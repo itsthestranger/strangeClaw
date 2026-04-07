@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,9 @@ DEFAULT_ACTION_SCHEMA: dict[str, Any] = {
     },
     "required": ["skill", "action", "args"],
 }
+MISSING_ENV_RE = re.compile(
+    r"Missing environment variable '([^']+)' required by config field '([^']+)'\."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,7 +82,12 @@ def main() -> int:
 
     args = parse_args()
     try:
-        config = load_config(args.config)
+        config = _load_config_with_api_key_override(
+            load_config=load_config,
+            config_error_type=ConfigError,
+            config_path=args.config,
+            api_key_override=args.api_key,
+        )
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
@@ -204,6 +214,41 @@ def parse_json_or_string(value: str) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def _load_config_with_api_key_override(
+    load_config: Any,
+    config_error_type: type[Exception],
+    config_path: Path | None,
+    api_key_override: str | None,
+) -> dict[str, Any]:
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            loaded = load_config(config_path)
+        except config_error_type as exc:
+            missing_env = _parse_missing_env(str(exc))
+            if (
+                missing_env is None
+                or api_key_override is None
+                or missing_env[1] != "llm.api_key"
+                or attempts > 4
+            ):
+                raise
+            os.environ[missing_env[0]] = api_key_override
+            continue
+        if not isinstance(loaded, dict):
+            raise ValueError("Loaded config must be an object.")
+        return loaded
+
+
+def _parse_missing_env(error_message: str) -> tuple[str, str] | None:
+    match = MISSING_ENV_RE.search(error_message)
+    if not match:
+        return None
+    env_name, field_path = match.groups()
+    return env_name, field_path
 
 
 if __name__ == "__main__":
