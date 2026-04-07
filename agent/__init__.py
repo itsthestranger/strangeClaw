@@ -1,0 +1,1 @@
+"""Core strangeclaw agent package."""

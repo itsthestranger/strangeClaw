@@ -1,3 +1,9 @@
 strangeclaw*.md
 
 firecrackerDocs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+.venv/
+*.pyc

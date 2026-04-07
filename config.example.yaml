@@ -1,0 +1,33 @@
+mode: yolo
+adapter: cli
+approval_mode: review
+
+llm:
+  model: anthropic/claude-sonnet-4-20250514
+  api_key: ${ANTHROPIC_API_KEY}
+  max_tokens: 4096
+  temperature: 0.2
+
+context:
+  token_budget: 4000
+  summary_threshold: 10
+  max_output_chars: 8000
+
+loop:
+  max_iterations: 50
+
+skills:
+  directory: ./skills
+
+firecracker:
+  binary: /usr/local/bin/firecracker
+  kernel: ./firecracker/kernel/vmlinux
+  rootfs: ./firecracker/rootfs/agent.ext4
+  vcpu: 1
+  mem_mb: 512
+  host_iface: null
+  boot_timeout: 30
+  tap_subnet_base: "172.16.0.0"
+
+telegram:
+  token: ""
