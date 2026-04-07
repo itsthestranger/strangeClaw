@@ -7,3 +7,4 @@ firecrackerDocs/
 __pycache__/
 .venv/
 *.pyc
+Agents.md
