@@ -4,7 +4,7 @@ approval_mode: review
 
 llm:
   model: anthropic/claude-sonnet-4-20250514
-  api_key: ${ANTHROPIC_API_KEY}
+  api_key: ${ANTHROPIC_API_KEY}  # Optional for local models; can also be set directly.
   max_tokens: 4096
   temperature: 0.2
   timeout_seconds: 60
