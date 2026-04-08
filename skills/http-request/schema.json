@@ -1,0 +1,73 @@
+{
+  "actions": {
+    "request": {
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE",
+              "HEAD",
+              "OPTIONS"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body_json": {
+            "type": [
+              "object",
+              "array",
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 120
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 256,
+            "maximum": 200000
+          }
+        },
+        "required": [
+          "method",
+          "url",
+          "headers",
+          "body_json",
+          "timeout_seconds",
+          "max_chars"
+        ],
+        "additionalProperties": false
+      },
+      "invoke": [
+        "python3",
+        "request.py",
+        "{method}",
+        "{url}",
+        "{headers}",
+        "{body_json}",
+        "{timeout_seconds}",
+        "{max_chars}"
+      ],
+      "timeout_seconds": 60
+    }
+  }
+}

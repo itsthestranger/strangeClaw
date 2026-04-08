@@ -1,0 +1,62 @@
+{
+  "actions": {
+    "search": {
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          }
+        },
+        "required": [
+          "query",
+          "limit"
+        ],
+        "additionalProperties": false
+      },
+      "invoke": [
+        "python3",
+        "search.py",
+        "search",
+        "{query}",
+        "{limit}"
+      ],
+      "timeout_seconds": 30
+    },
+    "fetch": {
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 1
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 256,
+            "maximum": 200000
+          }
+        },
+        "required": [
+          "url",
+          "max_chars"
+        ],
+        "additionalProperties": false
+      },
+      "invoke": [
+        "python3",
+        "search.py",
+        "fetch",
+        "{url}",
+        "{max_chars}"
+      ],
+      "timeout_seconds": 45
+    }
+  }
+}
