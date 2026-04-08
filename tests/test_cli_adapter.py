@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -57,7 +60,12 @@ def test_get_task_rejects_empty_text() -> None:
         adapter.get_task()
 
 
-def test_run_handles_plan_approval_and_done(capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_handles_plan_approval_and_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     sandbox = FakeSandbox(
         events=[
             {"type": "message", "role": "plan", "content": {"steps": ["one", "two"]}},
@@ -90,7 +98,11 @@ def test_run_handles_plan_approval_and_done(capsys: pytest.CaptureFixture[str]) 
     assert "Success: All good." in output
 
 
-def test_run_handles_clarification_reply() -> None:
+def test_run_handles_clarification_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     sandbox = FakeSandbox(
         events=[
             {"type": "message", "role": "clarification", "content": "Which port?"},
@@ -106,3 +118,62 @@ def test_run_handles_clarification_reply() -> None:
 
     adapter.run()
     assert sandbox.sent == [{"type": "user_reply", "approved": True, "text": "Use 8080"}]
+
+
+def test_run_persists_done_state_and_output_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file_content = b"artifact-content"
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "Finished.",
+                "state": {"goal": "x", "history": [1, 2]},
+                "files": [
+                    {
+                        "path": "nested/out.txt",
+                        "content_b64": base64.b64encode(file_content).decode("ascii"),
+                        "size_bytes": len(file_content),
+                    }
+                ],
+            }
+        ]
+    )
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: "Persist this")
+
+    adapter.run()
+
+    assert sandbox.started_task is not None
+    session_id = sandbox.started_task["session_id"]
+    state_path = tmp_path / ".strangeclaw" / "sessions" / session_id / "state.json"
+    assert state_path.exists()
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved == {"goal": "x", "history": [1, 2]}
+
+    output_path = (
+        tmp_path
+        / ".strangeclaw"
+        / "sessions"
+        / session_id
+        / "outputs"
+        / "nested"
+        / "out.txt"
+    )
+    assert output_path.read_bytes() == file_content
+
+
+def test_get_task_uses_resume_state_without_prompt() -> None:
+    sandbox = FakeSandbox(events=[])
+    adapter = CLIAdapter(
+        sandbox=sandbox,
+        resume_session_id="resume-1",
+        resume_state={"goal": "resume-goal", "history": []},
+    )
+    task = adapter.get_task()
+    assert task["session_id"] == "resume-1"
+    assert task["text"] == "resume-goal"
+    assert task["state"] == {"goal": "resume-goal", "history": []}
