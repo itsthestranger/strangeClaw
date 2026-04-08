@@ -147,8 +147,9 @@ class CLIAdapter:
         if not isinstance(state, dict):
             return
 
+        redacted_state = self._redact_sensitive(state)
         session_dir = session.create(session_id)
-        session.save(session_dir, state)
+        session.save(session_dir, redacted_state)
         outputs_dir = session_dir / "outputs"
         outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,3 +182,17 @@ class CLIAdapter:
         if candidate != root and root not in candidate.parents:
             raise ValueError(f"Invalid output file path: {rel_path}")
         return candidate
+
+    @classmethod
+    def _redact_sensitive(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                if key.lower() == "api_key":
+                    redacted[key] = "[REDACTED]"
+                else:
+                    redacted[key] = cls._redact_sensitive(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact_sensitive(item) for item in value]
+        return value
