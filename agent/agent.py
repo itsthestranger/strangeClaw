@@ -27,6 +27,11 @@ EXECUTION_SYSTEM_PROMPT = (
     "For replan you may set args.feedback."
 )
 
+SUMMARY_SYSTEM_PROMPT = (
+    "Summarize agent execution history into concise bullet-style text that preserves "
+    "decisions, tool outcomes, and unresolved questions."
+)
+
 EXECUTION_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -67,18 +72,28 @@ class Agent:
         max_iterations: int = 50,
         output_dir: str = "/output",
         llm_config_path: str = "/run/strangeclaw/llm.json",
+        token_budget: int = 4000,
+        summary_threshold: int = 10,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise AgentError("max_iterations must be greater than zero.")
+        if token_budget <= 0:
+            raise AgentError("token_budget must be greater than zero.")
+        if summary_threshold <= 0:
+            raise AgentError("summary_threshold must be greater than zero.")
 
         self._transport = transport
         self._skills = Skills(skills_dir)
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
         self._llm_config_path = Path(llm_config_path)
+        self._token_budget = token_budget
+        self._summary_threshold = summary_threshold
         self._llm_factory = llm_factory or LLMClient.from_config
         self._llm: LLMRuntime | None = None
+        self._history_summary: str | None = None
+        self._history_summarized_count = 0
 
     def run(self) -> None:
         """Run one task from transport input."""
@@ -90,6 +105,8 @@ class Agent:
         approval_mode = task_event["approval_mode"]
         llm_config = self._resolve_llm_config(task_event)
         self._llm = self._llm_factory(llm_config)
+        self._history_summary = None
+        self._history_summarized_count = 0
 
         history: list[dict[str, Any]] = []
         plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
@@ -137,7 +154,12 @@ class Agent:
                 "type": "done",
                 "success": False,
                 "reply": "Stopped after reaching iteration limit.",
-                "state": {"goal": goal, "plan": plan, "history": history},
+                "state": {
+                    "goal": goal,
+                    "plan": plan,
+                    "history": history,
+                    "summary": self._history_summary or "",
+                },
                 "files": self._collect_output_files(),
             }
         )
@@ -185,23 +207,8 @@ class Agent:
 
     def _generate_plan(self, *, goal: str, feedback: str | None) -> Any:
         llm = self._require_llm()
-        prompt_lines = [
-            f"Goal:\n{goal}",
-            "",
-            "Available skills:",
-            json.dumps(self._skills.index(), ensure_ascii=True, indent=2),
-            "",
-            "Return a short plan as JSON with keys goal and steps (array of strings).",
-        ]
-        if feedback:
-            prompt_lines.extend(["", f"User feedback for re-plan:\n{feedback}"])
-
-        response = llm.complete(
-            [
-                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
-                {"role": "user", "content": "\n".join(prompt_lines)},
-            ]
-        )
+        messages = self.build_planning_prompt(goal=goal, feedback=feedback)
+        response = llm.complete(messages)
         return _parse_json_if_possible(response.text)
 
     def _execution_decision(
@@ -212,18 +219,9 @@ class Agent:
         history: list[dict[str, Any]],
     ) -> ToolCall:
         llm = self._require_llm()
-        prompt = {
-            "goal": goal,
-            "plan": plan,
-            "skills": self._skills.index(),
-            "history": history,
-            "output_instruction": "Place any files for the user in /output/.",
-        }
+        messages = self.build_execution_prompt(goal=goal, plan=plan, history=history)
         response: LLMResponse = llm.complete(
-            [
-                {"role": "system", "content": EXECUTION_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
-            ],
+            messages,
             action_schema=EXECUTION_ACTION_SCHEMA,
         )
         if response.action is not None:
@@ -249,7 +247,12 @@ class Agent:
                     "type": "done",
                     "success": True,
                     "reply": reply,
-                    "state": {"goal": goal, "plan": current_plan, "history": history},
+                    "state": {
+                        "goal": goal,
+                        "plan": current_plan,
+                        "history": history,
+                        "summary": self._history_summary or "",
+                    },
                     "files": self._collect_output_files(),
                 }
             )
@@ -337,6 +340,90 @@ class Agent:
         if self._llm is None:
             raise AgentError("LLM client is not configured.")
         return self._llm
+
+    def build_planning_prompt(
+        self,
+        *,
+        goal: str,
+        feedback: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Build planning-phase messages."""
+        prompt_lines = [
+            f"Goal:\n{goal}",
+            "",
+            "Available skills:",
+            json.dumps(self._skills.index(), ensure_ascii=True, indent=2),
+            "",
+            "Return a short plan as JSON with keys goal and steps (array of strings).",
+        ]
+        if feedback:
+            prompt_lines.extend(["", f"User feedback for re-plan:\n{feedback}"])
+        return [
+            {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n".join(prompt_lines)},
+        ]
+
+    def build_execution_prompt(
+        self,
+        *,
+        goal: str,
+        plan: Any,
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Build execution-phase messages, enforcing token budget."""
+        recent_history = self._recent_history(history)
+        summary = self._history_summary or ""
+
+        while True:
+            user_payload = {
+                "goal": goal,
+                "plan": plan,
+                "skills": self._skills.index(),
+                "history_summary": summary,
+                "recent_history": recent_history,
+                "output_instruction": "Place any files for the user in /output/.",
+            }
+            messages = [
+                {"role": "system", "content": EXECUTION_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
+            ]
+            token_count = self._require_llm().count_tokens(messages)
+            if token_count <= self._token_budget:
+                return messages
+            if recent_history:
+                recent_history = recent_history[1:]
+                continue
+            if summary:
+                summary = ""
+                continue
+            return messages
+
+    def _recent_history(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return recent history and update summary when threshold is exceeded."""
+        if len(history) <= self._summary_threshold:
+            return history
+
+        cutoff = len(history) - self._summary_threshold
+        if cutoff > self._history_summarized_count:
+            self._summarize_history(history[:cutoff])
+            self._history_summarized_count = cutoff
+        return history[cutoff:]
+
+    def _summarize_history(self, chunk: list[dict[str, Any]]) -> None:
+        llm = self._require_llm()
+        summary_input = {
+            "previous_summary": self._history_summary or "",
+            "new_events": chunk,
+        }
+        response = llm.complete(
+            [
+                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(summary_input, ensure_ascii=True)},
+            ]
+        )
+        text = response.text.strip()
+        if text:
+            self._history_summary = text
 
 
 def _parse_json_if_possible(text: str) -> Any:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import json
 import shlex
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +18,15 @@ from agent.transport import InProcessTransport
 class ScriptedLLM:
     """Deterministic fake LLM for agent-loop tests."""
 
-    def __init__(self, responses: list[LLMResponse]) -> None:
+    def __init__(
+        self,
+        responses: list[LLMResponse],
+        *,
+        count_tokens_func: Callable[[list[dict[str, Any]]], int] | None = None,
+    ) -> None:
         self._responses = responses
         self.calls: list[dict[str, Any]] = []
+        self._count_tokens_func = count_tokens_func
 
     def complete(
         self,
@@ -31,6 +39,8 @@ class ScriptedLLM:
         return self._responses.pop(0)
 
     def count_tokens(self, messages: list[dict[str, Any]]) -> int:
+        if self._count_tokens_func is not None:
+            return int(self._count_tokens_func(messages))
         del messages
         return 1
 
@@ -132,7 +142,7 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
         skills_dir=str(_skills_root()),
         max_iterations=10,
         output_dir=str(output_dir),
-        llm_factory=lambda _: scripted_llm,  # type: ignore[arg-type]
+        llm_factory=lambda _: scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -185,7 +195,7 @@ def test_agent_plan_rejection_replans_in_review_mode() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,  # type: ignore[arg-type]
+        llm_factory=lambda _: scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -228,7 +238,7 @@ def test_agent_emits_clarification_when_max_iterations_reached() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=1,
-        llm_factory=lambda _: scripted_llm,  # type: ignore[arg-type]
+        llm_factory=lambda _: scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -247,3 +257,81 @@ def test_agent_emits_clarification_when_max_iterations_reached() -> None:
     assert done_event["type"] == "done"
     assert done_event["success"] is False
     assert "iteration limit" in done_event["reply"].lower()
+
+
+def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
+    def count_tokens(messages: list[dict[str, Any]]) -> int:
+        payload = json.loads(messages[1]["content"])
+        recent_count = len(payload["recent_history"])
+        summary_len = len(payload["history_summary"])
+        return 100 + (recent_count * 100) + summary_len
+
+    scripted_llm = ScriptedLLM(responses=[], count_tokens_func=count_tokens)
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        token_budget=220,
+        summary_threshold=50,
+        llm_factory=lambda _: scripted_llm,
+    )
+    agent._llm = scripted_llm
+
+    history = [
+        {"type": "action", "idx": 1},
+        {"type": "action", "idx": 2},
+        {"type": "action", "idx": 3},
+    ]
+    messages = agent.build_execution_prompt(goal="g", plan={"steps": []}, history=history)
+    payload = json.loads(messages[1]["content"])
+    assert payload["recent_history"] == [{"type": "action", "idx": 3}]
+
+
+def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["s1","s2"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(skill="shell", action="run", args={"command": "printf step1"}),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(skill="shell", action="run", args={"command": "printf step2"}),
+                usage=None,
+            ),
+            LLMResponse(text="summarized previous observations", action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    skill="__agent__",
+                    action="done",
+                    args={"reply": "done with summary"},
+                ),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        summary_threshold=1,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    assert done_event["state"]["summary"] == "summarized previous observations"
