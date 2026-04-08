@@ -108,8 +108,9 @@ class Agent:
         self._history_summary = None
         self._history_summarized_count = 0
 
-        history: list[dict[str, Any]] = []
-        plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
+        history, plan = self._resume_context(task_event)
+        if plan is None:
+            plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
 
         for _ in range(self._max_iterations):
             decision = self._execution_decision(goal=goal, plan=plan, history=history)
@@ -163,6 +164,27 @@ class Agent:
                 "files": self._collect_output_files(),
             }
         )
+
+    def _resume_context(
+        self,
+        task_event: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], Any | None]:
+        state = task_event.get("state")
+        if not isinstance(state, dict):
+            return [], None
+
+        history: list[dict[str, Any]] = []
+        raw_history = state.get("history")
+        if isinstance(raw_history, list):
+            history = [item for item in raw_history if isinstance(item, dict)]
+
+        summary = state.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            self._history_summary = summary
+        if len(history) > self._summary_threshold:
+            self._history_summarized_count = len(history) - self._summary_threshold
+
+        return history, state.get("plan")
 
     def _wait_for_task_event(self) -> dict[str, Any] | None:
         while True:
