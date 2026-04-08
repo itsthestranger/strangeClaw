@@ -26,6 +26,13 @@ def test_transport_pair_exchanges_events_across_threads() -> None:
     assert received == [{"type": "stop"}]
 
 
+def test_transport_receive_without_timeout_returns_event() -> None:
+    host, agent = InProcessTransport.pair()
+    host.send({"type": "agent_ready"})
+    received = agent.receive()
+    assert received == {"type": "agent_ready"}
+
+
 def test_transport_receive_returns_none_on_timeout() -> None:
     transport = InProcessTransport()
     start = time.monotonic()
