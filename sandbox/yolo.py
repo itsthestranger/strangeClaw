@@ -37,6 +37,9 @@ class YoloSandbox:
 
     def run(self, task: dict[str, Any]) -> None:
         """Start an agent run for a task."""
+        self._cleanup_inactive_runtime()
+        if self._agent_thread is not None and self._agent_thread.is_alive():
+            self._agent_thread.join(timeout=0.2)
         if self._agent_thread is not None and self._agent_thread.is_alive():
             raise RuntimeError("YoloSandbox is already running.")
 
@@ -86,6 +89,17 @@ class YoloSandbox:
         if self._agent_transport is not None:
             self._agent_transport.close()
 
+        self._host_transport = None
+        self._agent_transport = None
+        self._agent_thread = None
+
+    def _cleanup_inactive_runtime(self) -> None:
+        if self._agent_thread is not None and self._agent_thread.is_alive():
+            return
+        if self._host_transport is not None:
+            self._host_transport.close()
+        if self._agent_transport is not None:
+            self._agent_transport.close()
         self._host_transport = None
         self._agent_transport = None
         self._agent_thread = None

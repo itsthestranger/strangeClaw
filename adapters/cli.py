@@ -13,6 +13,10 @@ from uuid import uuid4
 import session
 
 
+class CLIExitRequested(RuntimeError):
+    """Raised when the user requests application exit."""
+
+
 class CLIAdapter:
     """CLI interaction contract."""
 
@@ -29,32 +33,28 @@ class CLIAdapter:
         self._sandbox = sandbox
         self._approval_mode = approval_mode
         self._llm_config = llm_config
-        self._resume_session_id = resume_session_id
-        self._resume_state = resume_state
         self._input = input_func
+        self._session_id = resume_session_id or str(uuid4())
+        self._latest_state = resume_state
 
     def get_task(self) -> dict[str, Any]:
-        """Get initial task from the user."""
-        if self._resume_state is not None:
-            goal = self._resume_state.get("goal")
-            text = goal if isinstance(goal, str) and goal.strip() else "Continue previous session"
-            session_id = self._resume_session_id or str(uuid4())
-        else:
-            text = self._input("Task: ").strip()
-            if not text:
-                raise ValueError("Task cannot be empty.")
-            session_id = str(uuid4())
+        """Get next task from the user."""
+        text = self._input("Task: ").strip()
+        if self._is_exit_command(text):
+            raise CLIExitRequested()
+        if not text:
+            raise ValueError("Task cannot be empty.")
 
         task: dict[str, Any] = {
             "type": "task",
             "text": text,
-            "session_id": session_id,
+            "session_id": self._session_id,
             "approval_mode": self._approval_mode,
         }
         if self._llm_config is not None:
             task["llm"] = self._llm_config
-        if self._resume_state is not None:
-            task["state"] = self._resume_state
+        if self._latest_state is not None:
+            task["state"] = self._state_for_follow_up(self._latest_state)
         return task
 
     def show(self, event: dict[str, Any]) -> None:
@@ -97,41 +97,65 @@ class CLIAdapter:
         """Get user feedback for plan review or clarification."""
         if role == "plan":
             answer = self._input("Approve plan? [y/n]: ").strip().lower()
+            if self._is_exit_command(answer):
+                raise CLIExitRequested()
             approved = answer in {"y", "yes"}
             if approved:
                 return {"approved": True, "text": ""}
             feedback = self._input("Plan feedback: ").strip()
+            if self._is_exit_command(feedback):
+                raise CLIExitRequested()
             return {"approved": False, "text": feedback}
 
         if role == "clarification":
             text = self._input("Reply: ").strip()
+            if self._is_exit_command(text):
+                raise CLIExitRequested()
             return {"approved": True, "text": text}
 
         raise ValueError(f"Unsupported reply role: {role}")
 
     def run(self) -> None:
         """Drive the adapter event loop."""
-        task = self.get_task()
-        self._sandbox.run(task)
-
         try:
             while True:
-                event = self._sandbox.receive(timeout_seconds=0.1)
-                if event is None:
+                try:
+                    task = self.get_task()
+                except CLIExitRequested:
+                    break
+                except ValueError as exc:
+                    print(f"\nError: {exc}")
                     continue
-                self.show(event)
 
-                if event.get("type") == "message":
-                    role = event.get("role")
-                    if role == "plan" and task["approval_mode"] == "review":
-                        reply = self.get_reply("plan")
-                        self._sandbox.send({"type": "user_reply", **reply})
-                    elif role == "clarification":
-                        reply = self.get_reply("clarification")
-                        self._sandbox.send({"type": "user_reply", **reply})
+                self._sandbox.run(task)
+                exit_requested = False
 
-                if event.get("type") == "done":
-                    self._persist_done(session_id=str(task["session_id"]), done_event=event)
+                while True:
+                    event = self._sandbox.receive(timeout_seconds=0.1)
+                    if event is None:
+                        continue
+                    self.show(event)
+
+                    if event.get("type") == "message":
+                        role = event.get("role")
+                        try:
+                            if role == "plan" and task["approval_mode"] == "review":
+                                reply = self.get_reply("plan")
+                                self._sandbox.send({"type": "user_reply", **reply})
+                            elif role == "clarification":
+                                reply = self.get_reply("clarification")
+                                self._sandbox.send({"type": "user_reply", **reply})
+                        except CLIExitRequested:
+                            exit_requested = True
+                            break
+
+                    if event.get("type") == "done":
+                        self._persist_done(session_id=str(task["session_id"]), done_event=event)
+                        state = event.get("state")
+                        self._latest_state = state if isinstance(state, dict) else None
+                        break
+
+                if exit_requested:
                     break
         finally:
             self._sandbox.stop()
@@ -196,3 +220,14 @@ class CLIAdapter:
         if isinstance(value, list):
             return [cls._redact_sensitive(item) for item in value]
         return value
+
+    @staticmethod
+    def _is_exit_command(text: str) -> bool:
+        return text.strip().lower() in {"/quit", "/exit"}
+
+    @staticmethod
+    def _state_for_follow_up(state: dict[str, Any]) -> dict[str, Any]:
+        # New task should re-plan while preserving prior context.
+        next_state = dict(state)
+        next_state.pop("plan", None)
+        return next_state

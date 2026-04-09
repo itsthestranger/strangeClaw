@@ -82,7 +82,8 @@ def test_api_key_not_persisted_to_session_state(
         },
         "files": [],
     }
-    adapter = CLIAdapter(sandbox=FakeSandbox(done_event), input_func=lambda _: "save it")
+    answers = iter(["save it", "/quit"])
+    adapter = CLIAdapter(sandbox=FakeSandbox(done_event), input_func=lambda _: next(answers))
 
     adapter.run()
 

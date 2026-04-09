@@ -18,11 +18,11 @@ class FakeSandbox:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = events
         self.sent: list[dict[str, Any]] = []
-        self.started_task: dict[str, Any] | None = None
-        self.stopped = False
+        self.started_tasks: list[dict[str, Any]] = []
+        self.stop_calls = 0
 
     def run(self, task: dict[str, Any]) -> None:
-        self.started_task = task
+        self.started_tasks.append(task)
 
     def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
@@ -34,7 +34,7 @@ class FakeSandbox:
         return self._events.pop(0)
 
     def stop(self) -> None:
-        self.stopped = True
+        self.stop_calls += 1
 
 
 def test_get_task_includes_type_session_and_llm() -> None:
@@ -78,7 +78,7 @@ def test_run_handles_plan_approval_and_done(
             {"type": "done", "success": True, "reply": "All good.", "state": {}, "files": []},
         ]
     )
-    answers = iter(["Build it", "y"])
+    answers = iter(["Build it", "y", "/quit"])
     adapter = CLIAdapter(
         sandbox=sandbox,
         approval_mode="review",
@@ -87,10 +87,10 @@ def test_run_handles_plan_approval_and_done(
 
     adapter.run()
 
-    assert sandbox.started_task is not None
-    assert sandbox.started_task["approval_mode"] == "review"
+    assert len(sandbox.started_tasks) == 1
+    assert sandbox.started_tasks[0]["approval_mode"] == "review"
     assert sandbox.sent == [{"type": "user_reply", "approved": True, "text": ""}]
-    assert sandbox.stopped is True
+    assert sandbox.stop_calls == 1
 
     output = capsys.readouterr().out
     assert "Plan:" in output
@@ -109,7 +109,7 @@ def test_run_handles_clarification_reply(
             {"type": "done", "success": True, "reply": "Done.", "state": {}, "files": []},
         ]
     )
-    answers = iter(["Start task", "Use 8080"])
+    answers = iter(["Start task", "Use 8080", "/quit"])
     adapter = CLIAdapter(
         sandbox=sandbox,
         approval_mode="auto",
@@ -118,6 +118,7 @@ def test_run_handles_clarification_reply(
 
     adapter.run()
     assert sandbox.sent == [{"type": "user_reply", "approved": True, "text": "Use 8080"}]
+    assert sandbox.stop_calls == 1
 
 
 def test_run_persists_done_state_and_output_files(
@@ -143,12 +144,13 @@ def test_run_persists_done_state_and_output_files(
             }
         ]
     )
-    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: "Persist this")
+    answers = iter(["Persist this", "/quit"])
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: next(answers))
 
     adapter.run()
 
-    assert sandbox.started_task is not None
-    session_id = sandbox.started_task["session_id"]
+    assert len(sandbox.started_tasks) == 1
+    session_id = sandbox.started_tasks[0]["session_id"]
     state_path = tmp_path / ".strangeclaw" / "sessions" / session_id / "state.json"
     assert state_path.exists()
     saved = json.loads(state_path.read_text(encoding="utf-8"))
@@ -164,16 +166,89 @@ def test_run_persists_done_state_and_output_files(
         / "out.txt"
     )
     assert output_path.read_bytes() == file_content
+    assert sandbox.stop_calls == 1
 
 
-def test_get_task_uses_resume_state_without_prompt() -> None:
+def test_get_task_uses_resume_state_with_new_prompted_task() -> None:
     sandbox = FakeSandbox(events=[])
     adapter = CLIAdapter(
         sandbox=sandbox,
         resume_session_id="resume-1",
         resume_state={"goal": "resume-goal", "history": []},
+        input_func=lambda _: "follow-up task",
     )
     task = adapter.get_task()
     assert task["session_id"] == "resume-1"
-    assert task["text"] == "resume-goal"
+    assert task["text"] == "follow-up task"
     assert task["state"] == {"goal": "resume-goal", "history": []}
+
+
+def test_run_keeps_same_session_id_across_follow_up_tasks(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "one",
+                "state": {"history": []},
+                "files": [],
+            },
+            {
+                "type": "done",
+                "success": True,
+                "reply": "two",
+                "state": {"history": []},
+                "files": [],
+            },
+        ]
+    )
+    answers = iter(["first task", "second task", "/exit"])
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: next(answers))
+
+    adapter.run()
+
+    assert len(sandbox.started_tasks) == 2
+    first_session = sandbox.started_tasks[0]["session_id"]
+    second_session = sandbox.started_tasks[1]["session_id"]
+    assert first_session == second_session
+    assert sandbox.stop_calls == 1
+
+
+def test_follow_up_task_reuses_state_but_forces_replan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {
+                    "goal": "g1",
+                    "plan": {"steps": ["old"]},
+                    "history": [{"type": "action"}],
+                },
+                "files": [],
+            },
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": [{"type": "action"}, {"type": "action"}]},
+                "files": [],
+            },
+        ]
+    )
+    answers = iter(["task one", "task two", "/quit"])
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: next(answers))
+
+    adapter.run()
+
+    assert len(sandbox.started_tasks) == 2
+    second_task = sandbox.started_tasks[1]
+    assert "state" in second_task
+    assert second_task["state"]["history"] == [{"type": "action"}]
+    assert "plan" not in second_task["state"]
