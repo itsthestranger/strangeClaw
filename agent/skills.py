@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,18 @@ class Skills:
             raise SkillsError(f"Unknown skill: {skill_name}")
         return definition.doc
 
+    def contracts(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Return per-skill action schemas for execution-time prompting."""
+        contracts: dict[str, dict[str, dict[str, Any]]] = {}
+        for skill_name in sorted(self._skills):
+            definition = self._skills[skill_name]
+            actions: dict[str, dict[str, Any]] = {}
+            for action_name in sorted(definition.actions):
+                action = definition.actions[action_name]
+                actions[action_name] = {"args_schema": deepcopy(action.args_schema)}
+            contracts[skill_name] = actions
+        return contracts
+
     def execute(self, tool_call: dict[str, Any]) -> ToolResult:
         """Validate and execute one tool call."""
         skill_name, action_name, args = _normalize_tool_call(tool_call)
@@ -88,14 +101,15 @@ class Skills:
         if action is None:
             raise SkillsError(f"Unknown action '{action_name}' for skill '{skill_name}'")
 
+        args_with_defaults = _apply_schema_defaults(action.args_schema, args)
         try:
-            jsonschema.validate(instance=args, schema=action.args_schema)
+            jsonschema.validate(instance=args_with_defaults, schema=action.args_schema)
         except jsonschema.ValidationError as exc:
             raise SkillsError(
                 f"Invalid args for {skill_name}.{action_name}: {exc.message}"
             ) from exc
 
-        command = _render_invoke(action.invoke, args)
+        command = _render_invoke(action.invoke, args_with_defaults)
         try:
             completed = subprocess.run(
                 command,
@@ -304,3 +318,25 @@ def _truncate_output(text: str, *, chunk_size: int = 4000) -> str:
         f"...[truncated {omitted_chars} chars]...\n"
         f"{text[-chunk_size:]}"
     )
+
+
+def _apply_schema_defaults(schema: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = deepcopy(args)
+    if schema.get("type") != "object":
+        return result
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return result
+
+    for key, prop_schema in properties.items():
+        if not isinstance(prop_schema, dict):
+            continue
+        if key not in result and "default" in prop_schema:
+            result[key] = deepcopy(prop_schema["default"])
+            continue
+
+        current = result.get(key)
+        if isinstance(current, dict):
+            result[key] = _apply_schema_defaults(prop_schema, current)
+    return result

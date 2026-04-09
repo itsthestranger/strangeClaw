@@ -103,7 +103,13 @@ def _action_search(query: str, limit: int) -> dict[str, Any]:
         entries = entries[:limit]
 
     wrapped = _wrap_external_data(json.dumps(entries, ensure_ascii=True, separators=(",", ":")))
-    return {"query": query, "count": len(entries), "data": wrapped}
+    top_result_url: str | None = entries[0]["url"] if entries else None
+    return {
+        "query": query,
+        "count": len(entries),
+        "top_result_url": top_result_url,
+        "data": wrapped,
+    }
 
 
 def _action_fetch(url: str, max_chars: int) -> dict[str, Any]:

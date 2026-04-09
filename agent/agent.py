@@ -21,6 +21,7 @@ PLANNING_SYSTEM_PROMPT = (
 EXECUTION_SYSTEM_PROMPT = (
     "You are in the execution loop. Respond with a structured decision every turn. "
     "Use a normal skill/action/args tool call to execute tools. "
+    "Use skill_contracts in the user payload to satisfy required args and defaults. "
     "For control decisions, use skill='__agent__' and one of actions: "
     "done, clarify, replan. "
     "For done use args.reply. For clarify use args.question. "
@@ -113,7 +114,29 @@ class Agent:
             plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
 
         for _ in range(self._max_iterations):
-            decision = self._execution_decision(goal=goal, plan=plan, history=history)
+            try:
+                decision = self._execution_decision(goal=goal, plan=plan, history=history)
+            except AgentError as exc:
+                error_result = ToolResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr=(
+                        "Decision parse error: "
+                        f"{exc} "
+                        "Return a valid JSON tool call with skill/action/args and re-check "
+                        "the skill contracts."
+                    ),
+                )
+                action_event = {
+                    "type": "action",
+                    "skill": "__agent__",
+                    "action": "decision_error",
+                    "args": {},
+                    "result": asdict(error_result),
+                }
+                self._send(action_event)
+                history.append(action_event)
+                continue
 
             if decision.skill == "__agent__":
                 handled = self._handle_control_decision(
@@ -401,6 +424,7 @@ class Agent:
                 "goal": goal,
                 "plan": plan,
                 "skills": self._skills.index(),
+                "skill_contracts": self._skills.contracts(),
                 "history_summary": summary,
                 "recent_history": recent_history,
                 "output_instruction": "Place any files for the user in /output/.",

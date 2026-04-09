@@ -162,3 +162,41 @@ def test_execute_returns_timeout_result(tmp_path: Path) -> None:
     result = skills.execute({"skill": "slow", "action": "run", "args": {}})
     assert result.exit_code == 124
     assert "timed out" in result.stderr
+
+
+def test_execute_applies_schema_defaults_before_validation_and_invoke(tmp_path: Path) -> None:
+    skills = Skills(
+        str(
+            _write_skill(
+                tmp_path,
+                "defaults",
+                "# Defaults\n",
+                {
+                    "actions": {
+                        "run": {
+                            "args_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "prefix": {"type": "string", "default": "hello"},
+                                },
+                                "required": ["name"],
+                                "additionalProperties": False,
+                            },
+                            "invoke": [
+                                "python3",
+                                "-c",
+                                "import sys; print(sys.argv[1] + ' ' + sys.argv[2])",
+                                "{prefix}",
+                                "{name}",
+                            ],
+                        }
+                    }
+                },
+            ).parent
+        )
+    )
+
+    result = skills.execute({"skill": "defaults", "action": "run", "args": {"name": "world"}})
+    assert result.exit_code == 0
+    assert result.stdout == "hello world\n"

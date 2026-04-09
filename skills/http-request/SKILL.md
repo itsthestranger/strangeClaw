@@ -14,12 +14,14 @@ requires_network: true
 ## Actions
 ### request
 - Args:
-  - `method` (string): `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`.
-  - `url` (string): HTTP or HTTPS URL.
-  - `headers` (object): String header map.
-  - `body_json` (object | array | string | number | boolean | null): Request body payload.
-  - `timeout_seconds` (number): Request timeout in seconds.
-  - `max_chars` (integer): Maximum response body characters to include.
+  - Required:
+    - `url` (string): HTTP, HTTPS, or file URL.
+  - Optional:
+    - `method` (string): `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`. Default: `GET`.
+    - `headers` (object): String header map. Default: `{}`.
+    - `body_json` (object | array | string | number | boolean | null): Request body payload. Default: `null`.
+    - `timeout_seconds` (number): Request timeout in seconds. Default: `20`.
+    - `max_chars` (integer): Maximum response body characters to include. Default: `8000`.
 - Returns:
   - Request metadata, status code, and wrapped external response payload.
 - Invoke:

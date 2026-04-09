@@ -62,12 +62,13 @@ def test_web_search_skill_search_and_fetch_wrap_external_data(
         {
             "skill": "web-search",
             "action": "search",
-            "args": {"query": "cats", "limit": 2},
+            "args": {"query": "cats"},
         }
     )
     assert search_result.exit_code == 0
     search_payload = json.loads(search_result.stdout)
     assert search_payload["count"] == 2
+    assert search_payload["top_result_url"] == "https://example.com/1"
     assert search_payload["data"].startswith(BEGIN_DATA)
     assert search_payload["data"].endswith(END_DATA)
     assert "cats result 1" in search_payload["data"]
@@ -78,7 +79,7 @@ def test_web_search_skill_search_and_fetch_wrap_external_data(
         {
             "skill": "web-search",
             "action": "fetch",
-            "args": {"url": page_path.as_uri(), "max_chars": 1024},
+            "args": {"url": page_path.as_uri()},
         }
     )
     assert fetch_result.exit_code == 0
@@ -98,12 +99,7 @@ def test_http_request_skill_wraps_external_data(tmp_path: Path) -> None:
             "skill": "http-request",
             "action": "request",
             "args": {
-                "method": "GET",
                 "url": response_file.as_uri(),
-                "headers": {},
-                "body_json": None,
-                "timeout_seconds": 5,
-                "max_chars": 4096,
             },
         }
     )

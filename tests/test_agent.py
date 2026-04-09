@@ -286,6 +286,8 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     messages = agent.build_execution_prompt(goal="g", plan={"steps": []}, history=history)
     payload = json.loads(messages[1]["content"])
     assert payload["recent_history"] == [{"type": "action", "idx": 3}]
+    assert "skill_contracts" in payload
+    assert "web-search" in payload["skill_contracts"]
 
 
 def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
@@ -335,3 +337,46 @@ def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
     done_event = events[-1]
     assert done_event["type"] == "done"
     assert done_event["state"]["summary"] == "summarized previous observations"
+
+
+def test_agent_handles_invalid_decision_output_without_crashing() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["attempt"]}', action=None, usage=None),
+            LLMResponse(text="not json", action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(skill="__agent__", action="done", args={"reply": "recovered"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event["type"] == "action" and event["skill"] == "__agent__"
+    ]
+    assert error_actions
+    assert error_actions[0]["action"] == "decision_error"
+    assert error_actions[0]["result"]["exit_code"] == 1
+    assert "Decision parse error" in error_actions[0]["result"]["stderr"]
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+    assert events[-1]["reply"] == "recovered"

@@ -14,7 +14,8 @@
               "DELETE",
               "HEAD",
               "OPTIONS"
-            ]
+            ],
+            "default": "GET"
           },
           "url": {
             "type": "string",
@@ -24,7 +25,8 @@
             "type": "object",
             "additionalProperties": {
               "type": "string"
-            }
+            },
+            "default": {}
           },
           "body_json": {
             "type": [
@@ -34,26 +36,24 @@
               "number",
               "boolean",
               "null"
-            ]
+            ],
+            "default": null
           },
           "timeout_seconds": {
             "type": "number",
             "exclusiveMinimum": 0,
-            "maximum": 120
+            "maximum": 120,
+            "default": 20
           },
           "max_chars": {
             "type": "integer",
             "minimum": 256,
-            "maximum": 200000
+            "maximum": 200000,
+            "default": 8000
           }
         },
         "required": [
-          "method",
-          "url",
-          "headers",
-          "body_json",
-          "timeout_seconds",
-          "max_chars"
+          "url"
         ],
         "additionalProperties": false
       },
