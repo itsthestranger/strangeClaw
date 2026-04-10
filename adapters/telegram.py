@@ -6,6 +6,8 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -18,11 +20,13 @@ TelegramCallbackQueryHandler: Any = None
 TelegramInlineKeyboardButton: Any = None
 TelegramInlineKeyboardMarkup: Any = None
 TelegramMessageHandler: Any = None
+TelegramChatAction: Any = None
 telegram_filters: Any = None
 
 try:
     from telegram import InlineKeyboardButton as TelegramInlineKeyboardButton
     from telegram import InlineKeyboardMarkup as TelegramInlineKeyboardMarkup
+    from telegram.constants import ChatAction as TelegramChatAction
     from telegram.ext import Application as TelegramApplication
     from telegram.ext import CallbackQueryHandler as TelegramCallbackQueryHandler
     from telegram.ext import MessageHandler as TelegramMessageHandler
@@ -32,8 +36,15 @@ except ImportError as exc:  # pragma: no cover - exercised in environments witho
 
 
 MAX_TELEGRAM_MESSAGE_CHARS = 4096
+MAX_TELEGRAM_UPLOAD_BYTES = 50 * 1024 * 1024
+MARKDOWN_V2_PARSE_MODE = "MarkdownV2"
+TYPING_INTERVAL_SECONDS = 3.0
+RECONNECT_BACKOFF_MIN_SECONDS = 1.0
+RECONNECT_BACKOFF_MAX_SECONDS = 30.0
+MARKDOWN_V2_SPECIAL_CHARS = "_*[]()~`>#+-=|{}.!"
 PLAN_APPROVE_CALLBACK = "sc:plan:approve"
 PLAN_REJECT_CALLBACK = "sc:plan:reject"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -108,32 +119,58 @@ class TelegramAdapter:
             if role == "plan":
                 text = self._format_plan(content)
                 if self._approval_mode == "review":
-                    await self._send_text(chat_id, text, reply_markup=self._plan_keyboard())
+                    await self._send_text(
+                        chat_id,
+                        text,
+                        reply_markup=self._plan_keyboard(),
+                        parse_mode=MARKDOWN_V2_PARSE_MODE,
+                    )
                 else:
-                    await self._send_text(chat_id, text)
+                    await self._send_text(chat_id, text, parse_mode=MARKDOWN_V2_PARSE_MODE)
                 return
             if role == "clarification":
-                await self._send_text(chat_id, f"Clarification needed:\n{self._to_text(content)}")
+                text = (
+                    "*Clarification Needed*\n"
+                    f"{self._escape_markdown_v2(self._to_text(content))}"
+                )
+                await self._send_text(chat_id, text, parse_mode=MARKDOWN_V2_PARSE_MODE)
                 return
             if role == "status":
-                await self._send_text(chat_id, f"Status: {self._to_text(content)}")
+                text = f"*Status:* {self._escape_markdown_v2(self._to_text(content))}"
+                await self._send_text(chat_id, text, parse_mode=MARKDOWN_V2_PARSE_MODE)
                 return
-            await self._send_text(chat_id, self._to_text(content))
+            await self._send_text(
+                chat_id,
+                self._escape_markdown_v2(self._to_text(content)),
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
             return
 
         if event_type == "action":
-            await self._send_text(chat_id, self._format_action(event))
+            await self._send_text(
+                chat_id,
+                self._format_action(event),
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
             return
 
         if event_type == "done":
             success = bool(event.get("success"))
             label = "Success" if success else "Failed"
-            reply = self._to_text(event.get("reply"))
-            await self._send_text(chat_id, f"{label}: {reply}")
+            reply = self._escape_markdown_v2(self._to_text(event.get("reply")))
+            await self._send_text(
+                chat_id,
+                f"*{label}:* {reply}",
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
             await self._send_done_files(chat_id, event.get("files"))
             return
 
-        await self._send_text(chat_id, self._to_text(event))
+        await self._send_text(
+            chat_id,
+            self._escape_markdown_v2(self._to_text(event)),
+            parse_mode=MARKDOWN_V2_PARSE_MODE,
+        )
 
     async def get_reply(self, role: str, *, chat_id: int) -> dict[str, Any]:
         """Wait for a user reply for plan review or clarification."""
@@ -169,22 +206,38 @@ class TelegramAdapter:
         ):
             raise RuntimeError("Telegram runtime components are unavailable.")
 
-        application = TelegramApplication.builder().token(self._token).build()
-        self._application = application
+        backoff_seconds = RECONNECT_BACKOFF_MIN_SECONDS
+        while True:
+            application = TelegramApplication.builder().token(self._token).build()
+            self._application = application
 
-        text_filter = telegram_filters.TEXT & ~telegram_filters.COMMAND
-        application.add_handler(TelegramMessageHandler(text_filter, self._on_text_message))
-        application.add_handler(
-            TelegramCallbackQueryHandler(
-                self._on_plan_callback,
-                pattern=r"^sc:plan:(approve|reject)$",
+            text_filter = telegram_filters.TEXT & ~telegram_filters.COMMAND
+            application.add_handler(TelegramMessageHandler(text_filter, self._on_text_message))
+            application.add_handler(
+                TelegramCallbackQueryHandler(
+                    self._on_plan_callback,
+                    pattern=r"^sc:plan:(approve|reject)$",
+                )
             )
-        )
 
-        try:
-            application.run_polling(drop_pending_updates=True)
-        finally:
-            self._application = None
+            try:
+                application.run_polling(drop_pending_updates=True)
+                return
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                LOGGER.warning(
+                    "Telegram polling failed (%s). Retrying in %.1f seconds.",
+                    exc,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(
+                    backoff_seconds * 2.0,
+                    RECONNECT_BACKOFF_MAX_SECONDS,
+                )
+            finally:
+                self._application = None
 
     async def _on_text_message(self, update: Any, context: Any) -> None:
         del context
@@ -262,11 +315,16 @@ class TelegramAdapter:
 
     async def _run_chat_session(self, session: ChatSession, task_event: dict[str, Any]) -> None:
         chat_id = session.chat_id
+        last_typing_time = 0.0
         try:
             await asyncio.to_thread(session.sandbox.run, task_event)
             while True:
                 event = await asyncio.to_thread(session.sandbox.receive, 0.2)
                 if event is None:
+                    now = time.monotonic()
+                    if now - last_typing_time >= TYPING_INTERVAL_SECONDS:
+                        await self._send_typing(chat_id)
+                        last_typing_time = now
                     await asyncio.sleep(0)
                     continue
 
@@ -291,10 +349,15 @@ class TelegramAdapter:
                 if event_type == "done":
                     return
         except Exception as exc:
-            await self._send_text(chat_id, f"Task failed: {exc}")
+            await self._send_text(
+                chat_id,
+                f"*Task Failed:* {self._escape_markdown_v2(str(exc))}",
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
         finally:
             self._cancel_pending_reply(session)
             await asyncio.to_thread(session.sandbox.stop)
+            self._sessions.pop(chat_id, None)
 
     def _cancel_pending_reply(self, session: ChatSession) -> None:
         pending = session.pending_reply
@@ -329,7 +392,8 @@ class TelegramAdapter:
         if not isinstance(files, list):
             return
 
-        bot = self._require_bot()
+        prepared_files: list[tuple[str, bytes]] = []
+        total_bytes = 0
         for item in files:
             if not isinstance(item, dict):
                 continue
@@ -341,7 +405,24 @@ class TelegramAdapter:
                 decoded = base64.b64decode(content_b64, validate=True)
             except binascii.Error:
                 continue
+            total_bytes += len(decoded)
+            prepared_files.append((rel_path, decoded))
 
+        if total_bytes > MAX_TELEGRAM_UPLOAD_BYTES:
+            limit_mb = MAX_TELEGRAM_UPLOAD_BYTES // (1024 * 1024)
+            await self._send_text(
+                chat_id,
+                (
+                    "Output files are too large to upload to Telegram "
+                    f"\\(>{limit_mb} MB total\\)\\. "
+                    "Please use local session outputs instead\\."
+                ),
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
+            return
+
+        bot = self._require_bot()
+        for rel_path, decoded in prepared_files:
             file_name = Path(rel_path).name or "output.bin"
             stream = BytesIO(decoded)
             stream.name = file_name
@@ -353,12 +434,37 @@ class TelegramAdapter:
         text: str,
         *,
         reply_markup: Any | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         bot = self._require_bot()
-        chunks = self._chunk_text(text, MAX_TELEGRAM_MESSAGE_CHARS)
+        if parse_mode == MARKDOWN_V2_PARSE_MODE:
+            chunks = self._chunk_markdown_text(text, MAX_TELEGRAM_MESSAGE_CHARS)
+        else:
+            chunks = self._chunk_text(text, MAX_TELEGRAM_MESSAGE_CHARS)
         for index, chunk in enumerate(chunks):
             markup = reply_markup if index == 0 else None
-            await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    reply_markup=markup,
+                    parse_mode=parse_mode,
+                )
+            except Exception:
+                if parse_mode is None:
+                    raise
+                await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
+
+    async def _send_typing(self, chat_id: int) -> None:
+        bot = self._require_bot()
+        action = "typing"
+        if TelegramChatAction is not None:
+            action = TelegramChatAction.TYPING
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=action)
+        except Exception:
+            # Best effort; if chat action fails we continue normal event handling.
+            return
 
     def _require_bot(self) -> Any:
         if self._application is None:
@@ -389,6 +495,44 @@ class TelegramAdapter:
             chunks.append(remaining)
         return chunks
 
+    @classmethod
+    def _chunk_markdown_text(cls, text: str, limit: int) -> list[str]:
+        if limit <= 0:
+            raise ValueError("Message chunk size limit must be positive.")
+        if not text:
+            return [""]
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        while len(remaining) > limit:
+            split_at = cls._find_markdown_split(remaining, limit)
+            chunk = remaining[:split_at]
+            if not chunk:
+                chunk = remaining[:limit]
+                split_at = len(chunk)
+            chunks.append(chunk)
+            remaining = remaining[split_at:]
+            if remaining.startswith("\n"):
+                remaining = remaining[1:]
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    @staticmethod
+    def _find_markdown_split(text: str, limit: int) -> int:
+        pos = text.rfind("\n", 0, limit)
+        while pos > 0:
+            candidate = text[:pos]
+            if candidate.count("```") % 2 == 0:
+                return pos
+            pos = text.rfind("\n", 0, pos)
+        fallback = text.rfind("\n", 0, limit)
+        if fallback > 0:
+            return fallback
+        return limit
+
     @staticmethod
     def _plan_keyboard() -> Any:
         if TelegramInlineKeyboardMarkup is None or TelegramInlineKeyboardButton is None:
@@ -407,15 +551,20 @@ class TelegramAdapter:
         if isinstance(content, dict):
             goal = content.get("goal")
             steps = content.get("steps")
-            lines: list[str] = ["Plan:"]
+            lines: list[str] = ["*Plan*"]
             if isinstance(goal, str) and goal.strip():
-                lines.append(f"Goal: {goal.strip()}")
+                lines.append(f"*Goal:* {TelegramAdapter._escape_markdown_v2(goal.strip())}")
             if isinstance(steps, list):
                 for index, step in enumerate(steps, start=1):
                     if isinstance(step, str):
-                        lines.append(f"{index}. {step}")
+                        lines.append(
+                            f"{index}\\. {TelegramAdapter._escape_markdown_v2(step)}"
+                        )
             return "\n".join(lines)
-        return f"Plan:\n{TelegramAdapter._to_text(content)}"
+        return (
+            "*Plan*\n"
+            f"{TelegramAdapter._escape_markdown_v2(TelegramAdapter._to_text(content))}"
+        )
 
     @staticmethod
     def _format_action(event: dict[str, Any]) -> str:
@@ -432,14 +581,16 @@ class TelegramAdapter:
             stdout = result.get("stdout")
             stderr = result.get("stderr")
             if isinstance(stdout, str) and stdout.strip():
-                preview = stdout.strip().splitlines()[0]
+                preview = stdout.strip()
             elif isinstance(stderr, str) and stderr.strip():
-                preview = stderr.strip().splitlines()[0]
+                preview = stderr.strip()
 
+        header = f"*Action:* {TelegramAdapter._escape_markdown_v2(f'{skill}.{action}{status}')}"
         if preview:
-            preview = preview[:200]
-            return f"Action: {skill}.{action}{status}\n{preview}"
-        return f"Action: {skill}.{action}{status}"
+            preview = preview[:3000]
+            escaped_preview = TelegramAdapter._escape_markdown_v2_code(preview)
+            return f"{header}\n```text\n{escaped_preview}\n```"
+        return header
 
     def _require_session(self, chat_id: int) -> ChatSession:
         session = self._sessions.get(chat_id)
@@ -458,3 +609,17 @@ class TelegramAdapter:
         if isinstance(content, str):
             return content
         return json.dumps(content, ensure_ascii=True, indent=2)
+
+    @staticmethod
+    def _escape_markdown_v2(text: str) -> str:
+        escaped: list[str] = []
+        for char in text:
+            if char in MARKDOWN_V2_SPECIAL_CHARS:
+                escaped.append(f"\\{char}")
+            else:
+                escaped.append(char)
+        return "".join(escaped)
+
+    @staticmethod
+    def _escape_markdown_v2_code(text: str) -> str:
+        return text.replace("\\", "\\\\").replace("`", "\\`")
