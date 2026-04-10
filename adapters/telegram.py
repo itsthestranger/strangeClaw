@@ -14,6 +14,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from adapters.session_persistence import persist_done_event, state_for_follow_up
+
 TELEGRAM_IMPORT_ERROR: Exception | None = None
 TelegramApplication: Any = None
 TelegramCallbackQueryHandler: Any = None
@@ -66,6 +68,15 @@ class ChatSession:
     pending_reply: PendingReply | None = None
 
 
+@dataclass(frozen=True)
+class TelegramLimits:
+    """Operational safety limits for Telegram adapter runtime behavior."""
+
+    max_active_sessions: int = 8
+    max_output_total_bytes: int = MAX_TELEGRAM_UPLOAD_BYTES
+    max_output_file_bytes: int = 10 * 1024 * 1024
+
+
 class TelegramAdapter:
     """Telegram interaction contract."""
 
@@ -77,13 +88,16 @@ class TelegramAdapter:
         llm_config: dict[str, Any] | None = None,
         token: str,
         allowed_chat_ids: list[int] | None = None,
+        limits: TelegramLimits | None = None,
     ) -> None:
         self._sandbox_factory = sandbox_factory
         self._approval_mode = approval_mode
         self._llm_config = llm_config
         self._token = token
         self._allowed_chat_ids = set(allowed_chat_ids or [])
+        self._limits = limits or TelegramLimits()
         self._sessions: dict[int, ChatSession] = {}
+        self._latest_state_by_chat: dict[int, dict[str, Any]] = {}
         self._application: Any | None = None
 
     def get_task(self, update: Any | None = None) -> dict[str, Any]:
@@ -267,7 +281,20 @@ class TelegramAdapter:
             )
             return
 
+        if self._active_session_count() >= self._limits.max_active_sessions:
+            await self._send_text(
+                chat_id,
+                (
+                    "The bot is at capacity right now. "
+                    "Please retry after one of the active tasks finishes."
+                ),
+            )
+            return
+
         task_event = self.get_task(update)
+        previous_state = self._latest_state_by_chat.get(chat_id)
+        if previous_state is not None:
+            task_event["state"] = state_for_follow_up(previous_state)
         sandbox = self._sandbox_factory()
         session = ChatSession(chat_id=chat_id, session_id=str(chat_id), sandbox=sandbox)
         self._sessions[chat_id] = session
@@ -347,6 +374,7 @@ class TelegramAdapter:
                         )
 
                 if event_type == "done":
+                    await self._persist_chat_done_state(chat_id=chat_id, done_event=event)
                     return
         except Exception as exc:
             await self._send_text(
@@ -373,6 +401,30 @@ class TelegramAdapter:
             pending.future.set_result({"approved": True, "text": ""})
         session.pending_reply = None
 
+    def _active_session_count(self) -> int:
+        count = 0
+        for item in self._sessions.values():
+            if item.runner is not None and not item.runner.done():
+                count += 1
+        return count
+
+    async def _persist_chat_done_state(self, *, chat_id: int, done_event: dict[str, Any]) -> None:
+        state = done_event.get("state")
+        if isinstance(state, dict):
+            self._latest_state_by_chat[chat_id] = state
+        try:
+            await asyncio.to_thread(
+                persist_done_event,
+                session_id=str(chat_id),
+                done_event=done_event,
+            )
+        except ValueError as exc:
+            await self._send_text(
+                chat_id,
+                f"Failed to persist session outputs: {self._escape_markdown_v2(str(exc))}",
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
+
     def _resolve_text_reply(self, session: ChatSession, text: str) -> bool:
         pending = session.pending_reply
         if pending is None or pending.future.done():
@@ -392,8 +444,9 @@ class TelegramAdapter:
         if not isinstance(files, list):
             return
 
-        prepared_files: list[tuple[str, bytes]] = []
         total_bytes = 0
+        skipped_for_size = False
+        bot = self._require_bot()
         for item in files:
             if not isinstance(item, dict):
                 continue
@@ -401,32 +454,43 @@ class TelegramAdapter:
             content_b64 = item.get("content_b64")
             if not isinstance(rel_path, str) or not isinstance(content_b64, str):
                 continue
+
+            size_bytes = self._declared_or_estimated_size(item=item, content_b64=content_b64)
+            if size_bytes > self._limits.max_output_file_bytes:
+                skipped_for_size = True
+                continue
+            if total_bytes + size_bytes > self._limits.max_output_total_bytes:
+                skipped_for_size = True
+                break
+
             try:
                 decoded = base64.b64decode(content_b64, validate=True)
             except binascii.Error:
                 continue
+            if len(decoded) > self._limits.max_output_file_bytes:
+                skipped_for_size = True
+                continue
+            if total_bytes + len(decoded) > self._limits.max_output_total_bytes:
+                skipped_for_size = True
+                break
+
             total_bytes += len(decoded)
-            prepared_files.append((rel_path, decoded))
-
-        if total_bytes > MAX_TELEGRAM_UPLOAD_BYTES:
-            limit_mb = MAX_TELEGRAM_UPLOAD_BYTES // (1024 * 1024)
-            await self._send_text(
-                chat_id,
-                (
-                    "Output files are too large to upload to Telegram "
-                    f"\\(>{limit_mb} MB total\\)\\. "
-                    "Please use local session outputs instead\\."
-                ),
-                parse_mode=MARKDOWN_V2_PARSE_MODE,
-            )
-            return
-
-        bot = self._require_bot()
-        for rel_path, decoded in prepared_files:
             file_name = Path(rel_path).name or "output.bin"
             stream = BytesIO(decoded)
             stream.name = file_name
             await bot.send_document(chat_id=chat_id, document=stream, caption=f"Output: {rel_path}")
+
+        if skipped_for_size:
+            limit_mb = self._limits.max_output_total_bytes // (1024 * 1024)
+            file_mb = self._limits.max_output_file_bytes // (1024 * 1024)
+            await self._send_text(
+                chat_id,
+                (
+                    "Some output files were not sent because Telegram safety limits were exceeded "
+                    f"\\(max {file_mb} MB per file, {limit_mb} MB total\\)\\."
+                ),
+                parse_mode=MARKDOWN_V2_PARSE_MODE,
+            )
 
     async def _send_text(
         self,
@@ -609,6 +673,19 @@ class TelegramAdapter:
         if isinstance(content, str):
             return content
         return json.dumps(content, ensure_ascii=True, indent=2)
+
+    @staticmethod
+    def _declared_or_estimated_size(*, item: dict[str, Any], content_b64: str) -> int:
+        declared = item.get("size_bytes")
+        if isinstance(declared, int) and declared >= 0:
+            return declared
+        # Approximate decoded size from base64 length and trailing '=' padding.
+        padding = 0
+        if content_b64.endswith("=="):
+            padding = 2
+        elif content_b64.endswith("="):
+            padding = 1
+        return max(0, (len(content_b64) * 3) // 4 - padding)
 
     @staticmethod
     def _escape_markdown_v2(text: str) -> str:

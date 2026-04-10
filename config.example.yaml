@@ -38,3 +38,8 @@ firecracker:
 
 telegram:
   token: ""
+  local_mode: true               # false in non-local deployments (requires allowed_chat_ids)
+  allowed_chat_ids: []           # required when local_mode=false
+  max_active_sessions: 8
+  max_output_total_bytes: 52428800
+  max_output_file_bytes: 10485760

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from adapters.cli import CLIAdapter
-from adapters.telegram import TelegramAdapter
+from adapters.telegram import TelegramAdapter, TelegramLimits
 from config import load_config
 from sandbox.yolo import YoloSandbox
 from session import load as load_session
@@ -64,12 +64,27 @@ def main(argv: list[str] | None = None) -> None:
         if raw_chat_ids is not None and not isinstance(raw_chat_ids, list):
             raise ValueError("Config field telegram.allowed_chat_ids must be a list when provided.")
         allowed_chat_ids = [int(chat_id) for chat_id in raw_chat_ids] if raw_chat_ids else []
+        local_mode = bool(telegram_cfg.get("local_mode", True))
+        if not local_mode and not allowed_chat_ids:
+            raise ValueError(
+                "telegram.allowed_chat_ids must be configured when telegram.local_mode is false."
+            )
+        limits = TelegramLimits(
+            max_active_sessions=int(telegram_cfg.get("max_active_sessions", 8)),
+            max_output_total_bytes=int(
+                telegram_cfg.get("max_output_total_bytes", 50 * 1024 * 1024)
+            ),
+            max_output_file_bytes=int(
+                telegram_cfg.get("max_output_file_bytes", 10 * 1024 * 1024)
+            ),
+        )
         adapter = TelegramAdapter(
             sandbox_factory=lambda: _build_yolo_sandbox(config),
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
             token=str(telegram_cfg.get("token", "")),
             allowed_chat_ids=allowed_chat_ids,
+            limits=limits,
         )
     else:
         raise ValueError(f"Unsupported adapter: {adapter_name}")

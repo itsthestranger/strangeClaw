@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 import adapters.telegram as telegram_module
-from adapters.telegram import MARKDOWN_V2_PARSE_MODE, ChatSession, TelegramAdapter
+from adapters.telegram import MARKDOWN_V2_PARSE_MODE, ChatSession, TelegramAdapter, TelegramLimits
 
 
 class FakeBot:
@@ -143,14 +143,23 @@ def test_chunk_markdown_text_prefers_code_fence_boundaries() -> None:
 
 
 def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(telegram_module, "MAX_TELEGRAM_UPLOAD_BYTES", 5)
-    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
+    del monkeypatch
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        token="token",
+        limits=TelegramLimits(
+            max_active_sessions=8,
+            max_output_total_bytes=5,
+            max_output_file_bytes=5,
+        ),
+    )
     bot = FakeBot()
     adapter._application = FakeApplication(bot)  # noqa: SLF001
 
     files = [
         {
             "path": "out.bin",
+            "size_bytes": 10,
             "content_b64": base64.b64encode(b"0123456789").decode("ascii"),
         }
     ]
@@ -158,7 +167,7 @@ def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -
 
     assert bot.documents == []
     assert len(bot.messages) == 1
-    assert "too large" in bot.messages[0]["text"]
+    assert "not sent" in bot.messages[0]["text"]
     assert bot.messages[0]["parse_mode"] == MARKDOWN_V2_PARSE_MODE
 
 
@@ -198,3 +207,63 @@ def test_run_chat_session_reports_failure_and_cleans_up(
     assert len(bot.messages) == 1
     assert bot.messages[0]["parse_mode"] == MARKDOWN_V2_PARSE_MODE
     assert "Task Failed" in bot.messages[0]["text"]
+
+
+def test_on_text_message_includes_follow_up_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
+    adapter._latest_state_by_chat[42] = {  # noqa: SLF001
+        "goal": "g",
+        "plan": {"steps": ["old"]},
+        "history": [{"type": "action"}],
+    }
+    captured_task: dict[str, Any] = {}
+
+    async def fake_run_chat_session(
+        session: ChatSession,
+        task_event: dict[str, Any],
+    ) -> None:
+        del session
+        captured_task.update(task_event)
+
+    monkeypatch.setattr(adapter, "_run_chat_session", fake_run_chat_session)
+
+    async def scenario() -> None:
+        await adapter._on_text_message(_update(42, "follow-up"), None)  # noqa: SLF001
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert captured_task["text"] == "follow-up"
+    assert captured_task["state"] == {"goal": "g", "history": [{"type": "action"}]}
+    assert "plan" not in captured_task["state"]
+
+
+def test_on_text_message_respects_max_active_sessions() -> None:
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        token="token",
+        limits=TelegramLimits(max_active_sessions=1),
+    )
+    bot = FakeBot()
+    adapter._application = FakeApplication(bot)  # noqa: SLF001
+
+    class RunningTask:
+        @staticmethod
+        def done() -> bool:
+            return False
+
+    adapter._sessions[1] = ChatSession(  # noqa: SLF001
+        chat_id=1,
+        session_id="1",
+        sandbox=object(),
+        runner=cast(Any, RunningTask()),
+    )
+
+    async def scenario() -> None:
+        await adapter._on_text_message(_update(2, "new task"), None)  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+    assert len(bot.messages) == 1
+    assert "at capacity" in bot.messages[0]["text"]
+    assert 2 not in adapter._sessions  # noqa: SLF001

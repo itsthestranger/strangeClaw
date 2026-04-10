@@ -56,12 +56,14 @@ class FakeTelegramAdapter:
         llm_config: dict[str, Any],
         token: str,
         allowed_chat_ids: list[int] | None = None,
+        limits: Any | None = None,
     ) -> None:
         self.sandbox_factory = sandbox_factory
         self.approval_mode = approval_mode
         self.llm_config = llm_config
         self.token = token
         self.allowed_chat_ids = allowed_chat_ids or []
+        self.limits = limits
         self.run_called = False
 
     def run(self) -> None:
@@ -77,7 +79,14 @@ def _config() -> dict[str, Any]:
         "skills": {"directory": "./skills"},
         "loop": {"max_iterations": 7},
         "context": {"token_budget": 1234, "summary_threshold": 9},
-        "telegram": {"token": "bot-token", "allowed_chat_ids": [123]},
+        "telegram": {
+            "token": "bot-token",
+            "local_mode": True,
+            "allowed_chat_ids": [123],
+            "max_active_sessions": 8,
+            "max_output_total_bytes": 50 * 1024 * 1024,
+            "max_output_file_bytes": 10 * 1024 * 1024,
+        },
     }
 
 
@@ -219,6 +228,7 @@ def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.token == "bot-token"
     assert adapter.allowed_chat_ids == [123]
+    assert adapter.limits.max_active_sessions == 8
     sandbox = adapter.sandbox_factory()
     assert sandbox._skills_dir == "./skills"  # noqa: SLF001
 
@@ -229,3 +239,15 @@ def test_main_rejects_resume_with_telegram(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(main, "load_config", lambda: cfg)
     with pytest.raises(ValueError, match="Resume is only supported"):
         main.main(["--resume", "abc-1"])
+
+
+def test_main_rejects_non_local_telegram_without_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config()
+    cfg["adapter"] = "telegram"
+    cfg["telegram"]["local_mode"] = False
+    cfg["telegram"]["allowed_chat_ids"] = []
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    with pytest.raises(ValueError, match="telegram.allowed_chat_ids must be configured"):
+        main.main([])

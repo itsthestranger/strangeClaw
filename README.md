@@ -69,10 +69,20 @@ Telegram `chat_id`.
 - While a run is active, extra messages are only accepted when the agent is
   explicitly waiting for plan feedback or clarification.
 - After `done`, the in-memory run state is cleared for that chat.
-- Follow-up tasks in the same chat start a new run (no automatic resume of the
-  prior task state).
+- Follow-up tasks in the same chat start a new run and automatically reuse the
+  last completed task state from that chat (with re-planning forced).
 - To create a truly separate session, use a different Telegram chat (different
   `chat_id`).
+
+## Telegram Security Defaults
+
+- For local development, keep `telegram.local_mode: true`.
+- For non-local deployments, set `telegram.local_mode: false` and configure
+  `telegram.allowed_chat_ids` to an explicit allowlist.
+- Runtime limits are enforced:
+  - `telegram.max_active_sessions`
+  - `telegram.max_output_total_bytes`
+  - `telegram.max_output_file_bytes`
 
 ## Validation
 
