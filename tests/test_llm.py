@@ -20,6 +20,12 @@ ACTION_SCHEMA = {
 }
 
 
+class _FakeClientError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def test_complete_normalizes_text_and_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -105,7 +111,13 @@ def test_native_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
         }
 
     monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
-    client = LLMClient(model="openai/gpt-4.1-mini", api_key="sk-test", structured_output="native")
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="forced_function",
+        native_probe=False,
+    )
 
     result = client.complete(
         messages=[{"role": "user", "content": "Use a tool"}],
@@ -119,6 +131,153 @@ def test_native_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     assert result.action.reason == "Need cwd"
     assert "tools" in captured
     assert captured["tool_choice"]["function"]["name"] == "submit_tool_call"
+
+
+def test_native_structured_output_can_use_string_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_tool_call",
+                                    "arguments": (
+                                        '{"skill":"shell","action":"run",'
+                                        '"args":{"command":"pwd"}}'
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert captured["tool_choice"] == "required"
+
+
+def test_native_probe_falls_back_from_forced_function_to_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _FakeClientError("bad request", status_code=400)
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": "probe ok"}}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_tool_call",
+                                    "arguments": (
+                                        '{"skill":"shell","action":"run",'
+                                        '"args":{"command":"pwd"}}'
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="lm_studio/local-model",
+        api_key="",
+        structured_output="native",
+        native_tool_choice="forced_function",
+        native_fallback_to_prompt=False,
+        native_probe=True,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert calls[0]["tool_choice"]["function"]["name"] == "submit_tool_call"
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[2]["tool_choice"] == "required"
+
+
+def test_native_probe_can_fallback_to_prompt_when_native_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        if len(calls) <= 2:
+            raise _FakeClientError("bad request", status_code=400)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"skill":"http-request","action":"request","args":{"method":"GET"},'
+                            '"reason":"Need data"}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="lm_studio/local-model",
+        api_key="",
+        structured_output="native",
+        native_tool_choice="forced_function",
+        native_fallback_to_prompt=True,
+        native_probe=True,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert result.action.skill == "http-request"
+    assert "tool_choice" in calls[0]
+    assert "tool_choice" in calls[1]
+    assert "tool_choice" not in calls[2]
+    assert calls[2]["messages"][0]["role"] == "system"
+    assert "return ONLY a JSON object matching this schema" in calls[2]["messages"][0]["content"]
 
 
 def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,6 +360,9 @@ def test_from_config_accepts_provider_settings() -> None:
             "timeout_seconds": 30,
             "max_retries": 4,
             "structured_output": "prompt",
+            "native_tool_choice": "auto",
+            "native_fallback_to_prompt": False,
+            "native_probe": False,
             "provider_settings": {"api_base": "https://openrouter.ai/api/v1"},
         }
     )
@@ -208,6 +370,9 @@ def test_from_config_accepts_provider_settings() -> None:
     assert client.model == "openrouter/deepseek/deepseek-r1"
     assert client.provider_settings["api_base"] == "https://openrouter.ai/api/v1"
     assert client.structured_output == "prompt"
+    assert client.native_tool_choice == "auto"
+    assert client.native_fallback_to_prompt is False
+    assert client.native_probe is False
 
 
 def test_provider_settings_reject_reserved_keys() -> None:
@@ -218,3 +383,8 @@ def test_provider_settings_reject_reserved_keys() -> None:
 def test_structured_output_mode_must_be_valid() -> None:
     with pytest.raises(ValueError, match="structured_output"):
         LLMClient(model="x", api_key="y", structured_output="invalid")
+
+
+def test_native_tool_choice_must_be_valid() -> None:
+    with pytest.raises(ValueError, match="native_tool_choice"):
+        LLMClient(model="x", api_key="y", native_tool_choice="bad-value")

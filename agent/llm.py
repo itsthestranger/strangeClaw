@@ -41,6 +41,9 @@ class LLMClient:
         max_retries: int = 2,
         provider_settings: dict[str, Any] | None = None,
         structured_output: str = "native",
+        native_tool_choice: str = "required",
+        native_fallback_to_prompt: bool = True,
+        native_probe: bool = True,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -50,6 +53,11 @@ class LLMClient:
         self.max_retries = max_retries
         self.provider_settings = provider_settings or {}
         self.structured_output = structured_output
+        self.native_tool_choice = native_tool_choice
+        self.native_fallback_to_prompt = native_fallback_to_prompt
+        self.native_probe = native_probe
+        self._native_tool_choice_resolved: str | None = None
+        self._native_probe_ran = False
 
         disallowed_keys = {
             "model",
@@ -59,6 +67,8 @@ class LLMClient:
             "temperature",
             "timeout",
             "num_retries",
+            "tools",
+            "tool_choice",
         }
         conflicts = sorted(key for key in self.provider_settings if key in disallowed_keys)
         if conflicts:
@@ -69,6 +79,14 @@ class LLMClient:
             )
         if self.structured_output not in {"native", "prompt"}:
             raise ValueError("structured_output must be either 'native' or 'prompt'.")
+        if self.native_tool_choice not in {"forced_function", "required", "auto", "none"}:
+            raise ValueError(
+                "native_tool_choice must be one of: forced_function, required, auto, none."
+            )
+        if not isinstance(self.native_fallback_to_prompt, bool):
+            raise ValueError("native_fallback_to_prompt must be a boolean.")
+        if not isinstance(self.native_probe, bool):
+            raise ValueError("native_probe must be a boolean.")
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> LLMClient:
@@ -90,6 +108,9 @@ class LLMClient:
             max_retries=int(config.get("max_retries", 2)),
             provider_settings=parsed_provider_settings,
             structured_output=str(config.get("structured_output", "native")),
+            native_tool_choice=str(config.get("native_tool_choice", "required")),
+            native_fallback_to_prompt=bool(config.get("native_fallback_to_prompt", True)),
+            native_probe=bool(config.get("native_probe", True)),
         )
 
     def complete(
@@ -98,10 +119,10 @@ class LLMClient:
         action_schema: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Produce one normalized response."""
-        request_messages = messages
+        response_action_mode = "none"
         completion_kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": request_messages,
+            "messages": messages,
             "api_key": self.api_key,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
@@ -112,21 +133,91 @@ class LLMClient:
 
         if action_schema is not None:
             if self.structured_output == "native":
-                completion_kwargs.update(_native_tool_call_kwargs(action_schema))
+                native_tool_choice = self._resolve_native_tool_choice_mode()
+                if native_tool_choice is None:
+                    response_action_mode = "prompt"
+                    completion_kwargs["messages"] = _inject_prompt_action_schema(
+                        messages,
+                        action_schema,
+                    )
+                else:
+                    response_action_mode = "native"
+                    completion_kwargs.update(
+                        _native_tool_call_kwargs(
+                            action_schema,
+                            tool_choice_mode=native_tool_choice,
+                        )
+                    )
             else:
-                request_messages = _inject_prompt_action_schema(messages, action_schema)
-                completion_kwargs["messages"] = request_messages
+                response_action_mode = "prompt"
+                completion_kwargs["messages"] = _inject_prompt_action_schema(
+                    messages,
+                    action_schema,
+                )
 
         response = litellm.completion(**completion_kwargs)
         text = _extract_text(response)
         usage = _extract_usage(response)
         action: ToolCall | None = None
         if action_schema is not None:
-            if self.structured_output == "native":
+            if response_action_mode == "native":
                 action = _extract_native_tool_call(response)
             else:
                 action = _extract_prompt_tool_call(text)
         return LLMResponse(text=text, action=action, usage=usage)
+
+    def _resolve_native_tool_choice_mode(self) -> str | None:
+        if not self.native_probe:
+            return self.native_tool_choice
+        if self._native_probe_ran:
+            return self._native_tool_choice_resolved
+
+        self._native_probe_ran = True
+        modes_to_try = _native_tool_choice_probe_order(self.native_tool_choice)
+        last_client_error: Exception | None = None
+
+        for mode in modes_to_try:
+            probe_result = self._probe_native_mode(mode)
+            if probe_result is True:
+                self._native_tool_choice_resolved = mode
+                return mode
+            if isinstance(probe_result, Exception):
+                last_client_error = probe_result
+
+        self._native_tool_choice_resolved = None
+        if self.native_fallback_to_prompt:
+            return None
+        if last_client_error is not None:
+            raise last_client_error
+        raise RuntimeError("No compatible native tool-choice mode is available.")
+
+    def _probe_native_mode(self, tool_choice_mode: str) -> bool | Exception:
+        probe_messages = [
+            {"role": "system", "content": "Tool capability probe. Reply briefly."},
+            {"role": "user", "content": "probe"},
+        ]
+        probe_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": probe_messages,
+            "api_key": self.api_key,
+            "max_tokens": min(8, self.max_tokens),
+            "temperature": 0.0,
+            "timeout": min(10.0, self.timeout_seconds),
+            "num_retries": 0,
+            **self.provider_settings,
+            **_native_tool_call_kwargs(
+                _probe_action_schema(),
+                tool_choice_mode=tool_choice_mode,
+            ),
+        }
+        try:
+            litellm.completion(**probe_kwargs)
+            return True
+        except Exception as exc:
+            status_code = _exception_status_code(exc)
+            if status_code is not None and 400 <= status_code < 500:
+                return exc
+            raise
 
     def count_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Estimate token usage for a message list."""
@@ -159,8 +250,12 @@ def _extract_text(response: Any) -> str:
     return ""
 
 
-def _native_tool_call_kwargs(action_schema: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _native_tool_call_kwargs(
+    action_schema: dict[str, Any],
+    *,
+    tool_choice_mode: str,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "tools": [
             {
                 "type": "function",
@@ -170,9 +265,50 @@ def _native_tool_call_kwargs(action_schema: dict[str, Any]) -> dict[str, Any]:
                     "parameters": action_schema,
                 },
             }
-        ],
-        "tool_choice": {"type": "function", "function": {"name": "submit_tool_call"}},
+        ]
     }
+    if tool_choice_mode == "forced_function":
+        kwargs["tool_choice"] = {"type": "function", "function": {"name": "submit_tool_call"}}
+    else:
+        kwargs["tool_choice"] = tool_choice_mode
+    return kwargs
+
+
+def _native_tool_choice_probe_order(configured_mode: str) -> list[str]:
+    modes = [configured_mode]
+    if configured_mode == "forced_function":
+        modes.append("required")
+    deduped: list[str] = []
+    for mode in modes:
+        if mode not in deduped:
+            deduped.append(mode)
+    return deduped
+
+
+def _probe_action_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "skill": {"type": "string"},
+            "action": {"type": "string"},
+            "args": {"type": "object"},
+        },
+        "required": ["skill", "action", "args"],
+        "additionalProperties": False,
+    }
+
+
+def _exception_status_code(exc: Exception) -> int | None:
+    for key in ("status_code", "status", "code"):
+        value = getattr(exc, key, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+    return None
 
 
 def _extract_native_tool_call(response: Any) -> ToolCall | None:

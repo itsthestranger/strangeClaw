@@ -10,6 +10,9 @@ llm:
   timeout_seconds: 60
   max_retries: 2
   structured_output: native  # native | prompt
+  native_tool_choice: required  # forced_function | required | auto | none
+  native_fallback_to_prompt: true
+  native_probe: true  # Probe native tool-call compatibility once per session.
   provider_settings: {}  # e.g. {"api_base": "http://127.0.0.1:1234/v1"}
 
 context:
