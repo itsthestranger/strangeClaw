@@ -60,6 +60,20 @@ Expected endpoint response is a JSON object. Supported fields:
 - `yolo`: direct host execution for trusted local workflows.
 - `fire`: Firecracker microVM isolation (in progress).
 
+## Telegram Session Behavior
+
+When using `adapter: telegram`, strangeclaw currently maps `session_id` to the
+Telegram `chat_id`.
+
+- A new task message in a chat starts a run for that chat.
+- While a run is active, extra messages are only accepted when the agent is
+  explicitly waiting for plan feedback or clarification.
+- After `done`, the in-memory run state is cleared for that chat.
+- Follow-up tasks in the same chat start a new run (no automatic resume of the
+  prior task state).
+- To create a truly separate session, use a different Telegram chat (different
+  `chat_id`).
+
 ## Validation
 
 ```bash
