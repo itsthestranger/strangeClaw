@@ -211,8 +211,8 @@ class LLMClient:
             ),
         }
         try:
-            litellm.completion(**probe_kwargs)
-            return True
+            response = litellm.completion(**probe_kwargs)
+            return _extract_native_tool_call(response) is not None
         except Exception as exc:
             status_code = _exception_status_code(exc)
             if status_code is not None and 400 <= status_code < 500:

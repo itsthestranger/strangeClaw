@@ -190,7 +190,27 @@ def test_native_probe_falls_back_from_forced_function_to_required(
         if len(calls) == 1:
             raise _FakeClientError("bad request", status_code=400)
         if len(calls) == 2:
-            return {"choices": [{"message": {"content": "probe ok"}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_tool_call",
+                                        "arguments": (
+                                            '{"skill":"shell","action":"run",'
+                                            '"args":{"command":"echo probe"}}'
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
         return {
             "choices": [
                 {
@@ -278,6 +298,48 @@ def test_native_probe_can_fallback_to_prompt_when_native_is_unavailable(
     assert "tool_choice" not in calls[2]
     assert calls[2]["messages"][0]["role"] == "system"
     assert "return ONLY a JSON object matching this schema" in calls[2]["messages"][0]["content"]
+
+
+def test_native_probe_falls_back_to_prompt_when_probe_returns_no_native_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        if "tool_choice" in kwargs:
+            return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"skill":"http-request","action":"request","args":{"method":"GET"},'
+                            '"reason":"Need data"}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="local/model",
+        api_key="",
+        structured_output="native",
+        native_tool_choice="required",
+        native_fallback_to_prompt=True,
+        native_probe=True,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert "tool_choice" in calls[0]
+    assert "tool_choice" not in calls[1]
 
 
 def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
