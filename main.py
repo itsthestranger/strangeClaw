@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 from adapters.cli import CLIAdapter
+from adapters.telegram import TelegramAdapter
 from config import load_config
 from sandbox.yolo import YoloSandbox
 from session import load as load_session
@@ -17,40 +19,66 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run the strangeclaw application."""
-    args = _parse_args(argv)
-    config = load_config()
-    if config["mode"] != "yolo":
-        raise ValueError(f"Unsupported mode: {config['mode']}")
-    if config["adapter"] != "cli":
-        raise ValueError(f"Unsupported adapter: {config['adapter']}")
-
-    sandbox = YoloSandbox(
+def _build_yolo_sandbox(config: dict[str, Any]) -> YoloSandbox:
+    return YoloSandbox(
         skills_dir=str(config["skills"]["directory"]),
         max_iterations=int(config["loop"]["max_iterations"]),
         token_budget=int(config["context"]["token_budget"]),
         summary_threshold=int(config["context"]["summary_threshold"]),
     )
 
-    resume_state = None
-    if args.resume:
-        session_dir = Path.home() / ".strangeclaw" / "sessions" / args.resume
-        resume_state = load_session(session_dir)
-        if resume_state is None:
-            raise ValueError(f"Cannot resume: session state not found for {args.resume}")
 
-    adapter = CLIAdapter(
-        sandbox=sandbox,
-        approval_mode=str(config["approval_mode"]),
-        llm_config=dict(config["llm"]),
-        resume_session_id=args.resume,
-        resume_state=resume_state,
-    )
+def main(argv: list[str] | None = None) -> None:
+    """Run the strangeclaw application."""
+    args = _parse_args(argv)
+    config = load_config()
+    if config["mode"] != "yolo":
+        raise ValueError(f"Unsupported mode: {config['mode']}")
+    adapter_name = str(config["adapter"])
+
+    sandbox: YoloSandbox | None = None
+    if adapter_name == "cli":
+        sandbox = _build_yolo_sandbox(config)
+
+        resume_state = None
+        if args.resume:
+            session_dir = Path.home() / ".strangeclaw" / "sessions" / args.resume
+            resume_state = load_session(session_dir)
+            if resume_state is None:
+                raise ValueError(f"Cannot resume: session state not found for {args.resume}")
+
+        adapter: CLIAdapter | TelegramAdapter = CLIAdapter(
+            sandbox=sandbox,
+            approval_mode=str(config["approval_mode"]),
+            llm_config=dict(config["llm"]),
+            resume_session_id=args.resume,
+            resume_state=resume_state,
+        )
+    elif adapter_name == "telegram":
+        if args.resume:
+            raise ValueError("Resume is only supported with the cli adapter.")
+        telegram_cfg = config.get("telegram", {})
+        if not isinstance(telegram_cfg, dict):
+            raise ValueError("Config field telegram must be a mapping.")
+        raw_chat_ids = telegram_cfg.get("allowed_chat_ids", [])
+        if raw_chat_ids is not None and not isinstance(raw_chat_ids, list):
+            raise ValueError("Config field telegram.allowed_chat_ids must be a list when provided.")
+        allowed_chat_ids = [int(chat_id) for chat_id in raw_chat_ids] if raw_chat_ids else []
+        adapter = TelegramAdapter(
+            sandbox_factory=lambda: _build_yolo_sandbox(config),
+            approval_mode=str(config["approval_mode"]),
+            llm_config=dict(config["llm"]),
+            token=str(telegram_cfg.get("token", "")),
+            allowed_chat_ids=allowed_chat_ids,
+        )
+    else:
+        raise ValueError(f"Unsupported adapter: {adapter_name}")
+
     try:
         adapter.run()
     except KeyboardInterrupt:
-        sandbox.stop()
+        if sandbox is not None:
+            sandbox.stop()
 
 
 if __name__ == "__main__":

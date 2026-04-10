@@ -45,6 +45,29 @@ class FakeAdapter:
             raise KeyboardInterrupt()
 
 
+class FakeTelegramAdapter:
+    """Telegram adapter test double."""
+
+    def __init__(
+        self,
+        *,
+        sandbox_factory: Any,
+        approval_mode: str,
+        llm_config: dict[str, Any],
+        token: str,
+        allowed_chat_ids: list[int] | None = None,
+    ) -> None:
+        self.sandbox_factory = sandbox_factory
+        self.approval_mode = approval_mode
+        self.llm_config = llm_config
+        self.token = token
+        self.allowed_chat_ids = allowed_chat_ids or []
+        self.run_called = False
+
+    def run(self) -> None:
+        self.run_called = True
+
+
 def _config() -> dict[str, Any]:
     return {
         "mode": "yolo",
@@ -54,6 +77,7 @@ def _config() -> dict[str, Any]:
         "skills": {"directory": "./skills"},
         "loop": {"max_iterations": 7},
         "context": {"token_budget": 1234, "summary_threshold": 9},
+        "telegram": {"token": "bot-token", "allowed_chat_ids": [123]},
     }
 
 
@@ -135,7 +159,7 @@ def test_main_rejects_unsupported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_main_rejects_unsupported_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = _config()
-    bad["adapter"] = "telegram"
+    bad["adapter"] = "discord"
     monkeypatch.setattr(main, "load_config", lambda: bad)
     with pytest.raises(ValueError, match="Unsupported adapter"):
         main.main([])
@@ -172,3 +196,36 @@ def test_main_loads_resume_state_and_passes_to_adapter(
 
     assert created["resume_session_id"] == "abc-1"
     assert created["resume_state"] == {"goal": "resume goal"}
+
+
+def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    cfg["adapter"] = "telegram"
+    created: dict[str, Any] = {}
+
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+
+    def fake_telegram_factory(**kwargs: Any) -> FakeTelegramAdapter:
+        adapter = FakeTelegramAdapter(**kwargs)
+        created["adapter"] = adapter
+        return adapter
+
+    monkeypatch.setattr(main, "TelegramAdapter", fake_telegram_factory)
+    main.main([])
+
+    adapter = created["adapter"]
+    assert adapter.run_called is True
+    assert adapter.approval_mode == "review"
+    assert adapter.llm_config == {"model": "x", "api_key": "k"}
+    assert adapter.token == "bot-token"
+    assert adapter.allowed_chat_ids == [123]
+    sandbox = adapter.sandbox_factory()
+    assert sandbox._skills_dir == "./skills"  # noqa: SLF001
+
+
+def test_main_rejects_resume_with_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    cfg["adapter"] = "telegram"
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    with pytest.raises(ValueError, match="Resume is only supported"):
+        main.main(["--resume", "abc-1"])

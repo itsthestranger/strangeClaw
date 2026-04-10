@@ -12,6 +12,7 @@ dependencies = [
   "litellm>=1.57.0",
   "jsonschema>=4.21.0",
   "PyYAML>=6.0.1",
+  "python-telegram-bot>=21.0",
   "tenacity>=8.2.3",
 ]
 
