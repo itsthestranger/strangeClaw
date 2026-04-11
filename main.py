@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -28,18 +29,62 @@ def _build_yolo_sandbox(config: dict[str, Any]) -> YoloSandbox:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run the strangeclaw application."""
-    args = _parse_args(argv)
-    config = load_config()
-    if config["mode"] != "yolo":
-        raise ValueError(f"Unsupported mode: {config['mode']}")
-    adapter_name = str(config["adapter"])
+def _enabled_adapters(config: dict[str, Any]) -> list[str]:
+    adapters_cfg = config.get("adapters")
+    if not isinstance(adapters_cfg, dict):
+        raise ValueError("Config field adapters must be a mapping.")
+    enabled = adapters_cfg.get("enabled")
+    if not isinstance(enabled, list):
+        raise ValueError("Config field adapters.enabled must be a list.")
+    names = [str(item).strip() for item in enabled if str(item).strip()]
+    if not names:
+        raise ValueError("Config field adapters.enabled cannot be empty.")
+    return names
 
-    sandbox: YoloSandbox | None = None
+
+def _telegram_adapter_config(
+    config: dict[str, Any],
+    *,
+    multi_adapter_mode: bool,
+) -> dict[str, Any]:
+    telegram_cfg = config.get("telegram", {})
+    if not isinstance(telegram_cfg, dict):
+        raise ValueError("Config field telegram must be a mapping.")
+
+    raw_chat_ids = telegram_cfg.get("allowed_chat_ids", [])
+    if raw_chat_ids is not None and not isinstance(raw_chat_ids, list):
+        raise ValueError("Config field telegram.allowed_chat_ids must be a list when provided.")
+    allowed_chat_ids = [int(chat_id) for chat_id in raw_chat_ids] if raw_chat_ids else []
+
+    local_mode = bool(telegram_cfg.get("local_mode", True))
+    if not local_mode and not allowed_chat_ids:
+        raise ValueError(
+            "telegram.allowed_chat_ids must be configured when telegram.local_mode is false."
+        )
+
+    limits = TelegramLimits(
+        max_active_sessions=int(telegram_cfg.get("max_active_sessions", 8)),
+        max_output_total_bytes=int(telegram_cfg.get("max_output_total_bytes", 50 * 1024 * 1024)),
+        max_output_file_bytes=int(telegram_cfg.get("max_output_file_bytes", 10 * 1024 * 1024)),
+    )
+    return {
+        "token": str(telegram_cfg.get("token", "")),
+        "allowed_chat_ids": allowed_chat_ids,
+        "limits": limits,
+        # Use namespaced session ids to avoid cross-adapter collisions in persistence paths.
+        "session_id_prefix": "telegram-" if multi_adapter_mode else "",
+    }
+
+
+def _build_adapter(
+    *,
+    adapter_name: str,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    multi_adapter_mode: bool,
+) -> tuple[CLIAdapter | TelegramAdapter, YoloSandbox | None]:
     if adapter_name == "cli":
         sandbox = _build_yolo_sandbox(config)
-
         resume_state = None
         if args.resume:
             session_dir = Path.home() / ".strangeclaw" / "sessions" / args.resume
@@ -47,53 +92,101 @@ def main(argv: list[str] | None = None) -> None:
             if resume_state is None:
                 raise ValueError(f"Cannot resume: session state not found for {args.resume}")
 
-        adapter: CLIAdapter | TelegramAdapter = CLIAdapter(
+        cli_adapter = CLIAdapter(
             sandbox=sandbox,
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
             resume_session_id=args.resume,
             resume_state=resume_state,
         )
-    elif adapter_name == "telegram":
+        return cli_adapter, sandbox
+
+    if adapter_name == "telegram":
         if args.resume:
             raise ValueError("Resume is only supported with the cli adapter.")
-        telegram_cfg = config.get("telegram", {})
-        if not isinstance(telegram_cfg, dict):
-            raise ValueError("Config field telegram must be a mapping.")
-        raw_chat_ids = telegram_cfg.get("allowed_chat_ids", [])
-        if raw_chat_ids is not None and not isinstance(raw_chat_ids, list):
-            raise ValueError("Config field telegram.allowed_chat_ids must be a list when provided.")
-        allowed_chat_ids = [int(chat_id) for chat_id in raw_chat_ids] if raw_chat_ids else []
-        local_mode = bool(telegram_cfg.get("local_mode", True))
-        if not local_mode and not allowed_chat_ids:
-            raise ValueError(
-                "telegram.allowed_chat_ids must be configured when telegram.local_mode is false."
-            )
-        limits = TelegramLimits(
-            max_active_sessions=int(telegram_cfg.get("max_active_sessions", 8)),
-            max_output_total_bytes=int(
-                telegram_cfg.get("max_output_total_bytes", 50 * 1024 * 1024)
-            ),
-            max_output_file_bytes=int(
-                telegram_cfg.get("max_output_file_bytes", 10 * 1024 * 1024)
-            ),
+        telegram_params = _telegram_adapter_config(
+            config,
+            multi_adapter_mode=multi_adapter_mode,
         )
-        adapter = TelegramAdapter(
+        telegram_adapter = TelegramAdapter(
             sandbox_factory=lambda: _build_yolo_sandbox(config),
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
-            token=str(telegram_cfg.get("token", "")),
-            allowed_chat_ids=allowed_chat_ids,
-            limits=limits,
+            token=telegram_params["token"],
+            allowed_chat_ids=telegram_params["allowed_chat_ids"],
+            limits=telegram_params["limits"],
+            session_id_prefix=telegram_params["session_id_prefix"],
         )
-    else:
-        raise ValueError(f"Unsupported adapter: {adapter_name}")
+        return telegram_adapter, None
+
+    raise ValueError(f"Unsupported adapter: {adapter_name}")
+
+
+def _stop_adapter(adapter: Any) -> None:
+    stop = getattr(adapter, "stop", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception:
+            return
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the strangeclaw application."""
+    args = _parse_args(argv)
+    config = load_config()
+    if config["mode"] != "yolo":
+        raise ValueError(f"Unsupported mode: {config['mode']}")
+
+    enabled_adapters = _enabled_adapters(config)
+    unsupported = [name for name in enabled_adapters if name not in {"cli", "telegram"}]
+    if unsupported:
+        raise ValueError(f"Unsupported adapter: {unsupported[0]}")
+    if args.resume and len(enabled_adapters) > 1:
+        raise ValueError("Resume cannot be used when multiple adapters are enabled.")
+
+    multi_adapter_mode = len(enabled_adapters) > 1
+    created: list[tuple[str, CLIAdapter | TelegramAdapter, YoloSandbox | None]] = []
+    for adapter_name in enabled_adapters:
+        adapter, sandbox = _build_adapter(
+            adapter_name=adapter_name,
+            config=config,
+            args=args,
+            multi_adapter_mode=multi_adapter_mode,
+        )
+        created.append((adapter_name, adapter, sandbox))
+
+    foreground_index = 0
+    for index, (name, _, _) in enumerate(created):
+        if name == "cli":
+            foreground_index = index
+            break
+
+    background_threads: list[threading.Thread] = []
+    background_adapters: list[CLIAdapter | TelegramAdapter] = []
 
     try:
-        adapter.run()
+        for index, (_, adapter, _) in enumerate(created):
+            if index == foreground_index:
+                continue
+            thread = threading.Thread(target=adapter.run, daemon=True)
+            thread.start()
+            background_threads.append(thread)
+            background_adapters.append(adapter)
+
+        created[foreground_index][1].run()
     except KeyboardInterrupt:
-        if sandbox is not None:
-            sandbox.stop()
+        pass
+    finally:
+        for adapter in background_adapters:
+            _stop_adapter(adapter)
+        for _, adapter, sandbox in created:
+            if sandbox is not None:
+                sandbox.stop()
+            else:
+                _stop_adapter(adapter)
+        for thread in background_threads:
+            thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

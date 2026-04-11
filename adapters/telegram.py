@@ -89,6 +89,7 @@ class TelegramAdapter:
         token: str,
         allowed_chat_ids: list[int] | None = None,
         limits: TelegramLimits | None = None,
+        session_id_prefix: str = "",
     ) -> None:
         self._sandbox_factory = sandbox_factory
         self._approval_mode = approval_mode
@@ -96,6 +97,7 @@ class TelegramAdapter:
         self._token = token
         self._allowed_chat_ids = set(allowed_chat_ids or [])
         self._limits = limits or TelegramLimits()
+        self._session_id_prefix = session_id_prefix
         self._sessions: dict[int, ChatSession] = {}
         self._latest_state_by_chat: dict[int, dict[str, Any]] = {}
         self._application: Any | None = None
@@ -117,7 +119,7 @@ class TelegramAdapter:
         task: dict[str, Any] = {
             "type": "task",
             "text": text.strip(),
-            "session_id": str(chat_id),
+            "session_id": self._session_id(chat_id),
             "approval_mode": self._approval_mode,
         }
         if self._llm_config is not None:
@@ -253,6 +255,18 @@ class TelegramAdapter:
             finally:
                 self._application = None
 
+    def stop(self) -> None:
+        """Best-effort stop for run_polling loop."""
+        application = self._application
+        if application is None:
+            return
+        stop_running = getattr(application, "stop_running", None)
+        if callable(stop_running):
+            try:
+                stop_running()
+            except Exception:
+                return
+
     async def _on_text_message(self, update: Any, context: Any) -> None:
         del context
         chat = getattr(update, "effective_chat", None)
@@ -296,7 +310,11 @@ class TelegramAdapter:
         if previous_state is not None:
             task_event["state"] = state_for_follow_up(previous_state)
         sandbox = self._sandbox_factory()
-        session = ChatSession(chat_id=chat_id, session_id=str(chat_id), sandbox=sandbox)
+        session = ChatSession(
+            chat_id=chat_id,
+            session_id=self._session_id(chat_id),
+            sandbox=sandbox,
+        )
         self._sessions[chat_id] = session
         session.runner = asyncio.create_task(self._run_chat_session(session, task_event))
 
@@ -412,10 +430,12 @@ class TelegramAdapter:
         state = done_event.get("state")
         if isinstance(state, dict):
             self._latest_state_by_chat[chat_id] = state
+        session = self._sessions.get(chat_id)
+        session_id = session.session_id if session is not None else self._session_id(chat_id)
         try:
             await asyncio.to_thread(
                 persist_done_event,
-                session_id=str(chat_id),
+                session_id=session_id,
                 done_event=done_event,
             )
         except ValueError as exc:
@@ -686,6 +706,9 @@ class TelegramAdapter:
         elif content_b64.endswith("="):
             padding = 1
         return max(0, (len(content_b64) * 3) // 4 - padding)
+
+    def _session_id(self, chat_id: int) -> str:
+        return f"{self._session_id_prefix}{chat_id}"
 
     @staticmethod
     def _escape_markdown_v2(text: str) -> str:

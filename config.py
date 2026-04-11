@@ -14,7 +14,7 @@ ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("mode",),
-    ("adapter",),
+    ("adapters", "enabled"),
     ("approval_mode",),
     ("llm", "model"),
     ("llm", "api_key"),

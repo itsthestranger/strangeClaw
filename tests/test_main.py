@@ -38,11 +38,15 @@ class FakeAdapter:
         self.extra = kwargs
         self.run_called = False
         self.raise_interrupt = False
+        self.stop_called = False
 
     def run(self) -> None:
         self.run_called = True
         if self.raise_interrupt:
             raise KeyboardInterrupt()
+
+    def stop(self) -> None:
+        self.stop_called = True
 
 
 class FakeTelegramAdapter:
@@ -57,6 +61,7 @@ class FakeTelegramAdapter:
         token: str,
         allowed_chat_ids: list[int] | None = None,
         limits: Any | None = None,
+        session_id_prefix: str = "",
     ) -> None:
         self.sandbox_factory = sandbox_factory
         self.approval_mode = approval_mode
@@ -64,16 +69,21 @@ class FakeTelegramAdapter:
         self.token = token
         self.allowed_chat_ids = allowed_chat_ids or []
         self.limits = limits
+        self.session_id_prefix = session_id_prefix
         self.run_called = False
+        self.stop_called = False
 
     def run(self) -> None:
         self.run_called = True
+
+    def stop(self) -> None:
+        self.stop_called = True
 
 
 def _config() -> dict[str, Any]:
     return {
         "mode": "yolo",
-        "adapter": "cli",
+        "adapters": {"enabled": ["cli"]},
         "approval_mode": "review",
         "llm": {"model": "x", "api_key": "k"},
         "skills": {"directory": "./skills"},
@@ -168,7 +178,7 @@ def test_main_rejects_unsupported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_main_rejects_unsupported_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = _config()
-    bad["adapter"] = "discord"
+    bad["adapters"] = {"enabled": ["discord"]}
     monkeypatch.setattr(main, "load_config", lambda: bad)
     with pytest.raises(ValueError, match="Unsupported adapter"):
         main.main([])
@@ -209,7 +219,7 @@ def test_main_loads_resume_state_and_passes_to_adapter(
 
 def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _config()
-    cfg["adapter"] = "telegram"
+    cfg["adapters"] = {"enabled": ["telegram"]}
     created: dict[str, Any] = {}
 
     monkeypatch.setattr(main, "load_config", lambda: cfg)
@@ -229,13 +239,14 @@ def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     assert adapter.token == "bot-token"
     assert adapter.allowed_chat_ids == [123]
     assert adapter.limits.max_active_sessions == 8
+    assert adapter.session_id_prefix == ""
     sandbox = adapter.sandbox_factory()
     assert sandbox._skills_dir == "./skills"  # noqa: SLF001
 
 
 def test_main_rejects_resume_with_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _config()
-    cfg["adapter"] = "telegram"
+    cfg["adapters"] = {"enabled": ["telegram"]}
     monkeypatch.setattr(main, "load_config", lambda: cfg)
     with pytest.raises(ValueError, match="Resume is only supported"):
         main.main(["--resume", "abc-1"])
@@ -245,9 +256,71 @@ def test_main_rejects_non_local_telegram_without_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = _config()
-    cfg["adapter"] = "telegram"
+    cfg["adapters"] = {"enabled": ["telegram"]}
     cfg["telegram"]["local_mode"] = False
     cfg["telegram"]["allowed_chat_ids"] = []
     monkeypatch.setattr(main, "load_config", lambda: cfg)
     with pytest.raises(ValueError, match="telegram.allowed_chat_ids must be configured"):
+        main.main([])
+
+
+def test_main_runs_cli_and_telegram_when_multiple_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config()
+    cfg["adapters"] = {"enabled": ["cli", "telegram"]}
+    created: dict[str, Any] = {}
+
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+
+    def fake_sandbox_factory(**kwargs: Any) -> FakeSandbox:
+        sandbox = FakeSandbox(**kwargs)
+        created["sandbox"] = sandbox
+        return sandbox
+
+    def fake_cli_factory(
+        *, sandbox: FakeSandbox, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+    ) -> FakeAdapter:
+        adapter = FakeAdapter(
+            sandbox=sandbox,
+            approval_mode=approval_mode,
+            llm_config=llm_config,
+            **kwargs,
+        )
+        created["cli"] = adapter
+        return adapter
+
+    def fake_telegram_factory(**kwargs: Any) -> FakeTelegramAdapter:
+        adapter = FakeTelegramAdapter(**kwargs)
+        created["telegram"] = adapter
+        return adapter
+
+    monkeypatch.setattr(main, "YoloSandbox", fake_sandbox_factory)
+    monkeypatch.setattr(main, "CLIAdapter", fake_cli_factory)
+    monkeypatch.setattr(main, "TelegramAdapter", fake_telegram_factory)
+
+    main.main([])
+
+    cli = created["cli"]
+    telegram = created["telegram"]
+    assert cli.run_called is True
+    assert telegram.run_called is True
+    assert telegram.session_id_prefix == "telegram-"
+
+
+def test_main_rejects_resume_when_multiple_adapters_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config()
+    cfg["adapters"] = {"enabled": ["cli", "telegram"]}
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    with pytest.raises(ValueError, match="Resume cannot be used"):
+        main.main(["--resume", "abc-1"])
+
+
+def test_main_rejects_missing_adapters_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    del cfg["adapters"]
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    with pytest.raises(ValueError, match="adapters must be a mapping"):
         main.main([])

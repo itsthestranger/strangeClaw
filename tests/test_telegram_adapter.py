@@ -134,6 +134,18 @@ def test_get_task_uses_chat_id_session_and_llm() -> None:
     }
 
 
+def test_get_task_applies_session_id_prefix_when_configured() -> None:
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        token="token",
+        session_id_prefix="telegram-",
+    )
+    task = adapter.get_task(_update(42, "task"))
+    assert task["session_id"] == "telegram-42"
+
+
 def test_chunk_text_respects_limit() -> None:
     text = "line1\nline2\nline3"
     chunks = TelegramAdapter._chunk_text(text, limit=6)

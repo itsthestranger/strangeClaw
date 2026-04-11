@@ -69,7 +69,8 @@ Expected endpoint response is a JSON object. Supported fields:
    - Copy the API token BotFather returns.
 2. Update `~/.strangeclaw/config.yaml`:
    ```yaml
-   adapter: telegram
+   adapters:
+     enabled: [telegram]
 
    telegram:
      token: "123456789:AA..."
@@ -90,9 +91,22 @@ Security note:
 - Treat `telegram.token` as a secret like your LLM API key.
 - Do not commit bot tokens to git or share them in logs/screenshots.
 
+## Multiple Adapters
+
+Enable multiple adapters in one process:
+
+```yaml
+adapters:
+  enabled: [cli, telegram]
+```
+
+Notes:
+- `--resume` is only allowed when exactly one adapter is enabled.
+- In multi-adapter mode, Telegram session IDs are namespaced (`telegram-<chat_id>`) to avoid persistence collisions with other adapters.
+
 ## Telegram Session Behavior
 
-When using `adapter: telegram`, strangeclaw currently maps `session_id` to the
+When `telegram` is enabled in `adapters.enabled`, strangeclaw maps Telegram session identity to the
 Telegram `chat_id`.
 
 - A new task message in a chat starts a run for that chat.

@@ -14,7 +14,7 @@ from config import ConfigError, load_config
 def _base_config(api_key: str = "${ANTHROPIC_API_KEY}") -> dict[str, Any]:
     return {
         "mode": "yolo",
-        "adapter": "cli",
+        "adapters": {"enabled": ["cli"]},
         "approval_mode": "review",
         "llm": {
             "model": "anthropic/claude-sonnet-4-20250514",

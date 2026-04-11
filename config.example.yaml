@@ -1,5 +1,6 @@
 mode: yolo
-adapter: cli
+adapters:
+  enabled: [cli]  # e.g. [cli, telegram]
 approval_mode: review
 
 llm:

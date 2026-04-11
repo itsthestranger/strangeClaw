@@ -158,6 +158,10 @@ class CLIAdapter:
         finally:
             self._sandbox.stop()
 
+    def stop(self) -> None:
+        """Stop adapter-owned runtime resources."""
+        self._sandbox.stop()
+
     @staticmethod
     def _format_content(content: Any) -> str:
         if isinstance(content, str):
