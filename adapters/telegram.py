@@ -241,7 +241,12 @@ class TelegramAdapter:
             )
 
             try:
-                application.run_polling(drop_pending_updates=True)
+                # In multi-adapter mode Telegram may run on a non-main thread.
+                # Disable signal registration there (set_wakeup_fd requires main thread).
+                application.run_polling(
+                    drop_pending_updates=True,
+                    stop_signals=None,
+                )
                 return
             except KeyboardInterrupt:
                 raise
