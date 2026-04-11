@@ -18,19 +18,13 @@ from coordinator import Coordinator
 
 TELEGRAM_IMPORT_ERROR: Exception | None = None
 TelegramApplication: Any = None
-TelegramCallbackQueryHandler: Any = None
-TelegramInlineKeyboardButton: Any = None
-TelegramInlineKeyboardMarkup: Any = None
 TelegramMessageHandler: Any = None
 TelegramChatAction: Any = None
 telegram_filters: Any = None
 
 try:
-    from telegram import InlineKeyboardButton as TelegramInlineKeyboardButton
-    from telegram import InlineKeyboardMarkup as TelegramInlineKeyboardMarkup
     from telegram.constants import ChatAction as TelegramChatAction
     from telegram.ext import Application as TelegramApplication
-    from telegram.ext import CallbackQueryHandler as TelegramCallbackQueryHandler
     from telegram.ext import MessageHandler as TelegramMessageHandler
     from telegram.ext import filters as telegram_filters
 except ImportError as exc:  # pragma: no cover - exercised in environments without telegram deps
@@ -44,8 +38,6 @@ TYPING_INTERVAL_SECONDS = 3.0
 RECONNECT_BACKOFF_MIN_SECONDS = 1.0
 RECONNECT_BACKOFF_MAX_SECONDS = 30.0
 MARKDOWN_V2_SPECIAL_CHARS = "_*[]()~`>#+-=|{}.!"
-PLAN_APPROVE_CALLBACK = "sc:plan:approve"
-PLAN_REJECT_CALLBACK = "sc:plan:reject"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -124,10 +116,12 @@ class TelegramAdapter:
             if role == "plan":
                 text = self._format_plan(content)
                 if self._approval_mode == "review":
+                    prompt = self._escape_markdown_v2(
+                        "Reply with 'approve' to continue, or send feedback to revise the plan."
+                    )
                     await self._send_text(
                         chat_id,
-                        text,
-                        reply_markup=self._plan_keyboard(),
+                        f"{text}\n\n{prompt}",
                         parse_mode=MARKDOWN_V2_PARSE_MODE,
                     )
                 else:
@@ -188,7 +182,6 @@ class TelegramAdapter:
         if (
             TelegramApplication is None
             or TelegramMessageHandler is None
-            or TelegramCallbackQueryHandler is None
             or telegram_filters is None
         ):
             raise RuntimeError("Telegram runtime components are unavailable.")
@@ -200,12 +193,6 @@ class TelegramAdapter:
 
             text_filter = telegram_filters.TEXT & ~telegram_filters.COMMAND
             application.add_handler(TelegramMessageHandler(text_filter, self._on_text_message))
-            application.add_handler(
-                TelegramCallbackQueryHandler(
-                    self._on_plan_callback,
-                    pattern=r"^sc:plan:(approve|reject)$",
-                )
-            )
 
             try:
                 # In multi-adapter mode Telegram may run on a non-main thread.
@@ -268,11 +255,16 @@ class TelegramAdapter:
         session_id = self._session_id(chat_id_int)
         pending = self._coordinator.pending_role(session_id=session_id)
         if pending is not None:
-            approved = pending != "plan"
+            approved = True
+            reply_text = text
+            if pending == "plan":
+                parsed = self._parse_plan_reply(text)
+                approved = bool(parsed["approved"])
+                reply_text = str(parsed["text"])
             submitted = self._coordinator.submit_reply(
                 session_id=session_id,
                 approved=approved,
-                text=text,
+                text=reply_text,
             )
             if not submitted:
                 await self._send_text(
@@ -305,42 +297,6 @@ class TelegramAdapter:
             )
             return
         self._ensure_typing_task(chat_id_int)
-
-    async def _on_plan_callback(self, update: Any, context: Any) -> None:
-        del context
-        query = getattr(update, "callback_query", None)
-        if query is None:
-            return
-
-        message = getattr(query, "message", None)
-        chat = getattr(message, "chat", None)
-        chat_id = getattr(chat, "id", None)
-        data = getattr(query, "data", "")
-        if not isinstance(chat_id, int) or not isinstance(data, str):
-            await query.answer()
-            return
-
-        if not await self._ensure_authorized(chat_id):
-            await query.answer(text="Not authorized.")
-            return
-
-        session_id = self._session_id(chat_id)
-        pending = self._coordinator.pending_role(session_id=session_id)
-        if pending != "plan":
-            await query.answer(text="No plan is awaiting approval.")
-            return
-
-        if data == PLAN_APPROVE_CALLBACK:
-            self._coordinator.submit_reply(session_id=session_id, approved=True, text="")
-            await query.answer(text="Plan approved.")
-            return
-
-        if data == PLAN_REJECT_CALLBACK:
-            self._coordinator.submit_reply(session_id=session_id, approved=False, text="")
-            await query.answer(text="Plan rejected.")
-            return
-
-        await query.answer()
 
     async def _send_done_files(self, chat_id: int, files: Any) -> None:
         if not isinstance(files, list):
@@ -500,19 +456,6 @@ class TelegramAdapter:
         return limit
 
     @staticmethod
-    def _plan_keyboard() -> Any:
-        if TelegramInlineKeyboardMarkup is None or TelegramInlineKeyboardButton is None:
-            return None
-        return TelegramInlineKeyboardMarkup(
-            [
-                [
-                    TelegramInlineKeyboardButton("Approve", callback_data=PLAN_APPROVE_CALLBACK),
-                    TelegramInlineKeyboardButton("Reject", callback_data=PLAN_REJECT_CALLBACK),
-                ]
-            ]
-        )
-
-    @staticmethod
     def _format_plan(content: Any) -> str:
         if isinstance(content, dict):
             goal = content.get("goal")
@@ -582,6 +525,15 @@ class TelegramAdapter:
         elif content_b64.endswith("="):
             padding = 1
         return max(0, (len(content_b64) * 3) // 4 - padding)
+
+    @staticmethod
+    def _parse_plan_reply(text: str) -> dict[str, Any]:
+        normalized = text.strip().lower()
+        if normalized in {"y", "yes", "approve", "approved", "ok", "go", "continue"}:
+            return {"approved": True, "text": ""}
+        if normalized in {"n", "no", "reject", "rejected"}:
+            return {"approved": False, "text": ""}
+        return {"approved": False, "text": text}
 
     def _session_id(self, chat_id: int) -> str:
         return f"{self._session_id_prefix}{chat_id}"

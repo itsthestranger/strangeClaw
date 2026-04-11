@@ -6,13 +6,12 @@ import asyncio
 import base64
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
 from adapters.telegram import (
     MARKDOWN_V2_PARSE_MODE,
-    PLAN_APPROVE_CALLBACK,
     TelegramAdapter,
     TelegramLimits,
 )
@@ -64,18 +63,6 @@ class FakeApplication:
 
     def __init__(self, bot: FakeBot) -> None:
         self.bot = bot
-
-
-class FakeCallbackQuery:
-    """Callback query test double."""
-
-    def __init__(self, *, chat_id: int, data: str) -> None:
-        self.message = SimpleNamespace(chat=SimpleNamespace(id=chat_id))
-        self.data = data
-        self.answers: list[dict[str, str]] = []
-
-    async def answer(self, text: str = "") -> None:
-        self.answers.append({"text": text})
 
 
 class FakeCoordinator:
@@ -132,10 +119,6 @@ def _update(chat_id: int, text: str) -> Any:
         effective_chat=SimpleNamespace(id=chat_id),
         effective_message=SimpleNamespace(text=text),
     )
-
-
-def _callback_update(chat_id: int, data: str) -> Any:
-    return SimpleNamespace(callback_query=FakeCallbackQuery(chat_id=chat_id, data=data))
 
 
 def _skills_root() -> Path:
@@ -214,6 +197,27 @@ def test_show_done_sends_text_and_document() -> None:
         }
     ]
     assert bot.documents == [{"chat_id": 7, "caption": "Output: nested/out.txt", "name": "out.txt"}]
+
+
+def test_show_plan_review_uses_text_approval_prompt_without_buttons() -> None:
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        token="token",
+        approval_mode="review",
+    )
+    bot = FakeBot()
+    adapter._application = FakeApplication(bot)  # noqa: SLF001
+
+    asyncio.run(
+        adapter.show(
+            {"type": "message", "role": "plan", "content": {"steps": ["one"]}},
+            chat_id=7,
+        )
+    )
+
+    assert len(bot.messages) == 1
+    assert bot.messages[0]["reply_markup"] is None
+    assert "Reply with" in bot.messages[0]["text"]
 
 
 def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,7 +306,7 @@ def test_on_text_message_reports_capacity() -> None:
     assert "at capacity" in bot.messages[0]["text"]
 
 
-def test_plan_callback_approve_submits_reply() -> None:
+def test_on_text_message_submits_pending_plan_approval() -> None:
     coordinator = FakeCoordinator(start_status="started")
     coordinator.pending["11"] = "plan"
     adapter = TelegramAdapter(
@@ -311,15 +315,11 @@ def test_plan_callback_approve_submits_reply() -> None:
         token="token",
     )
 
-    async def scenario() -> FakeCallbackQuery:
-        callback_update = _callback_update(11, PLAN_APPROVE_CALLBACK)
-        callback_query = cast(FakeCallbackQuery, callback_update.callback_query)
-        await adapter._on_plan_callback(callback_update, None)  # noqa: SLF001
-        return callback_query
+    async def scenario() -> None:
+        await adapter._on_text_message(_update(11, "approve"), None)  # noqa: SLF001
 
-    callback_query = asyncio.run(scenario())
+    asyncio.run(scenario())
     assert coordinator.submitted_replies == [{"session_id": "11", "approved": True, "text": ""}]
-    assert callback_query.answers == [{"text": "Plan approved."}]
 
 
 def test_show_status_long_output_is_chunked_for_telegram_limit() -> None:
@@ -391,8 +391,7 @@ def test_telegram_integration_task_plan_approve_execute_done(
         else:
             raise AssertionError("Timed out waiting for plan approval prompt.")
 
-        callback_update = _callback_update(77, PLAN_APPROVE_CALLBACK)
-        await adapter._on_plan_callback(callback_update, None)  # noqa: SLF001
+        await adapter._on_text_message(_update(77, "approve"), None)  # noqa: SLF001
 
         for _ in range(400):
             if any(message["text"].startswith("*Success:* complete") for message in bot.messages):
