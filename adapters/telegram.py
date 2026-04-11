@@ -14,7 +14,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from adapters.session_persistence import persist_done_event, state_for_follow_up
 from coordinator import Coordinator
 
 TELEGRAM_IMPORT_ERROR: Exception | None = None
@@ -50,25 +49,6 @@ PLAN_REJECT_CALLBACK = "sc:plan:reject"
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
-class PendingReply:
-    """A waiting user reply for an active chat session."""
-
-    role: str
-    future: asyncio.Future[dict[str, Any]]
-
-
-@dataclass
-class ChatSession:
-    """Runtime state for one chat."""
-
-    chat_id: int
-    session_id: str
-    sandbox: Any
-    runner: asyncio.Task[None] | None = None
-    pending_reply: PendingReply | None = None
-
-
 @dataclass(frozen=True)
 class TelegramLimits:
     """Operational safety limits for Telegram adapter runtime behavior."""
@@ -100,11 +80,16 @@ class TelegramAdapter:
         self._allowed_chat_ids = set(allowed_chat_ids or [])
         self._limits = limits or TelegramLimits()
         self._session_id_prefix = session_id_prefix
-        self._coordinator = coordinator
-        self._sessions: dict[int, ChatSession] = {}
-        self._latest_state_by_chat: dict[int, dict[str, Any]] = {}
+        self._coordinator = coordinator or Coordinator(
+            sandbox_factory=self._sandbox_factory,
+            approval_mode=self._approval_mode,
+            llm_config=self._llm_config,
+            max_active_sessions=self._limits.max_active_sessions,
+        )
+
         self._application: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._typing_tasks: dict[int, asyncio.Task[None]] = {}
 
     def get_task(self, update: Any | None = None) -> dict[str, Any]:
         """Build a task payload from an incoming Telegram update."""
@@ -192,24 +177,6 @@ class TelegramAdapter:
             parse_mode=MARKDOWN_V2_PARSE_MODE,
         )
 
-    async def get_reply(self, role: str, *, chat_id: int) -> dict[str, Any]:
-        """Wait for a user reply for plan review or clarification."""
-        if role not in {"plan", "clarification"}:
-            raise ValueError(f"Unsupported reply role: {role}")
-
-        session = self._require_session(chat_id)
-        if session.pending_reply is not None:
-            raise RuntimeError("Chat already has a pending reply.")
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        session.pending_reply = PendingReply(role=role, future=future)
-        try:
-            return await future
-        finally:
-            if session.pending_reply is not None and session.pending_reply.future is future:
-                session.pending_reply = None
-
     def run(self) -> None:
         """Drive the Telegram adapter loop."""
         if TELEGRAM_IMPORT_ERROR is not None:
@@ -262,10 +229,12 @@ class TelegramAdapter:
                     RECONNECT_BACKOFF_MAX_SECONDS,
                 )
             finally:
+                self._cancel_all_typing_tasks()
                 self._application = None
 
     def stop(self) -> None:
         """Best-effort stop for run_polling loop."""
+        self._cancel_all_typing_tasks()
         application = self._application
         if application is None:
             return
@@ -292,44 +261,50 @@ class TelegramAdapter:
         if not await self._ensure_authorized(chat_id):
             return
 
-        if self._coordinator is not None:
-            await self._on_text_message_with_coordinator(chat_id=chat_id, text=text)
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+        chat_id_int = chat_id
+        session_id = self._session_id(chat_id_int)
+        pending = self._coordinator.pending_role(session_id=session_id)
+        if pending is not None:
+            approved = pending != "plan"
+            submitted = self._coordinator.submit_reply(
+                session_id=session_id,
+                approved=approved,
+                text=text,
+            )
+            if not submitted:
+                await self._send_text(
+                    chat_id,
+                    "No prompt is waiting for a reply right now.",
+                )
             return
 
-        existing = self._sessions.get(chat_id)
-        if existing is not None and existing.pending_reply is not None:
-            if self._resolve_text_reply(existing, text):
-                return
+        def sink(event: dict[str, Any], *, cid: int = chat_id_int) -> None:
+            self._emit_from_coordinator(chat_id=cid, event=event)
 
-        if existing is not None and existing.runner is not None and not existing.runner.done():
+        status = self._coordinator.start_task(
+            session_id=session_id,
+            text=text,
+            sink=sink,
+        )
+        if status == "busy":
             await self._send_text(
                 chat_id,
                 "A task is already running. Wait for completion or answer the active prompt.",
             )
             return
-
-        if self._active_session_count() >= self._limits.max_active_sessions:
+        if status == "capacity":
             await self._send_text(
-                chat_id,
+                chat_id_int,
                 (
                     "The bot is at capacity right now. "
                     "Please retry after one of the active tasks finishes."
                 ),
             )
             return
-
-        task_event = self.get_task(update)
-        previous_state = self._latest_state_by_chat.get(chat_id)
-        if previous_state is not None:
-            task_event["state"] = state_for_follow_up(previous_state)
-        sandbox = self._sandbox_factory()
-        session = ChatSession(
-            chat_id=chat_id,
-            session_id=self._session_id(chat_id),
-            sandbox=sandbox,
-        )
-        self._sessions[chat_id] = session
-        session.runner = asyncio.create_task(self._run_chat_session(session, task_event))
+        self._ensure_typing_task(chat_id_int)
 
     async def _on_plan_callback(self, update: Any, context: Any) -> None:
         del context
@@ -349,137 +324,23 @@ class TelegramAdapter:
             await query.answer(text="Not authorized.")
             return
 
-        if self._coordinator is not None:
-            await self._on_plan_callback_with_coordinator(
-                chat_id=chat_id,
-                data=data,
-                query=query,
-            )
-            return
-
-        session = self._sessions.get(chat_id)
-        if session is None or session.pending_reply is None or session.pending_reply.role != "plan":
+        session_id = self._session_id(chat_id)
+        pending = self._coordinator.pending_role(session_id=session_id)
+        if pending != "plan":
             await query.answer(text="No plan is awaiting approval.")
             return
 
-        future = session.pending_reply.future
-        if future.done():
-            await query.answer()
-            return
-
         if data == PLAN_APPROVE_CALLBACK:
-            future.set_result({"approved": True, "text": ""})
+            self._coordinator.submit_reply(session_id=session_id, approved=True, text="")
             await query.answer(text="Plan approved.")
             return
 
         if data == PLAN_REJECT_CALLBACK:
-            future.set_result({"approved": False, "text": ""})
+            self._coordinator.submit_reply(session_id=session_id, approved=False, text="")
             await query.answer(text="Plan rejected.")
             return
 
         await query.answer()
-
-    async def _run_chat_session(self, session: ChatSession, task_event: dict[str, Any]) -> None:
-        chat_id = session.chat_id
-        last_typing_time = 0.0
-        try:
-            await asyncio.to_thread(session.sandbox.run, task_event)
-            while True:
-                event = await asyncio.to_thread(session.sandbox.receive, 0.2)
-                if event is None:
-                    now = time.monotonic()
-                    if now - last_typing_time >= TYPING_INTERVAL_SECONDS:
-                        await self._send_typing(chat_id)
-                        last_typing_time = now
-                    await asyncio.sleep(0)
-                    continue
-
-                await self.show(event, chat_id=chat_id)
-
-                event_type = event.get("type")
-                if event_type == "message":
-                    role = event.get("role")
-                    if role == "plan" and task_event.get("approval_mode") == "review":
-                        reply = await self.get_reply("plan", chat_id=chat_id)
-                        await asyncio.to_thread(
-                            session.sandbox.send,
-                            {"type": "user_reply", **reply},
-                        )
-                    elif role == "clarification":
-                        reply = await self.get_reply("clarification", chat_id=chat_id)
-                        await asyncio.to_thread(
-                            session.sandbox.send,
-                            {"type": "user_reply", **reply},
-                        )
-
-                if event_type == "done":
-                    await self._persist_chat_done_state(chat_id=chat_id, done_event=event)
-                    return
-        except Exception as exc:
-            await self._send_text(
-                chat_id,
-                f"*Task Failed:* {self._escape_markdown_v2(str(exc))}",
-                parse_mode=MARKDOWN_V2_PARSE_MODE,
-            )
-        finally:
-            self._cancel_pending_reply(session)
-            await asyncio.to_thread(session.sandbox.stop)
-            self._sessions.pop(chat_id, None)
-
-    def _cancel_pending_reply(self, session: ChatSession) -> None:
-        pending = session.pending_reply
-        if pending is None:
-            return
-        if pending.future.done():
-            session.pending_reply = None
-            return
-
-        if pending.role == "plan":
-            pending.future.set_result({"approved": False, "text": ""})
-        else:
-            pending.future.set_result({"approved": True, "text": ""})
-        session.pending_reply = None
-
-    def _active_session_count(self) -> int:
-        count = 0
-        for item in self._sessions.values():
-            if item.runner is not None and not item.runner.done():
-                count += 1
-        return count
-
-    async def _persist_chat_done_state(self, *, chat_id: int, done_event: dict[str, Any]) -> None:
-        state = done_event.get("state")
-        if isinstance(state, dict):
-            self._latest_state_by_chat[chat_id] = state
-        session = self._sessions.get(chat_id)
-        session_id = session.session_id if session is not None else self._session_id(chat_id)
-        try:
-            await asyncio.to_thread(
-                persist_done_event,
-                session_id=session_id,
-                done_event=done_event,
-            )
-        except ValueError as exc:
-            await self._send_text(
-                chat_id,
-                f"Failed to persist session outputs: {self._escape_markdown_v2(str(exc))}",
-                parse_mode=MARKDOWN_V2_PARSE_MODE,
-            )
-
-    def _resolve_text_reply(self, session: ChatSession, text: str) -> bool:
-        pending = session.pending_reply
-        if pending is None or pending.future.done():
-            return False
-
-        if pending.role == "plan":
-            pending.future.set_result({"approved": False, "text": text})
-            return True
-
-        if pending.role == "clarification":
-            pending.future.set_result({"approved": True, "text": text})
-            return True
-
-        return False
 
     async def _send_done_files(self, chat_id: int, files: Any) -> None:
         if not isinstance(files, list):
@@ -697,12 +558,6 @@ class TelegramAdapter:
             return f"{header}\n```text\n{escaped_preview}\n```"
         return header
 
-    def _require_session(self, chat_id: int) -> ChatSession:
-        session = self._sessions.get(chat_id)
-        if session is None:
-            raise RuntimeError(f"No active session for chat {chat_id}.")
-        return session
-
     async def _ensure_authorized(self, chat_id: int) -> bool:
         if not self._allowed_chat_ids or chat_id in self._allowed_chat_ids:
             return True
@@ -731,89 +586,53 @@ class TelegramAdapter:
     def _session_id(self, chat_id: int) -> str:
         return f"{self._session_id_prefix}{chat_id}"
 
-    async def _on_text_message_with_coordinator(self, *, chat_id: int, text: str) -> None:
-        coordinator = self._coordinator
-        if coordinator is None:
-            return
-        if self._loop is None:
-            self._loop = asyncio.get_running_loop()
-
-        session_id = self._session_id(chat_id)
-        pending = coordinator.pending_role(session_id=session_id)
-        if pending is not None:
-            approved = pending != "plan"
-            submitted = coordinator.submit_reply(
-                session_id=session_id,
-                approved=approved,
-                text=text,
-            )
-            if not submitted:
-                await self._send_text(
-                    chat_id,
-                    "No prompt is waiting for a reply right now.",
-                )
-            return
-
-        def sink(event: dict[str, Any], *, cid: int = chat_id) -> None:
-            self._emit_from_coordinator(chat_id=cid, event=event)
-
-        status = coordinator.start_task(
-            session_id=session_id,
-            text=text,
-            sink=sink,
-        )
-        if status == "busy":
-            await self._send_text(
-                chat_id,
-                "A task is already running. Wait for completion or answer the active prompt.",
-            )
-            return
-        if status == "capacity":
-            await self._send_text(
-                chat_id,
-                (
-                    "The bot is at capacity right now. "
-                    "Please retry after one of the active tasks finishes."
-                ),
-            )
-            return
-
-    async def _on_plan_callback_with_coordinator(
-        self,
-        *,
-        chat_id: int,
-        data: str,
-        query: Any,
-    ) -> None:
-        coordinator = self._coordinator
-        if coordinator is None:
-            await query.answer()
-            return
-
-        session_id = self._session_id(chat_id)
-        pending = coordinator.pending_role(session_id=session_id)
-        if pending != "plan":
-            await query.answer(text="No plan is awaiting approval.")
-            return
-
-        if data == PLAN_APPROVE_CALLBACK:
-            coordinator.submit_reply(session_id=session_id, approved=True, text="")
-            await query.answer(text="Plan approved.")
-            return
-
-        if data == PLAN_REJECT_CALLBACK:
-            coordinator.submit_reply(session_id=session_id, approved=False, text="")
-            await query.answer(text="Plan rejected.")
-            return
-
-        await query.answer()
-
     def _emit_from_coordinator(self, *, chat_id: int, event: dict[str, Any]) -> None:
         loop = self._loop
         if loop is None:
             return
-        future = asyncio.run_coroutine_threadsafe(self.show(event, chat_id=chat_id), loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self._show_and_track_event(chat_id=chat_id, event=event),
+            loop,
+        )
         future.add_done_callback(_consume_future_exception)
+
+    async def _show_and_track_event(self, *, chat_id: int, event: dict[str, Any]) -> None:
+        await self.show(event, chat_id=chat_id)
+        if event.get("type") == "done":
+            self._cancel_typing_task(chat_id)
+
+    def _ensure_typing_task(self, chat_id: int) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        existing = self._typing_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            return
+        self._typing_tasks[chat_id] = loop.create_task(self._typing_pulse(chat_id))
+
+    async def _typing_pulse(self, chat_id: int) -> None:
+        session_id = self._session_id(chat_id)
+        try:
+            while True:
+                pending = self._coordinator.pending_role(session_id=session_id)
+                if pending is None:
+                    try:
+                        await self._send_typing(chat_id)
+                    except RuntimeError:
+                        return
+                await asyncio.sleep(TYPING_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+    def _cancel_typing_task(self, chat_id: int) -> None:
+        task = self._typing_tasks.pop(chat_id, None)
+        if task is None:
+            return
+        task.cancel()
+
+    def _cancel_all_typing_tasks(self) -> None:
+        for chat_id in list(self._typing_tasks):
+            self._cancel_typing_task(chat_id)
 
     @staticmethod
     def _escape_markdown_v2(text: str) -> str:

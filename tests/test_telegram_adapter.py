@@ -10,15 +10,14 @@ from typing import Any, cast
 
 import pytest
 
-import adapters.telegram as telegram_module
 from adapters.telegram import (
     MARKDOWN_V2_PARSE_MODE,
     PLAN_APPROVE_CALLBACK,
-    ChatSession,
     TelegramAdapter,
     TelegramLimits,
 )
 from agent.llm import LLMResponse, ToolCall
+from coordinator import Coordinator
 from sandbox.yolo import YoloSandbox
 
 
@@ -77,6 +76,33 @@ class FakeCallbackQuery:
 
     async def answer(self, text: str = "") -> None:
         self.answers.append({"text": text})
+
+
+class FakeCoordinator:
+    """Coordinator stub for adapter tests."""
+
+    def __init__(self, *, start_status: str = "started") -> None:
+        self.start_status = start_status
+        self.pending: dict[str, str] = {}
+        self.started_tasks: list[dict[str, Any]] = []
+        self.submitted_replies: list[dict[str, Any]] = []
+
+    def pending_role(self, *, session_id: str) -> str | None:
+        return self.pending.get(session_id)
+
+    def submit_reply(self, *, session_id: str, approved: bool, text: str) -> bool:
+        role = self.pending.get(session_id)
+        if role is None:
+            return False
+        self.pending.pop(session_id, None)
+        self.submitted_replies.append(
+            {"session_id": session_id, "approved": approved, "text": text}
+        )
+        return True
+
+    def start_task(self, *, session_id: str, text: str, sink: Any) -> str:
+        self.started_tasks.append({"session_id": session_id, "text": text, "sink": sink})
+        return self.start_status
 
 
 class ScriptedLLM:
@@ -153,6 +179,13 @@ def test_chunk_text_respects_limit() -> None:
     assert chunks == ["line1", "line2", "line3"]
 
 
+def test_chunk_markdown_text_prefers_code_fence_boundaries() -> None:
+    text = "*Action:* shell\n```text\nline1\nline2\n```\nend"
+    chunks = TelegramAdapter._chunk_markdown_text(text, limit=24)
+    assert len(chunks) >= 2
+    assert all(chunk.count("```") % 2 == 0 for chunk in chunks[:-1])
+
+
 def test_show_done_sends_text_and_document() -> None:
     adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
     bot = FakeBot()
@@ -181,28 +214,6 @@ def test_show_done_sends_text_and_document() -> None:
         }
     ]
     assert bot.documents == [{"chat_id": 7, "caption": "Output: nested/out.txt", "name": "out.txt"}]
-
-
-def test_plan_feedback_text_resolves_pending_reply() -> None:
-    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
-    session = ChatSession(chat_id=1, session_id="1", sandbox=object())
-    adapter._sessions[1] = session  # noqa: SLF001
-
-    async def scenario() -> dict[str, Any]:
-        waiter = asyncio.create_task(adapter.get_reply("plan", chat_id=1))
-        await asyncio.sleep(0)
-        assert adapter._resolve_text_reply(session, "needs changes")  # noqa: SLF001
-        return await waiter
-
-    reply = asyncio.run(scenario())
-    assert reply == {"approved": False, "text": "needs changes"}
-
-
-def test_chunk_markdown_text_prefers_code_fence_boundaries() -> None:
-    text = "*Action:* shell\n```text\nline1\nline2\n```\nend"
-    chunks = TelegramAdapter._chunk_markdown_text(text, limit=24)
-    assert len(chunks) >= 2
-    assert all(chunk.count("```") % 2 == 0 for chunk in chunks[:-1])
 
 
 def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,93 +245,53 @@ def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -
     assert bot.messages[0]["parse_mode"] == MARKDOWN_V2_PARSE_MODE
 
 
-def test_run_chat_session_reports_failure_and_cleans_up(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingSandbox:
-        def __init__(self) -> None:
-            self.stop_calls = 0
-
-        def run(self, task: dict[str, Any]) -> None:
-            del task
-
-        def receive(self, timeout: float) -> dict[str, Any] | None:
-            del timeout
-            raise RuntimeError("sandbox crashed")
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
-    sandbox = FailingSandbox()
-    adapter = TelegramAdapter(sandbox_factory=lambda: sandbox, token="token")
-    bot = FakeBot()
-    adapter._application = FakeApplication(bot)  # noqa: SLF001
-    session = ChatSession(chat_id=9, session_id="9", sandbox=sandbox)
-    adapter._sessions[9] = session  # noqa: SLF001
-
-    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(telegram_module.asyncio, "to_thread", fake_to_thread)
-
-    asyncio.run(adapter._run_chat_session(session, {"approval_mode": "review"}))  # noqa: SLF001
-
-    assert sandbox.stop_calls == 1
-    assert 9 not in adapter._sessions  # noqa: SLF001
-    assert len(bot.messages) == 1
-    assert bot.messages[0]["parse_mode"] == MARKDOWN_V2_PARSE_MODE
-    assert "Task Failed" in bot.messages[0]["text"]
-
-
-def test_on_text_message_includes_follow_up_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
-    adapter._latest_state_by_chat[42] = {  # noqa: SLF001
-        "goal": "g",
-        "plan": {"steps": ["old"]},
-        "history": [{"type": "action"}],
-    }
-    captured_task: dict[str, Any] = {}
-
-    async def fake_run_chat_session(
-        session: ChatSession,
-        task_event: dict[str, Any],
-    ) -> None:
-        del session
-        captured_task.update(task_event)
-
-    monkeypatch.setattr(adapter, "_run_chat_session", fake_run_chat_session)
+def test_on_text_message_starts_task_via_coordinator() -> None:
+    coordinator = FakeCoordinator(start_status="started")
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        coordinator=coordinator,  # type: ignore[arg-type]
+        token="token",
+    )
 
     async def scenario() -> None:
-        await adapter._on_text_message(_update(42, "follow-up"), None)  # noqa: SLF001
-        await asyncio.sleep(0)
+        await adapter._on_text_message(_update(42, "run task"), None)  # noqa: SLF001
 
     asyncio.run(scenario())
 
-    assert captured_task["text"] == "follow-up"
-    assert captured_task["state"] == {"goal": "g", "history": [{"type": "action"}]}
-    assert "plan" not in captured_task["state"]
+    assert len(coordinator.started_tasks) == 1
+    assert coordinator.started_tasks[0]["session_id"] == "42"
+    assert coordinator.started_tasks[0]["text"] == "run task"
 
 
-def test_on_text_message_respects_max_active_sessions() -> None:
+def test_on_text_message_submits_pending_plan_feedback() -> None:
+    coordinator = FakeCoordinator(start_status="started")
+    coordinator.pending["42"] = "plan"
     adapter = TelegramAdapter(
         sandbox_factory=lambda: object(),
+        coordinator=coordinator,  # type: ignore[arg-type]
         token="token",
-        limits=TelegramLimits(max_active_sessions=1),
+    )
+
+    async def scenario() -> None:
+        await adapter._on_text_message(_update(42, "needs changes"), None)  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+    assert coordinator.submitted_replies == [
+        {"session_id": "42", "approved": False, "text": "needs changes"}
+    ]
+    assert coordinator.started_tasks == []
+
+
+def test_on_text_message_reports_capacity() -> None:
+    coordinator = FakeCoordinator(start_status="capacity")
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        coordinator=coordinator,  # type: ignore[arg-type]
+        token="token",
     )
     bot = FakeBot()
     adapter._application = FakeApplication(bot)  # noqa: SLF001
-
-    class RunningTask:
-        @staticmethod
-        def done() -> bool:
-            return False
-
-    adapter._sessions[1] = ChatSession(  # noqa: SLF001
-        chat_id=1,
-        session_id="1",
-        sandbox=object(),
-        runner=cast(Any, RunningTask()),
-    )
 
     async def scenario() -> None:
         await adapter._on_text_message(_update(2, "new task"), None)  # noqa: SLF001
@@ -329,48 +300,26 @@ def test_on_text_message_respects_max_active_sessions() -> None:
 
     assert len(bot.messages) == 1
     assert "at capacity" in bot.messages[0]["text"]
-    assert 2 not in adapter._sessions  # noqa: SLF001
 
 
-def test_plan_callback_approve_resolves_pending_reply() -> None:
-    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
-    session = ChatSession(chat_id=11, session_id="11", sandbox=object())
-    adapter._sessions[11] = session  # noqa: SLF001
+def test_plan_callback_approve_submits_reply() -> None:
+    coordinator = FakeCoordinator(start_status="started")
+    coordinator.pending["11"] = "plan"
+    adapter = TelegramAdapter(
+        sandbox_factory=lambda: object(),
+        coordinator=coordinator,  # type: ignore[arg-type]
+        token="token",
+    )
 
-    async def scenario() -> tuple[dict[str, Any], FakeCallbackQuery]:
-        waiter = asyncio.create_task(adapter.get_reply("plan", chat_id=11))
-        await asyncio.sleep(0)
+    async def scenario() -> FakeCallbackQuery:
         callback_update = _callback_update(11, PLAN_APPROVE_CALLBACK)
         callback_query = cast(FakeCallbackQuery, callback_update.callback_query)
         await adapter._on_plan_callback(callback_update, None)  # noqa: SLF001
-        return await waiter, callback_query
+        return callback_query
 
-    reply, callback_query = asyncio.run(scenario())
-    assert reply == {"approved": True, "text": ""}
+    callback_query = asyncio.run(scenario())
+    assert coordinator.submitted_replies == [{"session_id": "11", "approved": True, "text": ""}]
     assert callback_query.answers == [{"text": "Plan approved."}]
-
-
-def test_concurrent_pending_replies_do_not_cross_contaminate() -> None:
-    adapter = TelegramAdapter(sandbox_factory=lambda: object(), token="token")
-    adapter._sessions[1] = ChatSession(chat_id=1, session_id="1", sandbox=object())  # noqa: SLF001
-    adapter._sessions[2] = ChatSession(chat_id=2, session_id="2", sandbox=object())  # noqa: SLF001
-
-    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
-        waiter_one = asyncio.create_task(adapter.get_reply("clarification", chat_id=1))
-        waiter_two = asyncio.create_task(adapter.get_reply("clarification", chat_id=2))
-        await asyncio.sleep(0)
-
-        await adapter._on_text_message(_update(1, "alpha"), None)  # noqa: SLF001
-        reply_one = await asyncio.wait_for(waiter_one, timeout=1.0)
-        assert waiter_two.done() is False
-
-        await adapter._on_text_message(_update(2, "beta"), None)  # noqa: SLF001
-        reply_two = await asyncio.wait_for(waiter_two, timeout=1.0)
-        return reply_one, reply_two
-
-    reply_one, reply_two = asyncio.run(scenario())
-    assert reply_one == {"approved": True, "text": "alpha"}
-    assert reply_two == {"approved": True, "text": "beta"}
 
 
 def test_show_status_long_output_is_chunked_for_telegram_limit() -> None:
@@ -396,10 +345,6 @@ def test_telegram_integration_task_plan_approve_execute_done(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(telegram_module.asyncio, "to_thread", fake_to_thread)
 
     llm = ScriptedLLM(
         responses=[
@@ -421,6 +366,15 @@ def test_telegram_integration_task_plan_approve_execute_done(
             skills_dir=str(_skills_root()),
             llm_factory=lambda _: llm,
         ),
+        coordinator=Coordinator(
+            sandbox_factory=lambda: YoloSandbox(
+                skills_dir=str(_skills_root()),
+                llm_factory=lambda _: llm,
+            ),
+            approval_mode="review",
+            llm_config={"model": "fake/model", "api_key": "fake-key"},
+            max_active_sessions=8,
+        ),
         token="token",
         approval_mode="review",
         llm_config={"model": "fake/model", "api_key": "fake-key"},
@@ -431,12 +385,7 @@ def test_telegram_integration_task_plan_approve_execute_done(
     async def scenario() -> None:
         await adapter._on_text_message(_update(77, "run task"), None)  # noqa: SLF001
         for _ in range(400):
-            session = adapter._sessions.get(77)  # noqa: SLF001
-            if (
-                session is not None
-                and session.pending_reply is not None
-                and session.pending_reply.role == "plan"
-            ):
+            if any(message["text"].startswith("*Plan*") for message in bot.messages):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -446,7 +395,7 @@ def test_telegram_integration_task_plan_approve_execute_done(
         await adapter._on_plan_callback(callback_update, None)  # noqa: SLF001
 
         for _ in range(400):
-            if 77 not in adapter._sessions:  # noqa: SLF001
+            if any(message["text"].startswith("*Success:* complete") for message in bot.messages):
                 break
             await asyncio.sleep(0.01)
         else:

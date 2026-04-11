@@ -77,6 +77,22 @@ def _telegram_adapter_config(
     }
 
 
+def _coordinator_max_active_sessions(
+    *,
+    config: dict[str, Any],
+    enabled_adapters: list[str],
+) -> int | None:
+    if "telegram" not in enabled_adapters:
+        return None
+    telegram_cfg = config.get("telegram", {})
+    if not isinstance(telegram_cfg, dict):
+        raise ValueError("Config field telegram must be a mapping.")
+    value = int(telegram_cfg.get("max_active_sessions", 8))
+    if value <= 0:
+        raise ValueError("telegram.max_active_sessions must be greater than zero.")
+    return value
+
+
 def _build_adapter(
     *,
     adapter_name: str,
@@ -152,6 +168,10 @@ def main(argv: list[str] | None = None) -> None:
         sandbox_factory=lambda: _build_yolo_sandbox(config),
         approval_mode=str(config["approval_mode"]),
         llm_config=dict(config["llm"]),
+        max_active_sessions=_coordinator_max_active_sessions(
+            config=config,
+            enabled_adapters=enabled_adapters,
+        ),
     )
     created: list[tuple[str, CLIAdapter | TelegramAdapter]] = []
     for adapter_name in enabled_adapters:

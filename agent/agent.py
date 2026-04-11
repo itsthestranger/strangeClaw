@@ -19,11 +19,11 @@ PLANNING_SYSTEM_PROMPT = (
 )
 
 EXECUTION_SYSTEM_PROMPT = (
-    "You are in the execution loop. Respond with a structured decision every turn. "
+    "You are in an agentic loop: Inspect -> Choose -> Act -> Observe -> Repeat. "
+    "On each turn, inspect goal/plan/history and choose exactly one structured decision. "
     "Use a normal skill/action/args tool call to execute tools. "
     "Use skill_contracts in the user payload to satisfy required args and defaults. "
-    "For control decisions, use skill='__agent__' and one of actions: "
-    "done, clarify, replan. "
+    "For control decisions, use skill='__agent__' and one of actions: done, clarify, replan. "
     "For done use args.reply. For clarify use args.question. "
     "For replan you may set args.feedback."
 )
@@ -75,6 +75,7 @@ class Agent:
         llm_config_path: str = "/run/strangeclaw/llm.json",
         token_budget: int = 4000,
         summary_threshold: int = 10,
+        max_output_total_bytes: int = 10 * 1024 * 1024,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
     ) -> None:
         if max_iterations <= 0:
@@ -83,6 +84,8 @@ class Agent:
             raise AgentError("token_budget must be greater than zero.")
         if summary_threshold <= 0:
             raise AgentError("summary_threshold must be greater than zero.")
+        if max_output_total_bytes <= 0:
+            raise AgentError("max_output_total_bytes must be greater than zero.")
 
         self._transport = transport
         self._skills = Skills(skills_dir)
@@ -91,6 +94,7 @@ class Agent:
         self._llm_config_path = Path(llm_config_path)
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
+        self._max_output_total_bytes = max_output_total_bytes
         self._llm_factory = llm_factory or LLMClient.from_config
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
@@ -114,54 +118,21 @@ class Agent:
             plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
 
         for _ in range(self._max_iterations):
-            try:
-                decision = self._execution_decision(goal=goal, plan=plan, history=history)
-            except AgentError as exc:
-                error_result = ToolResult(
-                    exit_code=1,
-                    stdout="",
-                    stderr=(
-                        "Decision parse error: "
-                        f"{exc} "
-                        "Return a valid JSON tool call with skill/action/args and re-check "
-                        "the skill contracts."
-                    ),
-                )
-                action_event = {
-                    "type": "action",
-                    "skill": "__agent__",
-                    "action": "decision_error",
-                    "args": {},
-                    "result": asdict(error_result),
-                }
-                self._send(action_event)
-                history.append(action_event)
+            decision = self._choose_next_decision(goal=goal, plan=plan, history=history)
+            if decision is None:
                 continue
 
-            if decision.skill == "__agent__":
-                handled = self._handle_control_decision(
-                    decision=decision,
-                    goal=goal,
-                    approval_mode=approval_mode,
-                    history=history,
-                    current_plan=plan,
-                )
-                if handled["done"]:
-                    return
-                if handled["replanned"]:
-                    plan = handled["plan"]
-                continue
-
-            result = self._execute_tool(decision)
-            action_event = {
-                "type": "action",
-                "skill": decision.skill,
-                "action": decision.action,
-                "args": decision.args,
-                "result": asdict(result),
-            }
-            self._send(action_event)
-            history.append(action_event)
+            outcome = self._act_on_decision(
+                decision=decision,
+                goal=goal,
+                approval_mode=approval_mode,
+                current_plan=plan,
+                history=history,
+            )
+            plan = outcome["plan"]
+            self._observe(history=history, observation=outcome["observation"])
+            if outcome["done"]:
+                return
 
         self._send(
             {
@@ -276,14 +247,83 @@ class Agent:
             return fallback
         raise AgentError("LLM response did not contain an executable action decision.")
 
+    def _choose_next_decision(
+        self,
+        *,
+        goal: str,
+        plan: Any,
+        history: list[dict[str, Any]],
+    ) -> ToolCall | None:
+        try:
+            return self._execution_decision(goal=goal, plan=plan, history=history)
+        except AgentError as exc:
+            history.append(self._emit_decision_parse_error(exc))
+            return None
+
+    def _emit_decision_parse_error(self, error: AgentError) -> dict[str, Any]:
+        error_result = ToolResult(
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "Decision parse error: "
+                f"{error} "
+                "Return a valid JSON tool call with skill/action/args and re-check "
+                "the skill contracts."
+            ),
+        )
+        action_event = {
+            "type": "action",
+            "skill": "__agent__",
+            "action": "decision_error",
+            "args": {},
+            "result": asdict(error_result),
+        }
+        self._send(action_event)
+        return action_event
+
+    def _act_on_decision(
+        self,
+        *,
+        decision: ToolCall,
+        goal: str,
+        approval_mode: str,
+        current_plan: Any,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if decision.skill == "__agent__":
+            return self._handle_control_decision(
+                decision=decision,
+                goal=goal,
+                approval_mode=approval_mode,
+                current_plan=current_plan,
+                history=history,
+            )
+
+        result = self._execute_tool(decision)
+        action_event = {
+            "type": "action",
+            "skill": decision.skill,
+            "action": decision.action,
+            "args": decision.args,
+            "result": asdict(result),
+        }
+        self._send(action_event)
+        return {"done": False, "plan": current_plan, "observation": action_event}
+
+    @staticmethod
+    def _observe(*, history: list[dict[str, Any]], observation: dict[str, Any] | None) -> None:
+        if observation is None:
+            return
+        history.append(observation)
+
     def _handle_control_decision(
         self,
         *,
         decision: ToolCall,
         goal: str,
         approval_mode: str,
-        history: list[dict[str, Any]],
         current_plan: Any,
+        history: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if decision.action == "done":
             reply = _string_arg(decision.args, "reply", fallback="Task completed.")
@@ -301,7 +341,7 @@ class Agent:
                     "files": self._collect_output_files(),
                 }
             )
-            return {"done": True, "replanned": False, "plan": current_plan}
+            return {"done": True, "plan": current_plan, "observation": None}
 
         if decision.action == "clarify":
             question = _string_arg(
@@ -311,30 +351,33 @@ class Agent:
             )
             self._send({"type": "message", "role": "clarification", "content": question})
             user_reply = self._wait_for_user_reply()
-            history.append(
-                {
+            return {
+                "done": False,
+                "plan": current_plan,
+                "observation": {
                     "type": "clarification",
                     "question": question,
                     "user_reply": user_reply.get("text", ""),
-                }
-            )
-            return {"done": False, "replanned": False, "plan": current_plan}
+                },
+            }
 
         if decision.action == "replan":
             feedback = _string_arg(decision.args, "feedback", fallback="")
-            if feedback:
-                history.append({"type": "replan", "feedback": feedback})
             new_plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
-            return {"done": False, "replanned": True, "plan": new_plan}
+            observation: dict[str, Any] | None = None
+            if feedback:
+                observation = {"type": "replan", "feedback": feedback}
+            return {"done": False, "plan": new_plan, "observation": observation}
 
-        history.append(
-            {
+        return {
+            "done": False,
+            "plan": current_plan,
+            "observation": {
                 "type": "control_error",
                 "action": decision.action,
                 "reason": "unsupported __agent__ action",
-            }
-        )
-        return {"done": False, "replanned": False, "plan": current_plan}
+            },
+        }
 
     def _execute_tool(self, decision: ToolCall) -> ToolResult:
         try:
@@ -367,11 +410,18 @@ class Agent:
             return []
 
         files: list[dict[str, Any]] = []
+        total_bytes = 0
         for file_path in sorted(self._output_dir.rglob("*")):
-            if not file_path.is_file():
+            if not file_path.is_file() or file_path.is_symlink():
+                continue
+            size_bytes = file_path.stat().st_size
+            if size_bytes > self._max_output_total_bytes:
+                continue
+            if total_bytes + size_bytes > self._max_output_total_bytes:
                 continue
             rel_path = file_path.relative_to(self._output_dir).as_posix()
             content = file_path.read_bytes()
+            total_bytes += len(content)
             files.append(
                 {
                     "path": rel_path,
