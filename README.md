@@ -60,6 +60,36 @@ Expected endpoint response is a JSON object. Supported fields:
 - `yolo`: direct host execution for trusted local workflows.
 - `fire`: Firecracker microVM isolation (in progress).
 
+## Telegram Setup
+
+1. Create a bot with BotFather:
+   - Open Telegram and start a chat with `@BotFather`.
+   - Run `/newbot`.
+   - Follow prompts for bot name and username.
+   - Copy the API token BotFather returns.
+2. Update `~/.strangeclaw/config.yaml`:
+   ```yaml
+   adapter: telegram
+
+   telegram:
+     token: "123456789:AA..."
+     local_mode: true
+     allowed_chat_ids: []
+   ```
+3. Start strangeclaw:
+   ```bash
+   .venv/bin/python -m main
+   ```
+4. Open your bot chat in Telegram and send a task message.
+
+`telegram.allowed_chat_ids` behavior:
+- Empty or missing list: any Telegram chat can use the bot (good for local personal use).
+- Non-empty list: only listed chat IDs are allowed; all other chats receive a polite "not authorized" reply.
+
+Security note:
+- Treat `telegram.token` as a secret like your LLM API key.
+- Do not commit bot tokens to git or share them in logs/screenshots.
+
 ## Telegram Session Behavior
 
 When using `adapter: telegram`, strangeclaw currently maps `session_id` to the
