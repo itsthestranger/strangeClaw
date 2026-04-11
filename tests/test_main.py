@@ -27,12 +27,12 @@ class FakeAdapter:
     def __init__(
         self,
         *,
-        sandbox: FakeSandbox,
+        coordinator: Any,
         approval_mode: str,
         llm_config: dict[str, Any],
         **kwargs: Any,
     ) -> None:
-        self.sandbox = sandbox
+        self.coordinator = coordinator
         self.approval_mode = approval_mode
         self.llm_config = llm_config
         self.extra = kwargs
@@ -56,6 +56,7 @@ class FakeTelegramAdapter:
         self,
         *,
         sandbox_factory: Any,
+        coordinator: Any,
         approval_mode: str,
         llm_config: dict[str, Any],
         token: str,
@@ -64,6 +65,7 @@ class FakeTelegramAdapter:
         session_id_prefix: str = "",
     ) -> None:
         self.sandbox_factory = sandbox_factory
+        self.coordinator = coordinator
         self.approval_mode = approval_mode
         self.llm_config = llm_config
         self.token = token
@@ -78,6 +80,51 @@ class FakeTelegramAdapter:
 
     def stop(self) -> None:
         self.stop_called = True
+
+
+class FakeCoordinator:
+    """Coordinator test double."""
+
+    def __init__(
+        self,
+        *,
+        sandbox_factory: Any,
+        approval_mode: str,
+        llm_config: dict[str, Any] | None = None,
+        max_active_sessions: int | None = None,
+    ) -> None:
+        self.sandbox_factory = sandbox_factory
+        self.approval_mode = approval_mode
+        self.llm_config = llm_config
+        self.max_active_sessions = max_active_sessions
+        self.seed_calls: list[tuple[str, dict[str, Any]]] = []
+        self.stop_session_calls: list[str] = []
+        self.stop_all_called = False
+
+    def seed_state(self, *, session_id: str, state: dict[str, Any]) -> None:
+        self.seed_calls.append((session_id, state))
+
+    def start_task(self, *, session_id: str, text: str, sink: Any) -> str:
+        del session_id
+        del text
+        del sink
+        return "started"
+
+    def pending_role(self, *, session_id: str) -> Any:
+        del session_id
+        return None
+
+    def submit_reply(self, *, session_id: str, approved: bool, text: str) -> bool:
+        del session_id
+        del approved
+        del text
+        return True
+
+    def stop_session(self, *, session_id: str) -> None:
+        self.stop_session_calls.append(session_id)
+
+    def stop_all(self) -> None:
+        self.stop_all_called = True
 
 
 def _config() -> dict[str, Any]:
@@ -111,11 +158,16 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
         created["sandbox"] = sandbox
         return sandbox
 
+    def fake_coordinator_factory(**kwargs: Any) -> FakeCoordinator:
+        coordinator = FakeCoordinator(**kwargs)
+        created["coordinator"] = coordinator
+        return coordinator
+
     def fake_adapter_factory(
-        *, sandbox: FakeSandbox, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
     ) -> FakeAdapter:
         adapter = FakeAdapter(
-            sandbox=sandbox,
+            coordinator=coordinator,
             approval_mode=approval_mode,
             llm_config=llm_config,
             **kwargs,
@@ -125,11 +177,13 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(main, "load_config", fake_load_config)
     monkeypatch.setattr(main, "YoloSandbox", fake_sandbox_factory)
+    monkeypatch.setattr(main, "Coordinator", fake_coordinator_factory)
     monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
 
     main.main([])
 
-    sandbox = created["sandbox"]
+    coordinator = created["coordinator"]
+    sandbox = coordinator.sandbox_factory()
     adapter = created["adapter"]
     assert sandbox.kwargs["skills_dir"] == "./skills"
     assert sandbox.kwargs["max_iterations"] == 7
@@ -137,6 +191,7 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     assert sandbox.kwargs["summary_threshold"] == 9
     assert adapter.approval_mode == "review"
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
+    assert adapter.coordinator is coordinator
     assert adapter.run_called is True
 
 
@@ -145,27 +200,33 @@ def test_main_stops_sandbox_on_keyboard_interrupt(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(main, "load_config", _config)
 
-    def fake_sandbox_factory(**kwargs: Any) -> FakeSandbox:
-        del kwargs
-        sandbox = FakeSandbox()
-        created["sandbox"] = sandbox
-        return sandbox
+    def fake_coordinator_factory(**kwargs: Any) -> FakeCoordinator:
+        coordinator = FakeCoordinator(**kwargs)
+        created["coordinator"] = coordinator
+        return coordinator
 
     def fake_adapter_factory(
-        *, sandbox: FakeSandbox, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
     ) -> FakeAdapter:
         del approval_mode
         del llm_config
-        adapter = FakeAdapter(sandbox=sandbox, approval_mode="review", llm_config={}, **kwargs)
+        adapter = FakeAdapter(
+            coordinator=coordinator,
+            approval_mode="review",
+            llm_config={},
+            **kwargs,
+        )
         adapter.raise_interrupt = True
+        created["adapter"] = adapter
         return adapter
 
-    monkeypatch.setattr(main, "YoloSandbox", fake_sandbox_factory)
+    monkeypatch.setattr(main, "Coordinator", fake_coordinator_factory)
     monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
 
     main.main([])
 
-    assert created["sandbox"].stop_called is True
+    assert created["coordinator"].stop_all_called is True
+    assert created["adapter"].stop_called is True
 
 
 def test_main_rejects_unsupported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,20 +256,19 @@ def test_main_loads_resume_state_and_passes_to_adapter(
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "state.json").write_text('{"goal":"resume goal"}', encoding="utf-8")
 
-    def fake_sandbox_factory(**kwargs: Any) -> FakeSandbox:
-        del kwargs
-        return FakeSandbox()
+    def fake_coordinator_factory(**kwargs: Any) -> FakeCoordinator:
+        return FakeCoordinator(**kwargs)
 
     def fake_adapter_factory(
-        *, sandbox: FakeSandbox, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
     ) -> FakeAdapter:
-        del sandbox
+        del coordinator
         del approval_mode
         del llm_config
         created.update(kwargs)
-        return FakeAdapter(sandbox=FakeSandbox(), approval_mode="review", llm_config={})
+        return FakeAdapter(coordinator=object(), approval_mode="review", llm_config={})
 
-    monkeypatch.setattr(main, "YoloSandbox", fake_sandbox_factory)
+    monkeypatch.setattr(main, "Coordinator", fake_coordinator_factory)
     monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
 
     main.main(["--resume", "abc-1"])
@@ -223,6 +283,7 @@ def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict[str, Any] = {}
 
     monkeypatch.setattr(main, "load_config", lambda: cfg)
+    monkeypatch.setattr(main, "Coordinator", lambda **kwargs: FakeCoordinator(**kwargs))
 
     def fake_telegram_factory(**kwargs: Any) -> FakeTelegramAdapter:
         adapter = FakeTelegramAdapter(**kwargs)
@@ -240,6 +301,7 @@ def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     assert adapter.allowed_chat_ids == [123]
     assert adapter.limits.max_active_sessions == 8
     assert adapter.session_id_prefix == ""
+    assert adapter.coordinator is not None
     sandbox = adapter.sandbox_factory()
     assert sandbox._skills_dir == "./skills"  # noqa: SLF001
 
@@ -278,11 +340,16 @@ def test_main_runs_cli_and_telegram_when_multiple_enabled(
         created["sandbox"] = sandbox
         return sandbox
 
+    def fake_coordinator_factory(**kwargs: Any) -> FakeCoordinator:
+        coordinator = FakeCoordinator(**kwargs)
+        created["coordinator"] = coordinator
+        return coordinator
+
     def fake_cli_factory(
-        *, sandbox: FakeSandbox, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
     ) -> FakeAdapter:
         adapter = FakeAdapter(
-            sandbox=sandbox,
+            coordinator=coordinator,
             approval_mode=approval_mode,
             llm_config=llm_config,
             **kwargs,
@@ -296,6 +363,7 @@ def test_main_runs_cli_and_telegram_when_multiple_enabled(
         return adapter
 
     monkeypatch.setattr(main, "YoloSandbox", fake_sandbox_factory)
+    monkeypatch.setattr(main, "Coordinator", fake_coordinator_factory)
     monkeypatch.setattr(main, "CLIAdapter", fake_cli_factory)
     monkeypatch.setattr(main, "TelegramAdapter", fake_telegram_factory)
 
@@ -306,6 +374,8 @@ def test_main_runs_cli_and_telegram_when_multiple_enabled(
     assert cli.run_called is True
     assert telegram.run_called is True
     assert telegram.session_id_prefix == "telegram-"
+    assert cli.coordinator is created["coordinator"]
+    assert telegram.coordinator is created["coordinator"]
 
 
 def test_main_rejects_resume_when_multiple_adapters_enabled(

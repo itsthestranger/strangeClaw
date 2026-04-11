@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import queue
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
 from adapters.session_persistence import persist_done_event, state_for_follow_up
+from coordinator import Coordinator
 
 
 class CLIExitRequested(RuntimeError):
@@ -20,7 +22,8 @@ class CLIAdapter:
     def __init__(
         self,
         *,
-        sandbox: Any,
+        sandbox: Any | None = None,
+        coordinator: Coordinator | None = None,
         approval_mode: str = "review",
         llm_config: dict[str, Any] | None = None,
         resume_session_id: str | None = None,
@@ -33,6 +36,10 @@ class CLIAdapter:
         self._input = input_func
         self._session_id = resume_session_id or str(uuid4())
         self._latest_state = resume_state
+        self._coordinator = coordinator
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
+        if self._coordinator is not None and self._latest_state is not None:
+            self._coordinator.seed_state(session_id=self._session_id, state=self._latest_state)
 
     def get_task(self) -> dict[str, Any]:
         """Get next task from the user."""
@@ -114,6 +121,12 @@ class CLIAdapter:
 
     def run(self) -> None:
         """Drive the adapter event loop."""
+        if self._coordinator is not None:
+            self._run_with_coordinator()
+            return
+        if self._sandbox is None:
+            raise RuntimeError("CLIAdapter requires either sandbox or coordinator.")
+
         try:
             while True:
                 try:
@@ -160,7 +173,72 @@ class CLIAdapter:
 
     def stop(self) -> None:
         """Stop adapter-owned runtime resources."""
-        self._sandbox.stop()
+        if self._coordinator is not None:
+            self._coordinator.stop_session(session_id=self._session_id)
+            return
+        if self._sandbox is not None:
+            self._sandbox.stop()
+
+    def _run_with_coordinator(self) -> None:
+        if self._coordinator is None:
+            raise RuntimeError("coordinator is required for coordinator mode.")
+
+        while True:
+            try:
+                task = self.get_task()
+            except CLIExitRequested:
+                return
+            except ValueError as exc:
+                print(f"\nError: {exc}")
+                continue
+
+            status = self._coordinator.start_task(
+                session_id=self._session_id,
+                text=str(task["text"]),
+                sink=self._events.put,
+            )
+            if status == "busy":
+                print("\nA task is already running for this session.")
+                continue
+            if status == "capacity":
+                print("\nThe coordinator is at capacity. Please retry shortly.")
+                continue
+
+            exit_requested = False
+            while True:
+                try:
+                    event = self._events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                self.show(event)
+
+                if event.get("type") == "message":
+                    role = event.get("role")
+                    try:
+                        if role == "plan" and task["approval_mode"] == "review":
+                            reply = self.get_reply("plan")
+                            self._coordinator.submit_reply(
+                                session_id=self._session_id,
+                                approved=bool(reply["approved"]),
+                                text=str(reply["text"]),
+                            )
+                        elif role == "clarification":
+                            reply = self.get_reply("clarification")
+                            self._coordinator.submit_reply(
+                                session_id=self._session_id,
+                                approved=bool(reply["approved"]),
+                                text=str(reply["text"]),
+                            )
+                    except CLIExitRequested:
+                        exit_requested = True
+                        break
+
+                if event.get("type") == "done":
+                    break
+
+            if exit_requested:
+                self._coordinator.stop_session(session_id=self._session_id)
+                return
 
     @staticmethod
     def _format_content(content: Any) -> str:

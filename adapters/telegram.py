@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from adapters.session_persistence import persist_done_event, state_for_follow_up
+from coordinator import Coordinator
 
 TELEGRAM_IMPORT_ERROR: Exception | None = None
 TelegramApplication: Any = None
@@ -84,6 +85,7 @@ class TelegramAdapter:
         self,
         *,
         sandbox_factory: Callable[[], Any],
+        coordinator: Coordinator | None = None,
         approval_mode: str = "review",
         llm_config: dict[str, Any] | None = None,
         token: str,
@@ -98,9 +100,11 @@ class TelegramAdapter:
         self._allowed_chat_ids = set(allowed_chat_ids or [])
         self._limits = limits or TelegramLimits()
         self._session_id_prefix = session_id_prefix
+        self._coordinator = coordinator
         self._sessions: dict[int, ChatSession] = {}
         self._latest_state_by_chat: dict[int, dict[str, Any]] = {}
         self._application: Any | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def get_task(self, update: Any | None = None) -> dict[str, Any]:
         """Build a task payload from an incoming Telegram update."""
@@ -283,6 +287,10 @@ class TelegramAdapter:
         if not await self._ensure_authorized(chat_id):
             return
 
+        if self._coordinator is not None:
+            await self._on_text_message_with_coordinator(chat_id=chat_id, text=text)
+            return
+
         existing = self._sessions.get(chat_id)
         if existing is not None and existing.pending_reply is not None:
             if self._resolve_text_reply(existing, text):
@@ -334,6 +342,14 @@ class TelegramAdapter:
 
         if not await self._ensure_authorized(chat_id):
             await query.answer(text="Not authorized.")
+            return
+
+        if self._coordinator is not None:
+            await self._on_plan_callback_with_coordinator(
+                chat_id=chat_id,
+                data=data,
+                query=query,
+            )
             return
 
         session = self._sessions.get(chat_id)
@@ -710,6 +726,90 @@ class TelegramAdapter:
     def _session_id(self, chat_id: int) -> str:
         return f"{self._session_id_prefix}{chat_id}"
 
+    async def _on_text_message_with_coordinator(self, *, chat_id: int, text: str) -> None:
+        coordinator = self._coordinator
+        if coordinator is None:
+            return
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+        session_id = self._session_id(chat_id)
+        pending = coordinator.pending_role(session_id=session_id)
+        if pending is not None:
+            approved = pending != "plan"
+            submitted = coordinator.submit_reply(
+                session_id=session_id,
+                approved=approved,
+                text=text,
+            )
+            if not submitted:
+                await self._send_text(
+                    chat_id,
+                    "No prompt is waiting for a reply right now.",
+                )
+            return
+
+        def sink(event: dict[str, Any], *, cid: int = chat_id) -> None:
+            self._emit_from_coordinator(chat_id=cid, event=event)
+
+        status = coordinator.start_task(
+            session_id=session_id,
+            text=text,
+            sink=sink,
+        )
+        if status == "busy":
+            await self._send_text(
+                chat_id,
+                "A task is already running. Wait for completion or answer the active prompt.",
+            )
+            return
+        if status == "capacity":
+            await self._send_text(
+                chat_id,
+                (
+                    "The bot is at capacity right now. "
+                    "Please retry after one of the active tasks finishes."
+                ),
+            )
+            return
+
+    async def _on_plan_callback_with_coordinator(
+        self,
+        *,
+        chat_id: int,
+        data: str,
+        query: Any,
+    ) -> None:
+        coordinator = self._coordinator
+        if coordinator is None:
+            await query.answer()
+            return
+
+        session_id = self._session_id(chat_id)
+        pending = coordinator.pending_role(session_id=session_id)
+        if pending != "plan":
+            await query.answer(text="No plan is awaiting approval.")
+            return
+
+        if data == PLAN_APPROVE_CALLBACK:
+            coordinator.submit_reply(session_id=session_id, approved=True, text="")
+            await query.answer(text="Plan approved.")
+            return
+
+        if data == PLAN_REJECT_CALLBACK:
+            coordinator.submit_reply(session_id=session_id, approved=False, text="")
+            await query.answer(text="Plan rejected.")
+            return
+
+        await query.answer()
+
+    def _emit_from_coordinator(self, *, chat_id: int, event: dict[str, Any]) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(self.show(event, chat_id=chat_id), loop)
+        future.add_done_callback(_consume_future_exception)
+
     @staticmethod
     def _escape_markdown_v2(text: str) -> str:
         escaped: list[str] = []
@@ -723,3 +823,10 @@ class TelegramAdapter:
     @staticmethod
     def _escape_markdown_v2_code(text: str) -> str:
         return text.replace("\\", "\\\\").replace("`", "\\`")
+
+
+def _consume_future_exception(future: Any) -> None:
+    try:
+        future.result()
+    except Exception:
+        return

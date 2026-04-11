@@ -10,6 +10,7 @@ from typing import Any
 from adapters.cli import CLIAdapter
 from adapters.telegram import TelegramAdapter, TelegramLimits
 from config import load_config
+from coordinator import Coordinator
 from sandbox.yolo import YoloSandbox
 from session import load as load_session
 
@@ -82,9 +83,9 @@ def _build_adapter(
     config: dict[str, Any],
     args: argparse.Namespace,
     multi_adapter_mode: bool,
-) -> tuple[CLIAdapter | TelegramAdapter, YoloSandbox | None]:
+    coordinator: Coordinator,
+) -> CLIAdapter | TelegramAdapter:
     if adapter_name == "cli":
-        sandbox = _build_yolo_sandbox(config)
         resume_state = None
         if args.resume:
             session_dir = Path.home() / ".strangeclaw" / "sessions" / args.resume
@@ -93,13 +94,13 @@ def _build_adapter(
                 raise ValueError(f"Cannot resume: session state not found for {args.resume}")
 
         cli_adapter = CLIAdapter(
-            sandbox=sandbox,
+            coordinator=coordinator,
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
             resume_session_id=args.resume,
             resume_state=resume_state,
         )
-        return cli_adapter, sandbox
+        return cli_adapter
 
     if adapter_name == "telegram":
         if args.resume:
@@ -110,6 +111,7 @@ def _build_adapter(
         )
         telegram_adapter = TelegramAdapter(
             sandbox_factory=lambda: _build_yolo_sandbox(config),
+            coordinator=coordinator,
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
             token=telegram_params["token"],
@@ -117,7 +119,7 @@ def _build_adapter(
             limits=telegram_params["limits"],
             session_id_prefix=telegram_params["session_id_prefix"],
         )
-        return telegram_adapter, None
+        return telegram_adapter
 
     raise ValueError(f"Unsupported adapter: {adapter_name}")
 
@@ -146,18 +148,24 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Resume cannot be used when multiple adapters are enabled.")
 
     multi_adapter_mode = len(enabled_adapters) > 1
-    created: list[tuple[str, CLIAdapter | TelegramAdapter, YoloSandbox | None]] = []
+    coordinator = Coordinator(
+        sandbox_factory=lambda: _build_yolo_sandbox(config),
+        approval_mode=str(config["approval_mode"]),
+        llm_config=dict(config["llm"]),
+    )
+    created: list[tuple[str, CLIAdapter | TelegramAdapter]] = []
     for adapter_name in enabled_adapters:
-        adapter, sandbox = _build_adapter(
+        adapter = _build_adapter(
             adapter_name=adapter_name,
             config=config,
             args=args,
             multi_adapter_mode=multi_adapter_mode,
+            coordinator=coordinator,
         )
-        created.append((adapter_name, adapter, sandbox))
+        created.append((adapter_name, adapter))
 
     foreground_index = 0
-    for index, (name, _, _) in enumerate(created):
+    for index, (name, _) in enumerate(created):
         if name == "cli":
             foreground_index = index
             break
@@ -166,7 +174,7 @@ def main(argv: list[str] | None = None) -> None:
     background_adapters: list[CLIAdapter | TelegramAdapter] = []
 
     try:
-        for index, (_, adapter, _) in enumerate(created):
+        for index, (_, adapter) in enumerate(created):
             if index == foreground_index:
                 continue
             thread = threading.Thread(target=adapter.run, daemon=True)
@@ -180,11 +188,9 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         for adapter in background_adapters:
             _stop_adapter(adapter)
-        for _, adapter, sandbox in created:
-            if sandbox is not None:
-                sandbox.stop()
-            else:
-                _stop_adapter(adapter)
+        coordinator.stop_all()
+        for _, adapter in created:
+            _stop_adapter(adapter)
         for thread in background_threads:
             thread.join(timeout=1.0)
 
