@@ -60,6 +60,26 @@ Expected endpoint response is a JSON object. Supported fields:
 - `yolo`: direct host execution for trusted local workflows.
 - `fire`: Firecracker microVM isolation (in progress).
 
+## Fire Mode Prerequisite Setup
+
+Run host setup (installs/updates prerequisites and then runs checks):
+
+```bash
+bash scripts/setup-fire.sh
+```
+
+Run checks only (no host changes):
+
+```bash
+bash scripts/setup-fire.sh --check-only
+```
+
+Run the Fire prerequisite checker directly:
+
+```bash
+bash scripts/fire-check.sh
+```
+
 ## Telegram Setup
 
 1. Create a bot with BotFather:
