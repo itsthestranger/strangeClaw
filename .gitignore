@@ -11,6 +11,12 @@ __pycache__/
 .venv/
 *.pyc
 *.egg-info
+firecracker/kernel/vmlinux
+firecracker/kernel/vmlinux-*
+firecracker/kernel/config-*
+firecracker/kernel/kernel.config
+firecracker/rootfs/agent.ext4
+firecracker/rootfs/*.upstream
 Agents.md
 todo.md
 tool_use_error.md
