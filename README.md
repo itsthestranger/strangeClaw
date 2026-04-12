@@ -68,6 +68,17 @@ Run host setup (installs/updates prerequisites and then runs checks):
 bash scripts/setup-fire.sh
 ```
 
+`setup-fire.sh` keeps IP forwarding unchanged by default (runtime-managed policy).
+Use explicit flags only when you want setup to change it:
+
+```bash
+# Enable for current runtime only (no persistent sysctl file)
+bash scripts/setup-fire.sh --enable-ip-forwarding-now
+
+# Enable and persist in /etc/sysctl.d/99-strangeclaw-fire.conf
+bash scripts/setup-fire.sh --persist-ip-forwarding
+```
+
 Run checks only (no host changes):
 
 ```bash

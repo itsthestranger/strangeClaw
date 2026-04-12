@@ -41,27 +41,59 @@ read_os_release_value() {
   awk -F= -v k="${key}" '$1==k {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release 2>/dev/null
 }
 
+detect_package_manager() {
+  if command_exists apt-get; then
+    echo "apt"
+    return
+  fi
+  if command_exists dnf; then
+    echo "dnf"
+    return
+  fi
+  if command_exists pacman; then
+    echo "pacman"
+    return
+  fi
+  echo ""
+}
+
 check_host_os() {
   local distro_id
   local distro_version
   local pretty_name
+  local pkg_manager
   distro_id="$(read_os_release_value ID)"
   distro_version="$(read_os_release_value VERSION_ID)"
   pretty_name="$(read_os_release_value PRETTY_NAME)"
+  pkg_manager="$(detect_package_manager)"
 
   if [[ -z "${distro_id}" ]]; then
-    add_check "host_os" "WARN" "Could not determine distro; Ubuntu 22.04/24.04 recommended."
+    add_check "host_os" "WARN" "Could not determine distro from /etc/os-release."
     return
   fi
-  if [[ "${distro_id}" != "ubuntu" ]]; then
-    add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}}; Ubuntu 22.04/24.04 recommended."
+  if [[ -z "${pkg_manager}" ]]; then
+    add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}}, but apt/dnf/pacman was not found."
     return
   fi
-  if [[ "${distro_version}" != "22.04" && "${distro_version}" != "24.04" ]]; then
-    add_check "host_os" "WARN" "Detected Ubuntu ${distro_version}; Ubuntu 22.04/24.04 recommended."
+
+  if [[ -n "${distro_version}" ]]; then
+    add_check "host_os" "PASS" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
     return
   fi
-  add_check "host_os" "PASS" "Detected Ubuntu ${distro_version}."
+  add_check "host_os" "PASS" "Detected ${distro_id} (package manager: ${pkg_manager})."
+}
+
+check_architecture() {
+  local arch
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64|aarch64)
+      add_check "arch" "PASS" "Supported architecture: ${arch}."
+      ;;
+    *)
+      add_check "arch" "FAIL" "Unsupported architecture: ${arch} (expected x86_64 or aarch64)."
+      ;;
+  esac
 }
 
 check_kvm() {
@@ -195,6 +227,7 @@ print_report() {
 
 run_checks() {
   check_host_os
+  check_architecture
   check_kvm
   check_required_commands
   check_ip_forwarding

@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CHECK_ONLY=0
+ENABLE_IP_FORWARDING_NOW=0
+PERSIST_IP_FORWARDING=0
 
 declare -a STEP_NAMES=()
 declare -a STEP_STATUS=()
@@ -18,11 +20,14 @@ STEP_WARNS=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/setup-fire.sh [--check-only]
+Usage: scripts/setup-fire.sh [--check-only] [--enable-ip-forwarding-now] [--persist-ip-forwarding]
 
 Options:
-  --check-only   Do not install or change host state; only run checks.
-  -h, --help     Show this help.
+  --check-only               Do not install or change host state; only run checks.
+  --enable-ip-forwarding-now Enable net.ipv4.ip_forward=1 for the current runtime.
+  --persist-ip-forwarding    Persist net.ipv4.ip_forward=1 in /etc/sysctl.d.
+                             Implies --enable-ip-forwarding-now.
+  -h, --help                 Show this help.
 EOF
 }
 
@@ -30,6 +35,15 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --check-only)
       CHECK_ONLY=1
+      shift
+      ;;
+    --enable-ip-forwarding-now)
+      ENABLE_IP_FORWARDING_NOW=1
+      shift
+      ;;
+    --persist-ip-forwarding)
+      ENABLE_IP_FORWARDING_NOW=1
+      PERSIST_IP_FORWARDING=1
       shift
       ;;
     -h|--help)
@@ -82,37 +96,111 @@ read_os_release_value() {
   awk -F= -v k="${key}" '$1==k {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release 2>/dev/null
 }
 
+detect_package_manager() {
+  if command_exists apt-get; then
+    echo "apt"
+    return
+  fi
+  if command_exists dnf; then
+    echo "dnf"
+    return
+  fi
+  if command_exists pacman; then
+    echo "pacman"
+    return
+  fi
+  echo ""
+}
+
+check_supported_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64|aarch64)
+      add_step "arch" "PASS" "Supported architecture: ${arch}."
+      ;;
+    *)
+      add_step "arch" "FAIL" "Unsupported architecture: ${arch} (expected x86_64 or aarch64)."
+      ;;
+  esac
+}
+
 setup_os_check() {
   local distro_id
   local distro_version
   local pretty_name
+  local pkg_manager
   distro_id="$(read_os_release_value ID)"
   distro_version="$(read_os_release_value VERSION_ID)"
   pretty_name="$(read_os_release_value PRETTY_NAME)"
+  pkg_manager="$(detect_package_manager)"
 
-  if [[ "${distro_id}" != "ubuntu" ]]; then
-    add_step "os_check" "WARN" "Detected ${pretty_name:-unknown}; Ubuntu 22.04/24.04 recommended."
+  if [[ -z "${distro_id}" ]]; then
+    add_step "os_check" "WARN" "Could not detect distro from /etc/os-release."
     return
   fi
-  if [[ "${distro_version}" != "22.04" && "${distro_version}" != "24.04" ]]; then
-    add_step "os_check" "WARN" "Detected Ubuntu ${distro_version}; Ubuntu 22.04/24.04 recommended."
+  if [[ -z "${pkg_manager}" ]]; then
+    add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}}, but apt/dnf/pacman was not found."
     return
   fi
-  add_step "os_check" "PASS" "Detected Ubuntu ${distro_version}."
+  if [[ -n "${distro_version}" ]]; then
+    add_step "os_check" "PASS" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
+    return
+  fi
+  add_step "os_check" "PASS" "Detected ${distro_id} (package manager: ${pkg_manager})."
 }
 
 setup_packages() {
-  if ! command_exists apt-get; then
-    add_step "packages" "WARN" "apt-get not found; skipped package installation."
+  local pkg_manager
+  pkg_manager="$(detect_package_manager)"
+
+  case "${pkg_manager}" in
+    apt)
+      if run_as_root apt-get update >/dev/null 2>&1 && \
+        run_as_root apt-get install -y acl curl iproute2 iptables ca-certificates kmod >/dev/null 2>&1; then
+        add_step "packages" "PASS" "Installed via apt: acl curl iproute2 iptables ca-certificates kmod."
+      else
+        add_step "packages" "FAIL" "Failed to install prerequisites with apt."
+      fi
+      ;;
+    dnf)
+      if run_as_root dnf -y install acl curl iproute iptables ca-certificates kmod >/dev/null 2>&1; then
+        add_step "packages" "PASS" "Installed via dnf: acl curl iproute iptables ca-certificates kmod."
+      else
+        add_step "packages" "FAIL" "Failed to install prerequisites with dnf."
+      fi
+      ;;
+    pacman)
+      if run_as_root pacman -Sy --noconfirm --needed acl curl iproute2 iptables ca-certificates kmod >/dev/null 2>&1; then
+        add_step "packages" "PASS" "Installed via pacman: acl curl iproute2 iptables ca-certificates kmod."
+      else
+        add_step "packages" "FAIL" "Failed to install prerequisites with pacman."
+      fi
+      ;;
+    *)
+      add_step "packages" "WARN" "No supported package manager found (expected apt, dnf, or pacman)."
+      ;;
+  esac
+}
+
+setup_iptables_backend_check() {
+  local version_output
+
+  if ! command_exists iptables; then
+    add_step "iptables_backend" "FAIL" "iptables command not found after package setup."
     return
   fi
 
-  if run_as_root apt-get update >/dev/null 2>&1 && \
-    run_as_root apt-get install -y acl curl iproute2 iptables ca-certificates >/dev/null 2>&1; then
-    add_step "packages" "PASS" "Installed/verified packages: acl curl iproute2 iptables."
-  else
-    add_step "packages" "FAIL" "Failed to install prerequisite packages."
+  version_output="$(iptables -V 2>/dev/null || true)"
+  if [[ "${version_output}" == *"nf_tables"* ]]; then
+    add_step "iptables_backend" "PASS" "iptables is using nf_tables backend."
+    return
   fi
+  if command_exists iptables-nft; then
+    add_step "iptables_backend" "WARN" "iptables default backend may be legacy; iptables-nft is available."
+    return
+  fi
+  add_step "iptables_backend" "WARN" "Could not confirm nft backend for iptables."
 }
 
 setup_kvm_access() {
@@ -160,6 +248,10 @@ setup_firecracker_binary() {
   local tmp_dir
   local arch
   local expected_binary
+  local checksum_url
+  local checksum_file
+  local expected_sha
+  local actual_sha
 
   pinned_version="$(tr -d '[:space:]' < "${PROJECT_ROOT}/firecracker/VERSION" 2>/dev/null || true)"
   if [[ -z "${pinned_version}" ]]; then
@@ -186,19 +278,44 @@ setup_firecracker_binary() {
     return
   fi
 
+  arch="$(uname -m)"
   tmp_dir="$(mktemp -d)"
   if ! curl -fsSL --retry 3 "${url}" -o "${tmp_dir}/firecracker.tgz"; then
     rm -rf "${tmp_dir}"
     add_step "firecracker" "FAIL" "Failed to download Firecracker ${pinned_version}."
     return
   fi
+
+  checksum_url="${url}.sha256.txt"
+  checksum_file="${tmp_dir}/firecracker.tgz.sha256.txt"
+  if command_exists sha256sum; then
+    if curl -fsSL --retry 2 "${checksum_url}" -o "${checksum_file}"; then
+      expected_sha="$(grep -E "[A-Fa-f0-9]{64}.*firecracker-${pinned_version}-${arch}\.tgz" "${checksum_file}" | head -n 1 | sed -E 's/^.*([A-Fa-f0-9]{64}).*$/\1/')"
+      if [[ -n "${expected_sha}" ]]; then
+        actual_sha="$(sha256sum "${tmp_dir}/firecracker.tgz" | awk '{print $1}')"
+        if [[ "${actual_sha}" == "${expected_sha}" ]]; then
+          add_step "firecracker_checksum" "PASS" "Archive checksum verified."
+        else
+          rm -rf "${tmp_dir}"
+          add_step "firecracker_checksum" "FAIL" "Archive checksum mismatch."
+          return
+        fi
+      else
+        add_step "firecracker_checksum" "WARN" "Downloaded checksum file but could not parse expected hash."
+      fi
+    else
+      add_step "firecracker_checksum" "WARN" "Could not download release checksum file; verification skipped."
+    fi
+  else
+    add_step "firecracker_checksum" "WARN" "sha256sum not found; archive checksum not verified."
+  fi
+
   if ! tar -xzf "${tmp_dir}/firecracker.tgz" -C "${tmp_dir}"; then
     rm -rf "${tmp_dir}"
     add_step "firecracker" "FAIL" "Failed to extract Firecracker archive."
     return
   fi
 
-  arch="$(uname -m)"
   expected_binary="${tmp_dir}/release-${pinned_version}-${arch}/firecracker-${pinned_version}-${arch}"
   if [[ ! -f "${expected_binary}" ]]; then
     expected_binary="$(find "${tmp_dir}" -type f -name "firecracker-${pinned_version}-${arch}" | head -n 1)"
@@ -218,12 +335,38 @@ setup_firecracker_binary() {
 }
 
 setup_ip_forwarding() {
-  if run_as_root sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 && \
-    printf 'net.ipv4.ip_forward = 1\n' | run_as_root tee /etc/sysctl.d/99-strangeclaw-fire.conf >/dev/null; then
-    add_step "ip_forward" "PASS" "Enabled IPv4 forwarding and wrote sysctl config."
-  else
-    add_step "ip_forward" "FAIL" "Failed to enable IPv4 forwarding."
+  local current_value
+  if [[ ! -f /proc/sys/net/ipv4/ip_forward ]]; then
+    add_step "ip_forward" "FAIL" "Cannot read net.ipv4.ip_forward."
+    return
   fi
+
+  current_value="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true)"
+
+  if [[ "${ENABLE_IP_FORWARDING_NOW}" -eq 0 ]]; then
+    if [[ "${current_value}" == "1" ]]; then
+      add_step "ip_forward" "PASS" "IPv4 forwarding already enabled; left unchanged (runtime-managed policy)."
+    else
+      add_step "ip_forward" "WARN" "IPv4 forwarding is disabled; left unchanged (runtime-managed policy)."
+    fi
+    return
+  fi
+
+  if ! run_as_root sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+    add_step "ip_forward" "FAIL" "Failed to enable IPv4 forwarding."
+    return
+  fi
+
+  if [[ "${PERSIST_IP_FORWARDING}" -eq 1 ]]; then
+    if printf 'net.ipv4.ip_forward = 1\n' | run_as_root tee /etc/sysctl.d/99-strangeclaw-fire.conf >/dev/null; then
+      add_step "ip_forward" "PASS" "Enabled IPv4 forwarding and persisted it in /etc/sysctl.d."
+    else
+      add_step "ip_forward" "FAIL" "Enabled IPv4 forwarding but failed to persist sysctl config."
+    fi
+    return
+  fi
+
+  add_step "ip_forward" "PASS" "Enabled IPv4 forwarding for current runtime (not persisted)."
 }
 
 setup_tun_module() {
@@ -271,9 +414,11 @@ print_step_report() {
 }
 
 run_setup() {
+  check_supported_arch
   setup_os_check
   if [[ "${CHECK_ONLY}" -eq 0 ]]; then
     setup_packages
+    setup_iptables_backend_check
     setup_kvm_access
     setup_firecracker_binary
     setup_ip_forwarding
