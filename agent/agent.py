@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 from collections.abc import Callable
@@ -11,7 +12,7 @@ from typing import Any, Protocol
 
 from agent.llm import LLMClient, LLMResponse, ToolCall
 from agent.skills import Skills, SkillsError, ToolResult
-from agent.transport import InProcessTransport
+from agent.transport import VsockTransport
 
 PLANNING_SYSTEM_PROMPT = (
     "You are strangeclaw, a self-hosted autonomous agent. "
@@ -62,13 +63,21 @@ class LLMRuntime(Protocol):
     def count_tokens(self, messages: list[dict[str, Any]]) -> int: ...
 
 
+class AgentTransport(Protocol):
+    """Transport contract required by Agent."""
+
+    def send(self, event: dict[str, Any]) -> None: ...
+
+    def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None: ...
+
+
 class Agent:
     """Main agent runtime."""
 
     def __init__(
         self,
         *,
-        transport: InProcessTransport,
+        transport: AgentTransport,
         skills_dir: str,
         max_iterations: int = 50,
         output_dir: str = "/output",
@@ -76,6 +85,7 @@ class Agent:
         token_budget: int = 4000,
         summary_threshold: int = 10,
         max_output_total_bytes: int = 10 * 1024 * 1024,
+        allow_task_llm: bool = True,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
     ) -> None:
         if max_iterations <= 0:
@@ -95,6 +105,7 @@ class Agent:
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
         self._max_output_total_bytes = max_output_total_bytes
+        self._allow_task_llm = allow_task_llm
         self._llm_factory = llm_factory or LLMClient.from_config
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
@@ -193,7 +204,7 @@ class Agent:
 
     def _resolve_llm_config(self, task_event: dict[str, Any]) -> dict[str, Any]:
         llm_from_task = task_event.get("llm")
-        if isinstance(llm_from_task, dict):
+        if self._allow_task_llm and isinstance(llm_from_task, dict):
             return llm_from_task
 
         if not self._llm_config_path.is_file():
@@ -561,3 +572,42 @@ def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
     if isinstance(value, str) and value:
         return value
     return fallback
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="python -m agent.agent")
+    parser.add_argument("--vsock-port", type=int, default=None, help="Guest vsock listen port.")
+    parser.add_argument("--skills-dir", type=str, default="/opt/strangeclaw/skills")
+    parser.add_argument("--max-iterations", type=int, default=50)
+    parser.add_argument("--token-budget", type=int, default=4000)
+    parser.add_argument("--summary-threshold", type=int, default=10)
+    parser.add_argument("--output-dir", type=str, default="/output")
+    parser.add_argument("--llm-config-path", type=str, default="/run/strangeclaw/llm.json")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI entrypoint for guest execution."""
+    args = _parse_args(argv)
+    if args.vsock_port is None:
+        raise ValueError("Missing required --vsock-port for guest execution.")
+
+    transport = VsockTransport(guest_port=int(args.vsock_port))
+    try:
+        agent = Agent(
+            transport=transport,
+            skills_dir=str(args.skills_dir),
+            max_iterations=int(args.max_iterations),
+            output_dir=str(args.output_dir),
+            llm_config_path=str(args.llm_config_path),
+            token_budget=int(args.token_budget),
+            summary_threshold=int(args.summary_threshold),
+            allow_task_llm=False,
+        )
+        agent.run()
+    finally:
+        transport.close()
+
+
+if __name__ == "__main__":
+    main()

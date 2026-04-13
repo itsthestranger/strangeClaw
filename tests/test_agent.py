@@ -10,6 +10,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import agent.agent as agent_module
 from agent.agent import Agent
 from agent.llm import LLMResponse, ToolCall
 from agent.transport import InProcessTransport
@@ -380,3 +383,106 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
     assert events[-1]["type"] == "done"
     assert events[-1]["success"] is True
     assert events[-1]["reply"] == "recovered"
+
+
+def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) -> None:
+    llm_from_file = {"model": "file/model", "api_key": "file-key"}
+    llm_path = tmp_path / "llm.json"
+    llm_path.write_text(json.dumps(llm_from_file), encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    def llm_factory(config: dict[str, Any]) -> ScriptedLLM:
+        captured["config"] = config
+        return scripted_llm
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_config_path=str(llm_path),
+        allow_task_llm=False,
+        llm_factory=llm_factory,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+
+    task = _task_event()
+    task["llm"] = {"model": "task/model", "api_key": "task-key"}
+    host_transport.send(task)
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    assert captured["config"] == llm_from_file
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+
+
+def test_agent_main_requires_vsock_port() -> None:
+    with pytest.raises(ValueError, match="--vsock-port"):
+        agent_module.main([])
+
+
+def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeVsockTransport:
+        def __init__(self, *, guest_port: int) -> None:
+            captured["guest_port"] = guest_port
+            captured["closed"] = False
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+        def send(self, event: dict[str, Any]) -> None:
+            del event
+
+        def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
+            del timeout_seconds
+            return None
+
+    class FakeAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["agent_kwargs"] = kwargs
+
+        def run(self) -> None:
+            captured["ran"] = True
+
+    monkeypatch.setattr(agent_module, "VsockTransport", FakeVsockTransport)
+    monkeypatch.setattr(agent_module, "Agent", FakeAgent)
+
+    agent_module.main(
+        [
+            "--vsock-port",
+            "5000",
+            "--skills-dir",
+            str(tmp_path / "skills"),
+            "--llm-config-path",
+            str(tmp_path / "llm.json"),
+        ]
+    )
+
+    assert captured["guest_port"] == 5000
+    assert captured["ran"] is True
+    assert captured["closed"] is True
+
+    kwargs = captured["agent_kwargs"]
+    assert kwargs["allow_task_llm"] is False
+    assert kwargs["skills_dir"] == str(tmp_path / "skills")
+    assert kwargs["llm_config_path"] == str(tmp_path / "llm.json")
