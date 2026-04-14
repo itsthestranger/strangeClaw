@@ -78,7 +78,7 @@ class VsockTransport:
         self,
         guest_port: int,
         *,
-        recv_buffer_size: int = 65536,
+        recv_buffer_size: int = 65 * 1024,
         connected_socket: SocketLike | None = None,
         socket_family: int | None = None,
         unix_socket_path: str | None = None,
