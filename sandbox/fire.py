@@ -24,6 +24,7 @@ _TAP_NETWORK_PREFIX = "172.16"
 _TAP_NETMASK = "255.255.255.252"
 _TAP_CIDR_SUFFIX = 30
 _MAX_TAP_SUBNETS = 16384
+_FIRE_TAP_NAME_PATTERN = re.compile(r"^fc[0-9a-f]{12}$")
 
 
 class FirecrackerConfigError(ValueError):
@@ -335,6 +336,169 @@ class TapDeviceManager:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return current
+
+
+class IptablesManager:
+    """Manage Firecracker TAP firewall rules via iptables."""
+
+    def __init__(self, *, command_runner: CommandRunner | None = None) -> None:
+        self._command_runner: CommandRunner = command_runner or _default_command_runner
+
+    def apply(self, allocation: TapNetworkAllocation) -> None:
+        """Apply per-session firewall/NAT rules and shared conntrack rule."""
+        _validate_iptables_context(allocation)
+        self._ensure_conntrack_rule()
+        self._run_checked(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                allocation.host_iface,
+                "-s",
+                allocation.guest_ip,
+                "-j",
+                "MASQUERADE",
+            ]
+        )
+        self._run_checked(
+            [
+                "iptables",
+                "-A",
+                "FORWARD",
+                "-i",
+                allocation.tap_name,
+                "-o",
+                allocation.host_iface,
+                "-j",
+                "ACCEPT",
+            ]
+        )
+        self._run_checked(
+            [
+                "iptables",
+                "-A",
+                "INPUT",
+                "-i",
+                allocation.tap_name,
+                "-j",
+                "DROP",
+            ]
+        )
+
+    def cleanup(self, allocation: TapNetworkAllocation) -> None:
+        """Best-effort teardown for per-session rules. Never raises."""
+        _validate_iptables_context(allocation)
+        self._run_unchecked(
+            [
+                "iptables",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-o",
+                allocation.host_iface,
+                "-s",
+                allocation.guest_ip,
+                "-j",
+                "MASQUERADE",
+            ]
+        )
+        self._run_unchecked(
+            [
+                "iptables",
+                "-D",
+                "FORWARD",
+                "-i",
+                allocation.tap_name,
+                "-o",
+                allocation.host_iface,
+                "-j",
+                "ACCEPT",
+            ]
+        )
+        self._run_unchecked(
+            [
+                "iptables",
+                "-D",
+                "INPUT",
+                "-i",
+                allocation.tap_name,
+                "-j",
+                "DROP",
+            ]
+        )
+        if not self._has_active_fire_taps():
+            self._run_unchecked(
+                [
+                    "iptables",
+                    "-D",
+                    "FORWARD",
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
+
+    def _ensure_conntrack_rule(self) -> None:
+        check_args = [
+            "iptables",
+            "-C",
+            "FORWARD",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ]
+        existing = self._run_unchecked(check_args)
+        if existing.returncode == 0:
+            return
+        self._run_checked(
+            [
+                "iptables",
+                "-A",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ]
+        )
+
+    def _has_active_fire_taps(self) -> bool:
+        result = self._run_unchecked(["ip", "-o", "link", "show"])
+        if result.returncode != 0:
+            return True
+        for line in result.stdout.splitlines():
+            tap_name = _parse_link_name(line)
+            if tap_name is None:
+                continue
+            if _FIRE_TAP_NAME_PATTERN.fullmatch(tap_name):
+                return True
+        return False
+
+    def _run_checked(self, args: list[str]) -> None:
+        result = self._command_runner(args)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or (
+                f"exit code {result.returncode}"
+            )
+            raise FirecrackerConfigError(f"Command failed: {' '.join(args)}: {detail}")
+
+    def _run_unchecked(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return self._command_runner(args)
+        except Exception:
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="")
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -663,3 +827,24 @@ def _parse_default_route_iface_text(output: str) -> str | None:
     if match is None:
         return None
     return match.group(1)
+
+
+def _parse_link_name(line: str) -> str | None:
+    match = re.match(r"^\d+:\s+([^:]+):", line)
+    if match is None:
+        return None
+    raw_name = match.group(1)
+    return raw_name.split("@", 1)[0]
+
+
+def _validate_iptables_context(allocation: TapNetworkAllocation) -> None:
+    if not _HOST_IFACE_PATTERN.fullmatch(allocation.host_iface):
+        raise FirecrackerConfigError(
+            f"Invalid host interface for iptables rules: {allocation.host_iface!r}"
+        )
+    if not _HOST_IFACE_PATTERN.fullmatch(allocation.tap_name):
+        raise FirecrackerConfigError(
+            f"Invalid TAP interface for iptables rules: {allocation.tap_name!r}"
+        )
+    if not isinstance(allocation.guest_ip, str) or not allocation.guest_ip:
+        raise FirecrackerConfigError("Invalid guest_ip for iptables rules.")

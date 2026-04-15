@@ -17,7 +17,9 @@ from sandbox.fire import (
     FirecrackerConfig,
     FirecrackerConfigError,
     FirePrebootConfig,
+    IptablesManager,
     TapDeviceManager,
+    TapNetworkAllocation,
     configure_microvm_preboot,
     load_firecracker_config,
 )
@@ -361,6 +363,176 @@ def test_tap_device_manager_destroy_never_raises(tmp_path: Path) -> None:
     manager.destroy("fc123456789abc")
 
 
+def test_iptables_manager_apply_adds_required_rules() -> None:
+    runner = _ScriptedCommandRunner(
+        returncodes={
+            (
+                "iptables",
+                "-C",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ): [1]
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    manager.apply(_build_allocation())
+
+    assert (
+        "iptables",
+        "-A",
+        "FORWARD",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "ACCEPT",
+    ) in runner.calls_as_tuples()
+    assert (
+        "iptables",
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-o",
+        "eth0",
+        "-s",
+        "172.16.0.2",
+        "-j",
+        "MASQUERADE",
+    ) in runner.calls_as_tuples()
+    assert (
+        "iptables",
+        "-A",
+        "FORWARD",
+        "-i",
+        "fc123456789abc",
+        "-o",
+        "eth0",
+        "-j",
+        "ACCEPT",
+    ) in runner.calls_as_tuples()
+    assert (
+        "iptables",
+        "-A",
+        "INPUT",
+        "-i",
+        "fc123456789abc",
+        "-j",
+        "DROP",
+    ) in runner.calls_as_tuples()
+
+
+def test_iptables_manager_apply_skips_conntrack_when_existing() -> None:
+    runner = _ScriptedCommandRunner()
+    manager = IptablesManager(command_runner=runner)
+
+    manager.apply(_build_allocation())
+
+    assert (
+        "iptables",
+        "-A",
+        "FORWARD",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "ACCEPT",
+    ) not in runner.calls_as_tuples()
+
+
+def test_iptables_manager_cleanup_removes_conntrack_when_no_fire_taps() -> None:
+    runner = _ScriptedCommandRunner(
+        outputs={
+            ("ip", "-o", "link", "show"): "",
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    manager.cleanup(_build_allocation())
+
+    assert (
+        "iptables",
+        "-D",
+        "FORWARD",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "ACCEPT",
+    ) in runner.calls_as_tuples()
+
+
+def test_iptables_manager_cleanup_keeps_conntrack_with_active_fire_taps() -> None:
+    runner = _ScriptedCommandRunner(
+        outputs={
+            (
+                "ip",
+                "-o",
+                "link",
+                "show",
+            ): "7: fc0123456789ab: <BROADCAST,MULTICAST> mtu 1500 state DOWN",
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    manager.cleanup(_build_allocation())
+
+    assert (
+        "iptables",
+        "-D",
+        "FORWARD",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "ACCEPT",
+    ) not in runner.calls_as_tuples()
+
+
+def test_iptables_manager_cleanup_never_raises_on_command_errors() -> None:
+    runner = _ScriptedCommandRunner(default_returncode=1)
+    manager = IptablesManager(command_runner=runner)
+
+    manager.cleanup(_build_allocation())
+
+
+def test_iptables_manager_apply_raises_on_command_failure() -> None:
+    runner = _ScriptedCommandRunner(
+        returncodes={
+            (
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                "eth0",
+                "-s",
+                "172.16.0.2",
+                "-j",
+                "MASQUERADE",
+            ): [1]
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    with pytest.raises(
+        FirecrackerConfigError,
+        match="Command failed: iptables -t nat -A POSTROUTING",
+    ):
+        manager.apply(_build_allocation())
+
+
 def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -405,6 +577,17 @@ def _build_preboot_config(tmp_path: Path, **overrides: Any) -> FirePrebootConfig
     }
     params.update(overrides)
     return FirePrebootConfig(**params)
+
+
+def _build_allocation() -> TapNetworkAllocation:
+    return TapNetworkAllocation(
+        session_id="session-test",
+        session_index=0,
+        tap_name="fc123456789abc",
+        tap_ip="172.16.0.1",
+        guest_ip="172.16.0.2",
+        host_iface="eth0",
+    )
 
 
 class _NoopClient:
@@ -496,3 +679,35 @@ class _FakeCommandRunner:
                 stderr="Cannot find device",
             )
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+
+class _ScriptedCommandRunner:
+    def __init__(
+        self,
+        *,
+        returncodes: dict[tuple[str, ...], list[int]] | None = None,
+        outputs: dict[tuple[str, ...], str] | None = None,
+        default_returncode: int = 0,
+    ) -> None:
+        self._returncodes = {key: list(values) for key, values in (returncodes or {}).items()}
+        self._outputs = dict(outputs or {})
+        self._default_returncode = default_returncode
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(args))
+        key = tuple(args)
+        returncode = self._default_returncode
+        if key in self._returncodes and self._returncodes[key]:
+            returncode = self._returncodes[key].pop(0)
+        stdout = self._outputs.get(key, "")
+        stderr = "" if returncode == 0 else "error"
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def calls_as_tuples(self) -> list[tuple[str, ...]]:
+        return [tuple(call) for call in self.calls]
