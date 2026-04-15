@@ -353,8 +353,11 @@ def _validate_host_iface(value: Any) -> str | None:
 def _validate_preboot_config(preboot: FirePrebootConfig) -> None:
     if not preboot.rootfs_path.exists() or not preboot.rootfs_path.is_file():
         raise FirecrackerConfigError(f"Rootfs copy not found: {preboot.rootfs_path}")
-    if not preboot.tap_name:
-        raise FirecrackerConfigError("tap_name must be non-empty.")
+    if not _HOST_IFACE_PATTERN.fullmatch(preboot.tap_name):
+        raise FirecrackerConfigError(
+            "tap_name has invalid format: "
+            f"{preboot.tap_name!r}. Expected 1-15 chars [A-Za-z0-9._-]."
+        )
     if not _MAC_ADDR_PATTERN.fullmatch(preboot.guest_mac):
         raise FirecrackerConfigError(
             "Invalid guest MAC format. Expected six hex bytes, for example "
@@ -379,6 +382,10 @@ def _validate_network_payload(network: Mapping[str, Any]) -> None:
         raise FirecrackerConfigError(
             f"network payload missing required fields: {', '.join(missing)}"
         )
+    for field in ("ip", "gateway", "netmask"):
+        value = network.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise FirecrackerConfigError(f"network.{field} must be a non-empty string.")
     dns = network.get("dns")
     if not isinstance(dns, list) or not dns or not all(isinstance(item, str) for item in dns):
         raise FirecrackerConfigError("network.dns must be a non-empty list of strings.")
@@ -395,3 +402,9 @@ def _validate_llm_payload(llm: Mapping[str, Any]) -> None:
         raise FirecrackerConfigError("llm.model must be a non-empty string.")
     if not isinstance(llm.get("api_key"), str):
         raise FirecrackerConfigError("llm.api_key must be a string.")
+    max_tokens = llm.get("max_tokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        raise FirecrackerConfigError("llm.max_tokens must be a positive integer.")
+    temperature = llm.get("temperature")
+    if not isinstance(temperature, (int, float)):
+        raise FirecrackerConfigError("llm.temperature must be a number.")

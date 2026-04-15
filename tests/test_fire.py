@@ -187,6 +187,61 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
         )
 
 
+def test_configure_microvm_preboot_rejects_invalid_tap_name(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    preboot = _build_preboot_config(
+        tmp_path,
+        tap_name="tap-name-too-long!",
+    )
+
+    with pytest.raises(FirecrackerConfigError, match="tap_name has invalid format"):
+        configure_microvm_preboot(
+            api_client=_NoopClient(),
+            config=config,
+            preboot=preboot,
+        )
+
+
+def test_configure_microvm_preboot_rejects_invalid_network_ip(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    preboot = _build_preboot_config(
+        tmp_path,
+        network={
+            "ip": "",
+            "gateway": "172.16.0.1",
+            "netmask": "255.255.255.252",
+            "dns": ["8.8.8.8"],
+        },
+    )
+
+    with pytest.raises(FirecrackerConfigError, match=r"network\.ip must be a non-empty string"):
+        configure_microvm_preboot(
+            api_client=_NoopClient(),
+            config=config,
+            preboot=preboot,
+        )
+
+
+def test_configure_microvm_preboot_rejects_invalid_llm_max_tokens(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    preboot = _build_preboot_config(
+        tmp_path,
+        llm={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-test",
+            "max_tokens": 0,
+            "temperature": 0.2,
+        },
+    )
+
+    with pytest.raises(FirecrackerConfigError, match=r"llm\.max_tokens must be a positive integer"):
+        configure_microvm_preboot(
+            api_client=_NoopClient(),
+            config=config,
+            preboot=preboot,
+        )
+
+
 def test_firecracker_api_client_put_raises_on_non_2xx() -> None:
     response = _FakeResponse(status=400, body='{"fault_message":"bad request"}')
     connection = _FakeConnection(response=response)
@@ -226,6 +281,33 @@ def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
         host_iface="eth0",
         boot_timeout=30,
     )
+
+
+def _build_preboot_config(tmp_path: Path, **overrides: Any) -> FirePrebootConfig:
+    rootfs_copy = tmp_path / "rootfs-copy.ext4"
+    rootfs_copy.write_text("copy", encoding="utf-8")
+    params: dict[str, Any] = {
+        "rootfs_path": rootfs_copy,
+        "tap_name": "fc-testtap",
+        "guest_mac": "06:00:AC:10:00:02",
+        "guest_cid": 52,
+        "vsock_uds_path": tmp_path / "fire.vsock",
+        "log_path": tmp_path / "firecracker.log",
+        "network": {
+            "ip": "172.16.0.2",
+            "gateway": "172.16.0.1",
+            "netmask": "255.255.255.252",
+            "dns": ["8.8.8.8", "1.1.1.1"],
+        },
+        "llm": {
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-test",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+    }
+    params.update(overrides)
+    return FirePrebootConfig(**params)
 
 
 class _NoopClient:
