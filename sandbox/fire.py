@@ -990,7 +990,14 @@ class FireSandbox:
                 raise RuntimeError(f"Failed to receive event over vsock: {exc}") from exc
 
             if not chunk:
-                return None
+                if self._stopping:
+                    return None
+                exit_code = self._process.poll() if self._process is not None else None
+                if exit_code is None:
+                    raise RuntimeError("Guest vsock connection closed unexpectedly.")
+                raise RuntimeError(
+                    f"Guest vsock connection closed (firecracker exited with code {exit_code})."
+                )
 
             self._recv_buffer += chunk.decode("utf-8", errors="strict")
             line = self._extract_line()
