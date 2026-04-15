@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from sandbox.fire import (
     FirecrackerConfig,
     FirecrackerConfigError,
     FirePrebootConfig,
+    TapDeviceManager,
     configure_microvm_preboot,
     load_firecracker_config,
 )
@@ -264,6 +266,101 @@ def test_firecracker_api_client_put_raises_on_non_2xx() -> None:
     assert connection.request_calls[0]["url"] == "/machine-config"
 
 
+def test_tap_device_manager_allocates_sequential_subnets(tmp_path: Path) -> None:
+    runner = _FakeCommandRunner(
+        route_json='[{"dev":"eth0"}]',
+        route_text="default via 192.168.1.1 dev eth0 proto dhcp",
+    )
+    manager = TapDeviceManager(
+        host_iface=None,
+        counter_path=tmp_path / "tap_counter",
+        command_runner=runner,
+    )
+
+    first = manager.create(session_id="session-1")
+    second = manager.create(session_id="session-2")
+
+    assert first.tap_ip == "172.16.0.1"
+    assert first.guest_ip == "172.16.0.2"
+    assert second.tap_ip == "172.16.0.5"
+    assert second.guest_ip == "172.16.0.6"
+    assert first.host_iface == "eth0"
+    assert second.host_iface == "eth0"
+    assert len(first.tap_name) <= 15
+    assert len(second.tap_name) <= 15
+    assert first.tap_name != second.tap_name
+
+
+def test_tap_device_manager_retries_on_ip_collision(tmp_path: Path) -> None:
+    runner = _FakeCommandRunner(
+        route_json='[{"dev":"eth9"}]',
+        route_text="default via 10.0.0.1 dev eth9",
+        addr_outputs=[
+            "2: stale0    inet 172.16.0.1/30 brd 172.16.0.3 scope global stale0",
+            "",
+        ],
+    )
+    counter_path = tmp_path / "tap_counter"
+    manager = TapDeviceManager(
+        host_iface="eth9",
+        counter_path=counter_path,
+        command_runner=runner,
+    )
+
+    allocation = manager.create(session_id="session-collision")
+
+    assert allocation.session_index == 1
+    assert allocation.tap_ip == "172.16.0.5"
+    assert allocation.guest_ip == "172.16.0.6"
+    assert counter_path.read_text(encoding="utf-8").strip() == "2"
+
+
+def test_tap_device_manager_detects_host_iface_from_text_route(tmp_path: Path) -> None:
+    runner = _FakeCommandRunner(
+        route_json="not-json",
+        route_text="default via 192.168.0.1 dev wlan0 proto dhcp src 192.168.0.200",
+    )
+    manager = TapDeviceManager(
+        host_iface=None,
+        counter_path=tmp_path / "tap_counter",
+        command_runner=runner,
+    )
+
+    allocation = manager.create(session_id="session-route-fallback")
+
+    assert allocation.host_iface == "wlan0"
+
+
+def test_tap_device_manager_rejects_invalid_session_id(tmp_path: Path) -> None:
+    runner = _FakeCommandRunner(
+        route_json='[{"dev":"eth0"}]',
+        route_text="default via 192.168.1.1 dev eth0",
+    )
+    manager = TapDeviceManager(
+        host_iface=None,
+        counter_path=tmp_path / "tap_counter",
+        command_runner=runner,
+    )
+
+    with pytest.raises(FirecrackerConfigError, match="Invalid session_id format"):
+        manager.create(session_id="bad/session")
+
+
+def test_tap_device_manager_destroy_never_raises(tmp_path: Path) -> None:
+    runner = _FakeCommandRunner(
+        route_json='[{"dev":"eth0"}]',
+        route_text="default via 192.168.1.1 dev eth0",
+        fail_link_del=True,
+    )
+    manager = TapDeviceManager(
+        host_iface="eth0",
+        counter_path=tmp_path / "tap_counter",
+        command_runner=runner,
+    )
+
+    manager.destroy("fc123456789abc")
+
+
 def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -352,3 +449,50 @@ class _FakeConnection:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FakeCommandRunner:
+    def __init__(
+        self,
+        *,
+        route_json: str,
+        route_text: str,
+        addr_outputs: list[str] | None = None,
+        fail_link_del: bool = False,
+    ) -> None:
+        self._route_json = route_json
+        self._route_text = route_text
+        self._addr_outputs = list(addr_outputs or [])
+        self._fail_link_del = fail_link_del
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(args))
+        key = tuple(args)
+        if key == ("ip", "-j", "route", "list", "default"):
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=self._route_json,
+                stderr="",
+            )
+        if key == ("ip", "route", "show", "default"):
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=self._route_text,
+                stderr="",
+            )
+        if key == ("ip", "-4", "-o", "addr", "show"):
+            stdout = ""
+            if self._addr_outputs:
+                stdout = self._addr_outputs.pop(0)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+        if len(args) >= 4 and args[:3] == ["ip", "link", "del"] and self._fail_link_del:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=1,
+                stdout="",
+                stderr="Cannot find device",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")

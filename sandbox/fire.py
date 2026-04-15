@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import fcntl
 import http.client
 import json
 import os
 import re
 import socket
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
 _MAC_ADDR_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
+_DEFAULT_TAP_COUNTER_PATH = Path("~/.strangeclaw/tap_counter").expanduser()
+_TAP_NETWORK_PREFIX = "172.16"
+_TAP_NETMASK = "255.255.255.252"
+_TAP_CIDR_SUFFIX = 30
+_MAX_TAP_SUBNETS = 16384
 
 
 class FirecrackerConfigError(ValueError):
@@ -121,6 +130,211 @@ class FirecrackerRequestClient(Protocol):
     """Minimal client contract for Firecracker API requests."""
 
     def put(self, path: str, payload: Mapping[str, Any]) -> None: ...
+
+
+class CommandRunner(Protocol):
+    """Minimal subprocess runner contract for host command execution."""
+
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]: ...
+
+
+@dataclass(frozen=True)
+class TapNetworkAllocation:
+    """Allocated network tuple for a Firecracker TAP device."""
+
+    session_id: str
+    session_index: int
+    tap_name: str
+    tap_ip: str
+    guest_ip: str
+    host_iface: str
+
+    @property
+    def tap_cidr(self) -> str:
+        return f"{self.tap_ip}/{_TAP_CIDR_SUFFIX}"
+
+    @property
+    def netmask(self) -> str:
+        return _TAP_NETMASK
+
+    @property
+    def gateway(self) -> str:
+        return self.tap_ip
+
+
+def sanitize_session_id(session_id: str) -> str:
+    """Validate and return a safe session id for host-side resource names."""
+    if not isinstance(session_id, str) or not session_id:
+        raise FirecrackerConfigError("session_id must be a non-empty string.")
+    if not _SESSION_ID_PATTERN.fullmatch(session_id):
+        raise FirecrackerConfigError(
+            "Invalid session_id format. Expected characters [a-zA-Z0-9-] only."
+        )
+    return session_id
+
+
+def tap_name_for_session(session_id: str) -> str:
+    """Return deterministic TAP name: fc + first 12 hex chars of SHA-256(session_id)."""
+    sanitized = sanitize_session_id(session_id)
+    return f"fc{sha256(sanitized.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _default_command_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, check=False)
+
+
+class TapDeviceManager:
+    """Allocates and manages TAP devices for Firecracker sessions."""
+
+    def __init__(
+        self,
+        *,
+        host_iface: str | None,
+        counter_path: Path | None = None,
+        command_runner: CommandRunner | None = None,
+    ) -> None:
+        if host_iface is not None and not _HOST_IFACE_PATTERN.fullmatch(host_iface):
+            raise FirecrackerConfigError(
+                "Config field firecracker.host_iface has invalid format: "
+                f"{host_iface!r}. Expected 1-15 chars [A-Za-z0-9._-]."
+            )
+        self._host_iface_override = host_iface
+        self._counter_path = (counter_path or _DEFAULT_TAP_COUNTER_PATH).expanduser()
+        self._command_runner: CommandRunner = command_runner or _default_command_runner
+
+    def create(self, *, session_id: str, max_retries: int = 16) -> TapNetworkAllocation:
+        """Create TAP device and return allocation metadata."""
+        if max_retries <= 0:
+            raise ValueError("max_retries must be greater than zero.")
+
+        sanitized_session_id = sanitize_session_id(session_id)
+        tap_name = tap_name_for_session(sanitized_session_id)
+        host_iface = self._detect_host_iface()
+        last_collision: tuple[str, str] | None = None
+
+        for _ in range(max_retries):
+            session_index = self._next_session_index()
+            tap_ip, guest_ip = _tap_guest_ips_from_index(session_index)
+            used_ips = self._list_assigned_ipv4_addrs()
+            if tap_ip in used_ips or guest_ip in used_ips:
+                last_collision = (tap_ip, guest_ip)
+                continue
+
+            allocation = TapNetworkAllocation(
+                session_id=sanitized_session_id,
+                session_index=session_index,
+                tap_name=tap_name,
+                tap_ip=tap_ip,
+                guest_ip=guest_ip,
+                host_iface=host_iface,
+            )
+            self._create_tap_interface(allocation)
+            return allocation
+
+        collision_text = ""
+        if last_collision is not None:
+            collision_text = (
+                f" Last attempted pair tap_ip={last_collision[0]} guest_ip={last_collision[1]}."
+            )
+        raise FirecrackerConfigError(
+            f"Failed to allocate TAP subnet without IP collision after {max_retries} attempts."
+            f"{collision_text}"
+        )
+
+    def destroy(self, tap_name: str) -> None:
+        """Best-effort TAP teardown. Never raises."""
+        if not isinstance(tap_name, str) or not tap_name:
+            return
+        try:
+            self._run_command(["ip", "link", "del", tap_name], check=False)
+        except Exception:
+            return
+
+    def _create_tap_interface(self, allocation: TapNetworkAllocation) -> None:
+        self._run_command(
+            ["ip", "tuntap", "add", "dev", allocation.tap_name, "mode", "tap"],
+            check=True,
+        )
+        try:
+            self._run_command(
+                ["ip", "addr", "add", allocation.tap_cidr, "dev", allocation.tap_name],
+                check=True,
+            )
+            self._run_command(
+                ["ip", "link", "set", "dev", allocation.tap_name, "up"],
+                check=True,
+            )
+        except FirecrackerConfigError:
+            self.destroy(allocation.tap_name)
+            raise
+
+    def _detect_host_iface(self) -> str:
+        if self._host_iface_override:
+            return self._host_iface_override
+
+        route_json = self._run_command(
+            ["ip", "-j", "route", "list", "default"],
+            check=False,
+        )
+        iface = _parse_default_route_iface_json(route_json)
+        if iface is not None:
+            return iface
+
+        route_text = self._run_command(["ip", "route", "show", "default"], check=False)
+        iface = _parse_default_route_iface_text(route_text)
+        if iface is not None:
+            return iface
+
+        raise FirecrackerConfigError(
+            "Unable to detect host outbound interface from default route. "
+            "Set firecracker.host_iface in config."
+        )
+
+    def _run_command(self, args: list[str], *, check: bool) -> str:
+        result = self._command_runner(args)
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or (
+                f"exit code {result.returncode}"
+            )
+            raise FirecrackerConfigError(f"Command failed: {' '.join(args)}: {detail}")
+        return result.stdout
+
+    def _list_assigned_ipv4_addrs(self) -> set[str]:
+        output = self._run_command(["ip", "-4", "-o", "addr", "show"], check=False)
+        ips: set[str] = set()
+        for line in output.splitlines():
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+\b", line)
+            if match is not None:
+                ips.add(match.group(1))
+        return ips
+
+    def _next_session_index(self) -> int:
+        self._counter_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._counter_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                raw_value = handle.read().strip()
+                current = 0
+                if raw_value:
+                    try:
+                        current = int(raw_value)
+                    except ValueError as exc:
+                        raise FirecrackerConfigError(
+                            f"Invalid TAP counter value in {self._counter_path}: {raw_value!r}"
+                        ) from exc
+                if current < 0:
+                    raise FirecrackerConfigError(
+                        f"Invalid TAP counter value in {self._counter_path}: {raw_value!r}"
+                    )
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"{current + 1}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return current
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -408,3 +622,44 @@ def _validate_llm_payload(llm: Mapping[str, Any]) -> None:
     temperature = llm.get("temperature")
     if not isinstance(temperature, (int, float)):
         raise FirecrackerConfigError("llm.temperature must be a number.")
+
+
+def _tap_guest_ips_from_index(session_index: int) -> tuple[str, str]:
+    if session_index < 0:
+        raise FirecrackerConfigError("session_index must be greater than or equal to zero.")
+    effective_index = session_index % _MAX_TAP_SUBNETS
+    tap_host_offset = (4 * effective_index) + 1
+    guest_host_offset = tap_host_offset + 1
+    return _ip_from_host_offset(tap_host_offset), _ip_from_host_offset(guest_host_offset)
+
+
+def _ip_from_host_offset(host_offset: int) -> str:
+    if host_offset < 0 or host_offset > 65535:
+        raise FirecrackerConfigError(f"Invalid host offset for TAP /30 allocation: {host_offset}")
+    third_octet = host_offset // 256
+    fourth_octet = host_offset % 256
+    return f"{_TAP_NETWORK_PREFIX}.{third_octet}.{fourth_octet}"
+
+
+def _parse_default_route_iface_json(output: str) -> str | None:
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, list):
+        return None
+    for item in parsed:
+        if not isinstance(item, Mapping):
+            continue
+        dev = item.get("dev")
+        if isinstance(dev, str) and _HOST_IFACE_PATTERN.fullmatch(dev):
+            return dev
+    return None
+
+
+def _parse_default_route_iface_text(output: str) -> str | None:
+    match = re.search(r"\bdev\s+([A-Za-z0-9._-]{1,15})\b", output)
+    if match is None:
+        return None
+    return match.group(1)
