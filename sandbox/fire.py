@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import http.client
 import json
 import os
+import random
 import re
+import shutil
+import signal
 import socket
 import subprocess
+import tempfile
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol, cast
+
+from agent.protocol import decode_event, encode_event
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -25,6 +33,14 @@ _TAP_NETMASK = "255.255.255.252"
 _TAP_CIDR_SUFFIX = 30
 _MAX_TAP_SUBNETS = 16384
 _FIRE_TAP_NAME_PATTERN = re.compile(r"^fc[0-9a-f]{12}$")
+_GUEST_VSOCK_PORT = 5000
+_DEFAULT_API_SOCKET_WAIT_SECONDS = 5.0
+_DEFAULT_VSOCK_RETRY_SECONDS = 0.5
+_DEFAULT_FIRE_DNS = ["8.8.8.8", "1.1.1.1"]
+_CID_MIN = 3
+_CID_MAX = 4294967294
+_CID_RETRY_ATTEMPTS = 10
+_DEFAULT_CID_LOCK_PATH = Path("~/.strangeclaw/firecracker_cids.json").expanduser()
 
 
 class FirecrackerConfigError(ValueError):
@@ -33,6 +49,10 @@ class FirecrackerConfigError(ValueError):
 
 class FirecrackerAPIError(RuntimeError):
     """Raised when a Firecracker API call fails."""
+
+
+class VMBootError(RuntimeError):
+    """Raised when FireSandbox cannot boot/connect a Firecracker VM."""
 
 
 @dataclass(frozen=True)
@@ -139,6 +159,70 @@ class CommandRunner(Protocol):
     def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]: ...
 
 
+class TapManagerLike(Protocol):
+    """Contract for TAP allocation lifecycle dependencies."""
+
+    def create(self, *, session_id: str, max_retries: int = 16) -> TapNetworkAllocation: ...
+
+    def destroy(self, tap_name: str) -> None: ...
+
+
+class FirewallManagerLike(Protocol):
+    """Contract for host firewall lifecycle dependencies."""
+
+    def apply(self, allocation: TapNetworkAllocation) -> None: ...
+
+    def cleanup(self, allocation: TapNetworkAllocation) -> None: ...
+
+
+class CidManagerLike(Protocol):
+    """Contract for guest CID lease lifecycle dependencies."""
+
+    def allocate(self, *, attempts: int = _CID_RETRY_ATTEMPTS) -> int: ...
+
+    def release(self, cid: int) -> None: ...
+
+
+class PopenProcess(Protocol):
+    """Minimal process contract used by FireSandbox lifecycle."""
+
+    stderr: Any | None
+
+    def poll(self) -> int | None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+class PopenFactory(Protocol):
+    """Factory for spawning Firecracker processes."""
+
+    def __call__(self, args: list[str]) -> PopenProcess: ...
+
+
+class ConnectedSocket(Protocol):
+    """Minimal connected-socket contract for host vsock stream."""
+
+    def settimeout(self, timeout: float | None) -> None: ...
+
+    def connect(self, address: Any) -> None: ...
+
+    def sendall(self, payload: bytes) -> None: ...
+
+    def recv(self, bufsize: int) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+class UnixSocketFactory(Protocol):
+    """Factory for host AF_UNIX stream sockets."""
+
+    def __call__(self) -> ConnectedSocket: ...
+
+
 @dataclass(frozen=True)
 class TapNetworkAllocation:
     """Allocated network tuple for a Firecracker TAP device."""
@@ -182,6 +266,19 @@ def tap_name_for_session(session_id: str) -> str:
 
 def _default_command_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
+
+
+def _default_popen_factory(args: list[str]) -> PopenProcess:
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _default_unix_socket_factory() -> ConnectedSocket:
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
 
 class TapDeviceManager:
@@ -501,6 +598,93 @@ class IptablesManager:
             return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="")
 
 
+class CidLeaseManager:
+    """Cross-process guest CID allocator backed by a lock file."""
+
+    def __init__(
+        self,
+        *,
+        lock_path: Path | None = None,
+        rng: random.Random | None = None,
+    ) -> None:
+        self._lock_path = (lock_path or _DEFAULT_CID_LOCK_PATH).expanduser()
+        self._rng = rng or random.SystemRandom()
+
+    def allocate(self, *, attempts: int = _CID_RETRY_ATTEMPTS) -> int:
+        if attempts <= 0:
+            raise ValueError("attempts must be greater than zero.")
+
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                state = self._read_state(handle)
+                in_use = {int(item) for item in state.get("active", [])}
+                for _ in range(attempts):
+                    candidate = int(self._rng.randint(_CID_MIN, _CID_MAX))
+                    if candidate in in_use:
+                        continue
+                    in_use.add(candidate)
+                    self._write_state(handle, sorted(in_use))
+                    return candidate
+                raise FirecrackerConfigError(
+                    f"Unable to allocate guest_cid after {attempts} attempts."
+                )
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def release(self, cid: int) -> None:
+        if not isinstance(cid, int):
+            return
+        if not self._lock_path.exists():
+            return
+
+        try:
+            with self._lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    state = self._read_state(handle)
+                    in_use = {int(item) for item in state.get("active", [])}
+                    if cid not in in_use:
+                        return
+                    in_use.remove(cid)
+                    self._write_state(handle, sorted(in_use))
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            return
+
+    def _read_state(self, handle: Any) -> dict[str, Any]:
+        handle.seek(0)
+        raw = handle.read().strip()
+        if not raw:
+            return {"active": []}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise FirecrackerConfigError(
+                f"Invalid CID lock file content in {self._lock_path}: {raw!r}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise FirecrackerConfigError(
+                f"Invalid CID lock file structure in {self._lock_path}: expected object."
+            )
+        active = parsed.get("active", [])
+        if not isinstance(active, list):
+            raise FirecrackerConfigError(
+                f"Invalid CID lock file structure in {self._lock_path}: active must be list."
+            )
+        return {"active": active}
+
+    def _write_state(self, handle: Any, active: list[int]) -> None:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"active": active}, separators=(",", ":")))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 class _UnixHTTPConnection(http.client.HTTPConnection):
     """HTTP connection over a Unix socket path."""
 
@@ -660,21 +844,464 @@ def configure_microvm_preboot(
 class FireSandbox:
     """Firecracker sandbox interface."""
 
+    def __init__(
+        self,
+        *,
+        firecracker_config: FirecrackerConfig,
+        llm_config: Mapping[str, Any],
+        tap_manager: TapManagerLike | None = None,
+        iptables_manager: FirewallManagerLike | None = None,
+        cid_manager: CidManagerLike | None = None,
+        api_client_factory: Callable[[str], FirecrackerRequestClient] | None = None,
+        command_runner: CommandRunner | None = None,
+        popen_factory: PopenFactory | None = None,
+        unix_socket_factory: UnixSocketFactory | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        temp_root: Path | None = None,
+        install_exit_handlers: bool = True,
+    ) -> None:
+        self._firecracker_config = firecracker_config
+        self._llm_config = dict(llm_config)
+        _validate_llm_payload(self._llm_config)
+
+        self._command_runner = command_runner or _default_command_runner
+        self._tap_manager = tap_manager or TapDeviceManager(
+            host_iface=self._firecracker_config.host_iface,
+            command_runner=self._command_runner,
+        )
+        self._iptables_manager = iptables_manager or IptablesManager(
+            command_runner=self._command_runner
+        )
+        self._cid_manager = cid_manager or CidLeaseManager()
+        self._api_client_factory = api_client_factory or (
+            lambda api_sock: FirecrackerAPIClient(
+                api_socket_path=api_sock,
+                timeout_seconds=5.0,
+            )
+        )
+        self._popen_factory = popen_factory or _default_popen_factory
+        self._unix_socket_factory = unix_socket_factory or _default_unix_socket_factory
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._temp_root = temp_root or Path("/tmp")
+
+        self._process: PopenProcess | None = None
+        self._api_socket_path: Path | None = None
+        self._vsock_uds_path: Path | None = None
+        self._log_path: Path | None = None
+        self._session_temp_dir: Path | None = None
+        self._rootfs_copy_path: Path | None = None
+        self._allocation: TapNetworkAllocation | None = None
+        self._guest_cid: int | None = None
+        self._vsock_conn: ConnectedSocket | None = None
+        self._recv_buffer = ""
+        self._stopping = False
+
+        self._install_exit_handlers = install_exit_handlers
+        self._atexit_registered = False
+        self._previous_signal_handlers: dict[int, Any] = {}
+        if self._install_exit_handlers:
+            self._register_exit_handlers()
+
+    def __enter__(self) -> FireSandbox:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type
+        del exc
+        del tb
+        self.stop()
+
     def run(self, task: dict[str, Any]) -> None:
         """Start an agent run for a task."""
-        raise NotImplementedError("Backlog task B2.4 implements FireSandbox.")
+        if self._process is not None and self._process.poll() is None:
+            raise RuntimeError("FireSandbox is already running.")
+        if self._install_exit_handlers and not self._atexit_registered:
+            self._register_exit_handlers()
+
+        session_id = sanitize_session_id(str(task.get("session_id", "")))
+        llm_payload = self._resolve_llm_payload(task)
+        task_event = dict(task)
+        task_event.pop("llm", None)
+
+        try:
+            self._prepare_runtime_paths(session_id=session_id)
+            self._copy_rootfs()
+            self._allocation = self._tap_manager.create(session_id=session_id)
+            self._iptables_manager.apply(self._allocation)
+            self._guest_cid = self._cid_manager.allocate()
+            self._launch_firecracker()
+            self._wait_for_api_socket(timeout_seconds=_DEFAULT_API_SOCKET_WAIT_SECONDS)
+            self._configure_microvm(llm_payload=llm_payload)
+            self._vsock_conn = self._connect_vsock_with_retry(
+                timeout_seconds=self._firecracker_config.boot_timeout
+            )
+            agent_ready = self.receive(timeout_seconds=self._firecracker_config.boot_timeout)
+            if agent_ready is None or agent_ready.get("type") != "agent_ready":
+                raise VMBootError(
+                    "Did not receive agent_ready after successful vsock CONNECT handshake."
+                )
+            self.send(task_event)
+        except Exception as exc:
+            diagnostics = self._build_boot_diagnostics()
+            self.stop()
+            if isinstance(exc, VMBootError):
+                raise VMBootError(f"{exc}{diagnostics}") from exc
+            raise VMBootError(f"Failed to start FireSandbox: {exc}{diagnostics}") from exc
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event to the agent."""
-        raise NotImplementedError("Backlog task B2.4 implements FireSandbox.")
+        conn = self._require_vsock_conn()
+        try:
+            payload = encode_event(event).encode("utf-8")
+            conn.sendall(payload)
+        except OSError as exc:
+            raise RuntimeError(f"Failed to send event over vsock: {exc}") from exc
 
     def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
         """Receive an event from the agent."""
-        raise NotImplementedError("Backlog task B2.4 implements FireSandbox.")
+        conn = self._require_vsock_conn()
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be >= 0.")
+
+        line = self._extract_line()
+        if line is not None:
+            return decode_event(line)
+
+        deadline: float | None = None
+        if timeout_seconds is not None:
+            deadline = self._monotonic() + timeout_seconds
+
+        while True:
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    return None
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(65 * 1024)
+            except TimeoutError:
+                return None
+            except OSError as exc:
+                if self._stopping:
+                    return None
+                raise RuntimeError(f"Failed to receive event over vsock: {exc}") from exc
+
+            if not chunk:
+                return None
+
+            self._recv_buffer += chunk.decode("utf-8", errors="strict")
+            line = self._extract_line()
+            if line is not None:
+                return decode_event(line)
 
     def stop(self) -> None:
         """Stop the VM and clean up resources."""
-        raise NotImplementedError("Backlog task B2.4 implements FireSandbox.")
+        if self._stopping:
+            return
+        self._stopping = True
+        try:
+            self._close_vsock_conn()
+            self._graceful_shutdown_process()
+            if self._allocation is not None:
+                self._iptables_manager.cleanup(self._allocation)
+                self._tap_manager.destroy(self._allocation.tap_name)
+                self._allocation = None
+            if self._guest_cid is not None:
+                self._cid_manager.release(self._guest_cid)
+                self._guest_cid = None
+            if self._session_temp_dir is not None:
+                shutil.rmtree(self._session_temp_dir, ignore_errors=True)
+            self._session_temp_dir = None
+            self._api_socket_path = None
+            self._vsock_uds_path = None
+            self._log_path = None
+            self._rootfs_copy_path = None
+            self._recv_buffer = ""
+        finally:
+            self._process = None
+            self._unregister_exit_handlers()
+            self._stopping = False
+
+    def _resolve_llm_payload(self, task: Mapping[str, Any]) -> dict[str, Any]:
+        from_task = task.get("llm")
+        if isinstance(from_task, Mapping):
+            candidate = dict(from_task)
+            _validate_llm_payload(candidate)
+            return candidate
+        return dict(self._llm_config)
+
+    def _prepare_runtime_paths(self, *, session_id: str) -> None:
+        self._session_temp_dir = Path(
+            tempfile.mkdtemp(prefix=f"strangeclaw-{session_id}-", dir=str(self._temp_root))
+        )
+        self._api_socket_path = self._session_temp_dir / "firecracker.socket"
+        self._vsock_uds_path = self._session_temp_dir / "fire.vsock"
+        self._log_path = self._session_temp_dir / "firecracker.log"
+        self._rootfs_copy_path = self._session_temp_dir / "rootfs.ext4"
+
+    def _copy_rootfs(self) -> None:
+        if self._rootfs_copy_path is None:
+            raise RuntimeError("Rootfs copy path was not initialized.")
+        result = self._command_runner(
+            [
+                "cp",
+                "--reflink=auto",
+                str(self._firecracker_config.rootfs),
+                str(self._rootfs_copy_path),
+            ]
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or (
+                f"exit code {result.returncode}"
+            )
+            raise FirecrackerConfigError(f"Failed to copy rootfs image: {detail}")
+
+    def _launch_firecracker(self) -> None:
+        if self._api_socket_path is None:
+            raise RuntimeError("API socket path was not initialized.")
+        args = [
+            str(self._firecracker_config.binary),
+            "--api-sock",
+            str(self._api_socket_path),
+        ]
+        self._process = self._popen_factory(args)
+
+    def _wait_for_api_socket(self, *, timeout_seconds: float) -> None:
+        if self._api_socket_path is None:
+            raise RuntimeError("API socket path was not initialized.")
+        deadline = self._monotonic() + timeout_seconds
+        while self._monotonic() < deadline:
+            if self._api_socket_path.exists():
+                return
+            if self._process is not None and self._process.poll() is not None:
+                raise VMBootError("Firecracker process exited before API socket became available.")
+            self._sleep(0.1)
+        raise VMBootError(
+            f"Timed out waiting for Firecracker API socket: {self._api_socket_path}"
+        )
+
+    def _configure_microvm(self, *, llm_payload: dict[str, Any]) -> None:
+        if self._api_socket_path is None:
+            raise RuntimeError("API socket path was not initialized.")
+        if self._rootfs_copy_path is None:
+            raise RuntimeError("Rootfs copy path was not initialized.")
+        if self._allocation is None:
+            raise RuntimeError("TAP allocation was not initialized.")
+        if self._guest_cid is None:
+            raise RuntimeError("guest_cid was not initialized.")
+        if self._vsock_uds_path is None:
+            raise RuntimeError("vsock uds path was not initialized.")
+        if self._log_path is None:
+            raise RuntimeError("log path was not initialized.")
+
+        api_client = self._api_client_factory(str(self._api_socket_path))
+        preboot = FirePrebootConfig(
+            rootfs_path=self._rootfs_copy_path,
+            tap_name=self._allocation.tap_name,
+            guest_mac="06:00:AC:10:00:02",
+            guest_cid=self._guest_cid,
+            vsock_uds_path=self._vsock_uds_path,
+            log_path=self._log_path,
+            network={
+                "ip": self._allocation.guest_ip,
+                "gateway": self._allocation.tap_ip,
+                "netmask": self._allocation.netmask,
+                "dns": list(_DEFAULT_FIRE_DNS),
+            },
+            llm=llm_payload,
+        )
+        configure_microvm_preboot(
+            api_client=api_client,
+            config=self._firecracker_config,
+            preboot=preboot,
+        )
+
+    def _connect_vsock_with_retry(self, *, timeout_seconds: float) -> ConnectedSocket:
+        if self._vsock_uds_path is None:
+            raise RuntimeError("vsock uds path was not initialized.")
+        deadline = self._monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while self._monotonic() < deadline:
+            if not self._vsock_uds_path.exists():
+                self._sleep(0.1)
+                continue
+            conn = self._unix_socket_factory()
+            try:
+                conn.settimeout(2.0)
+                conn.connect(str(self._vsock_uds_path))
+                conn.sendall(f"CONNECT {_GUEST_VSOCK_PORT}\n".encode())
+                ack = self._recv_line_bytes(conn, timeout_seconds=2.0)
+                if not ack.startswith(b"OK "):
+                    raise VMBootError(f"Unexpected vsock CONNECT acknowledgment: {ack!r}")
+                return conn
+            except Exception as exc:
+                last_error = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._sleep(_DEFAULT_VSOCK_RETRY_SECONDS)
+
+        raise VMBootError(
+            "Timed out waiting for vsock CONNECT handshake "
+            f"on {self._vsock_uds_path}. Last error: {last_error}"
+        )
+
+    def _recv_line_bytes(self, conn: ConnectedSocket, *, timeout_seconds: float) -> bytes:
+        conn.settimeout(timeout_seconds)
+        data = b""
+        while b"\n" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise VMBootError("EOF while waiting for vsock handshake line.")
+            data += chunk
+        line, remainder = data.split(b"\n", 1)
+        if remainder:
+            self._recv_buffer += remainder.decode("utf-8", errors="strict")
+        return line
+
+    def _require_vsock_conn(self) -> ConnectedSocket:
+        if self._vsock_conn is None:
+            raise RuntimeError("FireSandbox is not connected to guest vsock.")
+        return self._vsock_conn
+
+    def _extract_line(self) -> str | None:
+        newline_index = self._recv_buffer.find("\n")
+        if newline_index < 0:
+            return None
+        line = self._recv_buffer[: newline_index + 1]
+        self._recv_buffer = self._recv_buffer[newline_index + 1 :]
+        return line
+
+    def _close_vsock_conn(self) -> None:
+        if self._vsock_conn is None:
+            return
+        try:
+            self._vsock_conn.close()
+        except Exception:
+            pass
+        self._vsock_conn = None
+
+    def _graceful_shutdown_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+
+        self._try_send_ctrl_alt_del()
+        if self._wait_for_process_exit(timeout_seconds=5.0):
+            return
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        if self._wait_for_process_exit(timeout_seconds=2.0):
+            return
+        try:
+            process.kill()
+        except Exception:
+            pass
+        self._wait_for_process_exit(timeout_seconds=1.0)
+
+    def _try_send_ctrl_alt_del(self) -> None:
+        if self._api_socket_path is None:
+            return
+        if not self._api_socket_path.exists():
+            return
+        try:
+            api_client = self._api_client_factory(str(self._api_socket_path))
+            api_client.put("/actions", {"action_type": "SendCtrlAltDel"})
+        except Exception:
+            return
+
+    def _wait_for_process_exit(self, *, timeout_seconds: float) -> bool:
+        process = self._process
+        if process is None:
+            return True
+        try:
+            process.wait(timeout=timeout_seconds)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return process.poll() is not None
+
+    def _build_boot_diagnostics(self) -> str:
+        parts: list[str] = []
+        stderr_text = self._read_process_stderr_best_effort()
+        if self._process is not None:
+            parts.append(f"firecracker stderr: {stderr_text or '<empty>'}")
+        log_tail = self._read_log_tail_best_effort()
+        if self._log_path is not None:
+            parts.append(f"firecracker log tail: {log_tail or '<empty>'}")
+        if not parts:
+            return ""
+        return " | " + " | ".join(parts)
+
+    def _read_process_stderr_best_effort(self) -> str:
+        process = self._process
+        if process is None or process.stderr is None:
+            return ""
+        try:
+            if process.poll() is None:
+                return ""
+            stderr_value = process.stderr.read()
+            if not isinstance(stderr_value, str):
+                return ""
+            return stderr_value.strip()[-2000:]
+        except Exception:
+            return ""
+
+    def _read_log_tail_best_effort(self) -> str:
+        if self._log_path is None or not self._log_path.exists():
+            return ""
+        try:
+            data = self._log_path.read_text(encoding="utf-8", errors="replace")
+            return data[-2000:].strip()
+        except Exception:
+            return ""
+
+    def _register_exit_handlers(self) -> None:
+        if self._atexit_registered:
+            return
+        try:
+            atexit.register(self.stop)
+            self._atexit_registered = True
+        except Exception:
+            self._atexit_registered = False
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                previous = signal.getsignal(sig)
+                self._previous_signal_handlers[int(sig)] = previous
+                signal.signal(sig, self._handle_exit_signal)
+            except Exception:
+                continue
+
+    def _unregister_exit_handlers(self) -> None:
+        if self._atexit_registered:
+            try:
+                atexit.unregister(self.stop)
+            except Exception:
+                pass
+            self._atexit_registered = False
+
+        if not self._previous_signal_handlers:
+            return
+        for sig, handler in list(self._previous_signal_handlers.items()):
+            try:
+                signal.signal(sig, handler)
+            except Exception:
+                continue
+        self._previous_signal_handlers.clear()
+
+    def _handle_exit_signal(self, signum: int, frame: Any) -> None:
+        self.stop()
+        previous = self._previous_signal_handlers.get(int(signum))
+        if callable(previous) and previous is not self._handle_exit_signal:
+            previous(signum, frame)
 
 
 def _require_file_path(value: Any, *, field_name: str, executable: bool) -> Path:

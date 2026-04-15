@@ -17,9 +17,11 @@ from sandbox.fire import (
     FirecrackerConfig,
     FirecrackerConfigError,
     FirePrebootConfig,
+    FireSandbox,
     IptablesManager,
     TapDeviceManager,
     TapNetworkAllocation,
+    VMBootError,
     configure_microvm_preboot,
     load_firecracker_config,
 )
@@ -533,6 +535,154 @@ def test_iptables_manager_apply_raises_on_command_failure() -> None:
         manager.apply(_build_allocation())
 
 
+def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'],
+            )
+        ]
+    )
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    task = {
+        "type": "task",
+        "text": "hello",
+        "session_id": "sess-1",
+        "approval_mode": "review",
+        "llm": {
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-inline",
+            "max_tokens": 2048,
+            "temperature": 0.1,
+        },
+    }
+    sandbox.run(task)
+
+    sent_payloads = socket_factory.sockets[0].sent
+    assert sent_payloads[0] == b"CONNECT 5000\n"
+    assert b'"type":"task"' in sent_payloads[1]
+    assert b'"llm"' not in sent_payloads[1]
+    assert tap_manager.create_calls == ["sess-1"]
+    assert iptables_manager.applied is True
+    assert cid_manager.allocated == 52
+    assert api_factory.paths() == [
+        "/boot-source",
+        "/drives/rootfs",
+        "/machine-config",
+        "/network-interfaces/eth0",
+        "/vsock",
+        "/logger",
+        "/mmds/config",
+        "/mmds",
+        "/actions",
+    ]
+
+    sandbox.stop()
+    assert iptables_manager.cleaned is True
+    assert tap_manager.destroyed == ["fc123456789abc"]
+    assert cid_manager.released == [52]
+
+
+def test_fire_sandbox_connect_retries_with_new_socket(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    vsock_path = tmp_path / "fire.vsock"
+    vsock_path.write_text("", encoding="utf-8")
+
+    first = _FakeConnectedSocket(connect_error=OSError("connection refused"))
+    second = _FakeConnectedSocket(recv_chunks=[b"OK 101\n"])
+    socket_factory = _FakeSocketFactory([first, second])
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        sleep=lambda _seconds: None,
+        install_exit_handlers=False,
+    )
+    sandbox._vsock_uds_path = vsock_path  # noqa: SLF001
+
+    conn = sandbox._connect_vsock_with_retry(timeout_seconds=1.0)  # noqa: SLF001
+    assert conn is second
+    assert len(socket_factory.sockets) == 2
+
+
+def test_fire_sandbox_run_raises_boot_error_with_diagnostics(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory([_FakeConnectedSocket(recv_chunks=[b"BAD\n"])])
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    with pytest.raises(VMBootError, match="firecracker log tail"):
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "hello",
+                "session_id": "sess-2",
+                "approval_mode": "review",
+            }
+        )
+
+
 def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -711,3 +861,172 @@ class _ScriptedCommandRunner:
 
     def calls_as_tuples(self) -> list[tuple[str, ...]]:
         return [tuple(call) for call in self.calls]
+
+
+class _CopyingCommandRunner:
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        if len(args) == 4 and args[0] == "cp":
+            source = Path(args[2])
+            dest = Path(args[3])
+            dest.write_bytes(source.read_bytes())
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+
+class _FakeTapManager:
+    def __init__(self, allocation: TapNetworkAllocation) -> None:
+        self._allocation = allocation
+        self.create_calls: list[str] = []
+        self.destroyed: list[str] = []
+
+    def create(self, *, session_id: str, max_retries: int = 16) -> TapNetworkAllocation:
+        del max_retries
+        self.create_calls.append(session_id)
+        return self._allocation
+
+    def destroy(self, tap_name: str) -> None:
+        self.destroyed.append(tap_name)
+
+
+class _FakeIptablesManager:
+    def __init__(self) -> None:
+        self.applied = False
+        self.cleaned = False
+
+    def apply(self, allocation: TapNetworkAllocation) -> None:
+        del allocation
+        self.applied = True
+
+    def cleanup(self, allocation: TapNetworkAllocation) -> None:
+        del allocation
+        self.cleaned = True
+
+
+class _FakeCidManager:
+    def __init__(self, cid: int) -> None:
+        self.allocated = cid
+        self.released: list[int] = []
+
+    def allocate(self, *, attempts: int = 10) -> int:
+        del attempts
+        return self.allocated
+
+    def release(self, cid: int) -> None:
+        self.released.append(cid)
+
+
+class _FakeApiFactory:
+    def __init__(self) -> None:
+        self._clients: list[_FakeApiClient] = []
+
+    def make(self, api_socket: str) -> _FakeApiClient:
+        client = _FakeApiClient(api_socket=Path(api_socket))
+        self._clients.append(client)
+        return client
+
+    def paths(self) -> list[str]:
+        if not self._clients:
+            return []
+        return [path for path, _payload in self._clients[-1].calls]
+
+
+class _FakeApiClient:
+    def __init__(self, api_socket: Path) -> None:
+        self._api_socket = api_socket
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._vsock_uds: Path | None = None
+
+    def put(self, path: str, payload: Mapping[str, Any]) -> None:
+        self.calls.append((path, dict(payload)))
+        if path == "/vsock":
+            uds_path = payload.get("uds_path")
+            if isinstance(uds_path, str):
+                self._vsock_uds = Path(uds_path)
+        if path == "/actions" and self._vsock_uds is not None:
+            self._vsock_uds.write_text("", encoding="utf-8")
+
+
+class _FakePopenFactory:
+    def __init__(self) -> None:
+        self.processes: list[_FakeProcess] = []
+
+    def __call__(self, args: list[str]) -> _FakeProcess:
+        api_index = args.index("--api-sock") + 1
+        api_path = Path(args[api_index])
+        api_path.write_text("", encoding="utf-8")
+        process = _FakeProcess()
+        self.processes.append(process)
+        return process
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self._running = True
+        self.stderr = _FakeStderr("")
+
+    def poll(self) -> int | None:
+        return None if self._running else 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        self._running = False
+        return 0
+
+    def terminate(self) -> None:
+        self._running = False
+
+    def kill(self) -> None:
+        self._running = False
+
+
+class _FakeStderr:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def read(self) -> str:
+        return self._content
+
+
+class _FakeSocketFactory:
+    def __init__(self, sockets: list[_FakeConnectedSocket]) -> None:
+        self.sockets = sockets
+        self._index = 0
+
+    def __call__(self) -> _FakeConnectedSocket:
+        if self._index >= len(self.sockets):
+            raise AssertionError("No more fake sockets configured.")
+        sock = self.sockets[self._index]
+        self._index += 1
+        return sock
+
+
+class _FakeConnectedSocket:
+    def __init__(
+        self,
+        *,
+        recv_chunks: list[bytes] | None = None,
+        connect_error: Exception | None = None,
+    ) -> None:
+        self._recv_chunks = list(recv_chunks or [])
+        self._connect_error = connect_error
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def settimeout(self, timeout: float | None) -> None:
+        del timeout
+
+    def connect(self, address: Any) -> None:
+        del address
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    def recv(self, bufsize: int) -> bytes:
+        del bufsize
+        if not self._recv_chunks:
+            return b""
+        return self._recv_chunks.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
