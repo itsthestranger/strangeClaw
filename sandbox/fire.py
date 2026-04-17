@@ -1010,17 +1010,22 @@ class FireSandbox:
             return
         self._stopping = True
         try:
-            self._close_vsock_conn()
-            self._graceful_shutdown_process()
+            self._safe_teardown_step(self._close_vsock_conn)
+            self._safe_teardown_step(self._graceful_shutdown_process)
             if self._allocation is not None:
-                self._iptables_manager.cleanup(self._allocation)
-                self._tap_manager.destroy(self._allocation.tap_name)
+                allocation = self._allocation
+                self._safe_teardown_step(lambda: self._iptables_manager.cleanup(allocation))
+                self._safe_teardown_step(lambda: self._tap_manager.destroy(allocation.tap_name))
                 self._allocation = None
             if self._guest_cid is not None:
-                self._cid_manager.release(self._guest_cid)
+                guest_cid = self._guest_cid
+                self._safe_teardown_step(lambda: self._cid_manager.release(guest_cid))
                 self._guest_cid = None
             if self._session_temp_dir is not None:
-                shutil.rmtree(self._session_temp_dir, ignore_errors=True)
+                session_temp_dir = self._session_temp_dir
+                self._safe_teardown_step(
+                    lambda: shutil.rmtree(session_temp_dir, ignore_errors=True)
+                )
             self._session_temp_dir = None
             self._api_socket_path = None
             self._vsock_uds_path = None
@@ -1029,8 +1034,14 @@ class FireSandbox:
             self._recv_buffer = ""
         finally:
             self._process = None
-            self._unregister_exit_handlers()
+            self._safe_teardown_step(self._unregister_exit_handlers)
             self._stopping = False
+
+    def _safe_teardown_step(self, operation: Callable[[], None]) -> None:
+        try:
+            operation()
+        except Exception:
+            return
 
     def _resolve_llm_payload(self, task: Mapping[str, Any]) -> dict[str, Any]:
         from_task = task.get("llm")

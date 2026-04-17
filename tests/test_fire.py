@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -683,6 +683,43 @@ def test_fire_sandbox_run_raises_boot_error_with_diagnostics(tmp_path: Path) -> 
         )
 
 
+def test_fire_sandbox_stop_never_raises_and_is_idempotent(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=_RaisingTapManager(_build_allocation()),
+        iptables_manager=_RaisingIptablesManager(),
+        cid_manager=_RaisingCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=_FakeSocketFactory([]),
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+    sandbox._allocation = _build_allocation()  # noqa: SLF001
+    sandbox._guest_cid = 52  # noqa: SLF001
+    sandbox._session_temp_dir = runtime_dir  # noqa: SLF001
+    sandbox._process = cast(Any, _FakeProcess())  # noqa: SLF001
+
+    sandbox.stop()
+    sandbox.stop()
+
+    assert not runtime_dir.exists()
+    assert sandbox._allocation is None  # noqa: SLF001
+    assert sandbox._guest_cid is None  # noqa: SLF001
+    assert sandbox._session_temp_dir is None  # noqa: SLF001
+
+
 def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -901,6 +938,15 @@ class _FakeIptablesManager:
         self.cleaned = True
 
 
+class _RaisingIptablesManager:
+    def apply(self, allocation: TapNetworkAllocation) -> None:
+        del allocation
+
+    def cleanup(self, allocation: TapNetworkAllocation) -> None:
+        del allocation
+        raise RuntimeError("cleanup failed")
+
+
 class _FakeCidManager:
     def __init__(self, cid: int) -> None:
         self.allocated = cid
@@ -912,6 +958,19 @@ class _FakeCidManager:
 
     def release(self, cid: int) -> None:
         self.released.append(cid)
+
+
+class _RaisingCidManager:
+    def __init__(self, cid: int) -> None:
+        self.allocated = cid
+
+    def allocate(self, *, attempts: int = 10) -> int:
+        del attempts
+        return self.allocated
+
+    def release(self, cid: int) -> None:
+        del cid
+        raise RuntimeError("release failed")
 
 
 class _FakeApiFactory:
@@ -1030,3 +1089,17 @@ class _FakeConnectedSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _RaisingTapManager:
+    def __init__(self, allocation: TapNetworkAllocation) -> None:
+        self._allocation = allocation
+
+    def create(self, *, session_id: str, max_retries: int = 16) -> TapNetworkAllocation:
+        del session_id
+        del max_retries
+        return self._allocation
+
+    def destroy(self, tap_name: str) -> None:
+        del tap_name
+        raise RuntimeError("destroy failed")
