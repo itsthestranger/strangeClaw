@@ -91,6 +91,58 @@ Run the Fire prerequisite checker directly:
 bash scripts/fire-check.sh
 ```
 
+## Fire Mode With Local LLMs (Opt-In)
+
+By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM
+server (Ollama, LM Studio), you must opt in with `firecracker.host_expose`.
+
+Example config:
+
+```yaml
+llm:
+  model: lm_studio/your-model-id
+  api_key: ""
+  api_base: "http://localhost:1235/v1"
+
+firecracker:
+  host_expose:
+    enabled: true
+    ports: [1235]
+```
+
+Notes:
+- In Fire mode, strangeclaw rewrites `localhost` / `127.0.0.1` `api_base` to
+  the TAP gateway IP before sending config to the guest.
+- Fire mode networking setup (`ip tuntap`, `iptables`) requires elevated
+  privileges. Run Fire verification/usage commands with `sudo` and preserve your
+  user config path:
+  ```bash
+  sudo --preserve-env=HOME .venv/bin/python scripts/verify_b24.py --goal "Say hello briefly." --approval-mode auto
+  ```
+- For security trade-offs of `host_expose`, see `strangeclaw_spec.md` §13.
+
+### LM Studio Loopback Gotcha
+
+LM Studio often listens on loopback only (`127.0.0.1:<port>`). In that case,
+the Fire guest cannot reach it through exposed host ports.
+
+Check listener:
+
+```bash
+ss -ltnp | grep 1234
+```
+
+If LM Studio is loopback-only, use a host proxy port that listens on all
+interfaces:
+
+```bash
+sudo dnf install -y socat
+socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
+```
+
+Then point strangeclaw to the proxy port (`api_base: http://localhost:1235/v1`)
+and expose that port (`host_expose.ports: [1235]`).
+
 ## Telegram Setup
 
 1. Create a bot with BotFather:

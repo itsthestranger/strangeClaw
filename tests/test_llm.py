@@ -437,6 +437,33 @@ def test_from_config_accepts_provider_settings() -> None:
     assert client.native_probe is False
 
 
+def test_from_config_maps_api_base_into_provider_settings() -> None:
+    client = LLMClient.from_config(
+        {
+            "model": "lm_studio/local-model",
+            "api_key": "",
+            "max_tokens": 1024,
+            "temperature": 0.1,
+            "api_base": "http://127.0.0.1:11434/v1",
+        }
+    )
+
+    assert client.provider_settings["api_base"] == "http://127.0.0.1:11434/v1"
+
+
+def test_from_config_rejects_invalid_api_base() -> None:
+    with pytest.raises(ValueError, match=r"llm\.api_base"):
+        LLMClient.from_config(
+            {
+                "model": "lm_studio/local-model",
+                "api_key": "",
+                "max_tokens": 1024,
+                "temperature": 0.1,
+                "api_base": "",
+            }
+        )
+
+
 def test_provider_settings_reject_reserved_keys() -> None:
     with pytest.raises(ValueError, match="reserved keys"):
         LLMClient(model="x", api_key="y", provider_settings={"model": "override"})

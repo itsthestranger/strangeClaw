@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -11,6 +12,7 @@ import yaml
 
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+LOGGER = logging.getLogger(__name__)
 
 REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("mode",),
@@ -50,6 +52,7 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         raise ConfigError(f"Config file {source_path} must contain a top-level mapping.")
     resolved = cast(dict[str, Any], resolved_any)
     _validate_required_fields(resolved, source_path)
+    _validate_optional_fields(resolved)
     return resolved
 
 
@@ -120,4 +123,74 @@ def _validate_required_fields(config: dict[str, Any], source_path: Path) -> None
         missing_text = ", ".join(missing)
         raise ConfigError(
             f"Missing required config fields in {source_path}: {missing_text}"
+        )
+
+
+def _validate_optional_fields(config: dict[str, Any]) -> None:
+    _validate_llm_optional_fields(config)
+    _validate_firecracker_optional_fields(config)
+
+
+def _validate_llm_optional_fields(config: dict[str, Any]) -> None:
+    llm_section = config.get("llm")
+    if not isinstance(llm_section, dict):
+        raise ConfigError("Config field llm must be a mapping.")
+
+    if "api_base" not in llm_section:
+        llm_section["api_base"] = None
+        return
+
+    api_base = llm_section["api_base"]
+    if api_base is None:
+        return
+    if not isinstance(api_base, str) or not api_base.strip():
+        raise ConfigError("Config field llm.api_base must be a non-empty string or null.")
+    llm_section["api_base"] = api_base.strip()
+
+
+def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
+    firecracker_section = config.get("firecracker")
+    if not isinstance(firecracker_section, dict):
+        raise ConfigError("Config field firecracker must be a mapping.")
+
+    host_expose = firecracker_section.get("host_expose")
+    if host_expose is None:
+        firecracker_section["host_expose"] = {"enabled": False, "ports": []}
+        return
+    if not isinstance(host_expose, dict):
+        raise ConfigError("Config field firecracker.host_expose must be a mapping.")
+
+    enabled = host_expose.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("Config field firecracker.host_expose.enabled must be a boolean.")
+
+    raw_ports = host_expose.get("ports", [])
+    if not isinstance(raw_ports, list):
+        raise ConfigError("Config field firecracker.host_expose.ports must be a list.")
+
+    seen_ports: set[int] = set()
+    ports: list[int] = []
+    for index, item in enumerate(raw_ports):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(
+                "Config field firecracker.host_expose.ports must contain integers "
+                f"in range 1..65535 (invalid at index {index})."
+            )
+        if item < 1 or item > 65535:
+            raise ConfigError(
+                "Config field firecracker.host_expose.ports must contain integers "
+                f"in range 1..65535 (invalid value {item} at index {index})."
+            )
+        if item in seen_ports:
+            continue
+        seen_ports.add(item)
+        ports.append(item)
+
+    host_expose["enabled"] = enabled
+    host_expose["ports"] = ports
+
+    if enabled and not ports:
+        LOGGER.warning(
+            "firecracker.host_expose is enabled but no ports were configured; "
+            "this setting currently has no effect."
         )

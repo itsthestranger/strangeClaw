@@ -105,6 +105,33 @@ def test_load_firecracker_config_rejects_non_executable_binary(tmp_path: Path) -
         load_firecracker_config(config)
 
 
+def test_load_firecracker_config_parses_host_expose(tmp_path: Path) -> None:
+    binary = tmp_path / "firecracker"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    kernel = tmp_path / "vmlinux"
+    kernel.write_text("kernel", encoding="utf-8")
+    rootfs = tmp_path / "agent.ext4"
+    rootfs.write_text("rootfs", encoding="utf-8")
+
+    config = {
+        "firecracker": {
+            "binary": str(binary),
+            "kernel": str(kernel),
+            "rootfs": str(rootfs),
+            "vcpu": 1,
+            "mem_mb": 512,
+            "host_iface": "eth0",
+            "boot_timeout": 30,
+            "host_expose": {"enabled": True, "ports": [11434, 11434]},
+        }
+    }
+    loaded = load_firecracker_config(config)
+
+    assert loaded.host_expose_enabled is True
+    assert loaded.host_expose_ports == (11434,)
+
+
 def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     rootfs_copy = tmp_path / "rootfs-copy.ext4"
@@ -450,6 +477,54 @@ def test_iptables_manager_apply_skips_conntrack_when_existing() -> None:
     ) not in runner.calls_as_tuples()
 
 
+def test_iptables_manager_apply_inserts_host_expose_accept_before_drop() -> None:
+    runner = _ScriptedCommandRunner(
+        returncodes={
+            (
+                "iptables",
+                "-C",
+                "FORWARD",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ): [0]
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    manager.apply(_build_allocation(), host_expose_ports=(11434,))
+
+    calls = runner.calls_as_tuples()
+    expose_call = (
+        "iptables",
+        "-I",
+        "INPUT",
+        "-i",
+        "fc123456789abc",
+        "-p",
+        "tcp",
+        "--dport",
+        "11434",
+        "-j",
+        "ACCEPT",
+    )
+    drop_call = (
+        "iptables",
+        "-A",
+        "INPUT",
+        "-i",
+        "fc123456789abc",
+        "-j",
+        "DROP",
+    )
+    assert expose_call in calls
+    assert drop_call in calls
+    assert calls.index(expose_call) < calls.index(drop_call)
+
+
 def test_iptables_manager_cleanup_removes_conntrack_when_no_fire_taps() -> None:
     runner = _ScriptedCommandRunner(
         outputs={
@@ -499,6 +574,31 @@ def test_iptables_manager_cleanup_keeps_conntrack_with_active_fire_taps() -> Non
         "-j",
         "ACCEPT",
     ) not in runner.calls_as_tuples()
+
+
+def test_iptables_manager_cleanup_removes_host_expose_accept_rules() -> None:
+    runner = _ScriptedCommandRunner(
+        outputs={
+            ("ip", "-o", "link", "show"): "",
+        }
+    )
+    manager = IptablesManager(command_runner=runner)
+
+    manager.cleanup(_build_allocation(), host_expose_ports=(11434,))
+
+    assert (
+        "iptables",
+        "-D",
+        "INPUT",
+        "-i",
+        "fc123456789abc",
+        "-p",
+        "tcp",
+        "--dport",
+        "11434",
+        "-j",
+        "ACCEPT",
+    ) in runner.calls_as_tuples()
 
 
 def test_iptables_manager_cleanup_never_raises_on_command_errors() -> None:
@@ -590,6 +690,7 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
     assert b'"llm"' not in sent_payloads[1]
     assert tap_manager.create_calls == ["sess-1"]
     assert iptables_manager.applied is True
+    assert iptables_manager.apply_ports == ()
     assert cid_manager.allocated == 52
     assert api_factory.paths() == [
         "/boot-source",
@@ -605,6 +706,7 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
 
     sandbox.stop()
     assert iptables_manager.cleaned is True
+    assert iptables_manager.cleanup_ports == ()
     assert tap_manager.destroyed == ["fc123456789abc"]
     assert cid_manager.released == [52]
 
@@ -683,6 +785,117 @@ def test_fire_sandbox_run_raises_boot_error_with_diagnostics(tmp_path: Path) -> 
         )
 
 
+def test_fire_sandbox_rewrites_localhost_api_base_for_host_expose(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _build_firecracker_config(
+        tmp_path,
+        host_expose_enabled=True,
+        host_expose_ports=(11434,),
+    )
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'])]
+    )
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "lm_studio/local-model",
+            "api_key": "",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "api_base": "http://localhost:11434/v1",
+        },
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    with caplog.at_level("INFO"):
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "hello",
+                "session_id": "sess-expose",
+                "approval_mode": "review",
+            }
+        )
+
+    mmds_payload = api_factory.payload_for("/mmds")
+    assert mmds_payload["llm"]["api_base"] == "http://172.16.0.1:11434/v1"
+    assert mmds_payload["llm"]["provider_settings"]["api_base"] == "http://172.16.0.1:11434/v1"
+    assert iptables_manager.apply_ports == (11434,)
+    assert "host_expose enabled for ports [11434]" in caplog.text
+
+    sandbox.stop()
+
+
+def test_fire_sandbox_warns_when_localhost_api_base_without_host_expose(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'])]
+    )
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "lm_studio/local-model",
+            "api_key": "",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "api_base": "http://127.0.0.1:11434/v1",
+        },
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    with caplog.at_level("WARNING"):
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "hello",
+                "session_id": "sess-no-expose",
+                "approval_mode": "review",
+            }
+        )
+
+    mmds_payload = api_factory.payload_for("/mmds")
+    assert mmds_payload["llm"]["api_base"] == "http://127.0.0.1:11434/v1"
+    assert "host_expose is disabled" in caplog.text
+    assert iptables_manager.apply_ports == ()
+
+    sandbox.stop()
+
+
 def test_fire_sandbox_stop_never_raises_and_is_idempotent(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     runtime_dir = tmp_path / "runtime"
@@ -720,7 +933,12 @@ def test_fire_sandbox_stop_never_raises_and_is_idempotent(tmp_path: Path) -> Non
     assert sandbox._session_temp_dir is None  # noqa: SLF001
 
 
-def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
+def _build_firecracker_config(
+    tmp_path: Path,
+    *,
+    host_expose_enabled: bool = False,
+    host_expose_ports: tuple[int, ...] = (),
+) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     binary.chmod(0o755)
@@ -736,6 +954,8 @@ def _build_firecracker_config(tmp_path: Path) -> FirecrackerConfig:
         mem_mb=512,
         host_iface="eth0",
         boot_timeout=30,
+        host_expose_enabled=host_expose_enabled,
+        host_expose_ports=host_expose_ports,
     )
 
 
@@ -928,22 +1148,48 @@ class _FakeIptablesManager:
     def __init__(self) -> None:
         self.applied = False
         self.cleaned = False
+        self.apply_ports: tuple[int, ...] = ()
+        self.cleanup_ports: tuple[int, ...] = ()
 
-    def apply(self, allocation: TapNetworkAllocation) -> None:
+    def apply(
+        self,
+        allocation: TapNetworkAllocation,
+        *,
+        host_expose_ports: tuple[int, ...] = (),
+    ) -> None:
         del allocation
         self.applied = True
+        self.apply_ports = host_expose_ports
 
-    def cleanup(self, allocation: TapNetworkAllocation) -> None:
+    def cleanup(
+        self,
+        allocation: TapNetworkAllocation,
+        *,
+        host_expose_ports: tuple[int, ...] = (),
+    ) -> None:
         del allocation
         self.cleaned = True
+        self.cleanup_ports = host_expose_ports
 
 
 class _RaisingIptablesManager:
-    def apply(self, allocation: TapNetworkAllocation) -> None:
+    def apply(
+        self,
+        allocation: TapNetworkAllocation,
+        *,
+        host_expose_ports: tuple[int, ...] = (),
+    ) -> None:
         del allocation
+        del host_expose_ports
 
-    def cleanup(self, allocation: TapNetworkAllocation) -> None:
+    def cleanup(
+        self,
+        allocation: TapNetworkAllocation,
+        *,
+        host_expose_ports: tuple[int, ...] = (),
+    ) -> None:
         del allocation
+        del host_expose_ports
         raise RuntimeError("cleanup failed")
 
 
@@ -986,6 +1232,14 @@ class _FakeApiFactory:
         if not self._clients:
             return []
         return [path for path, _payload in self._clients[-1].calls]
+
+    def payload_for(self, path: str) -> dict[str, Any]:
+        if not self._clients:
+            raise AssertionError("No API clients recorded.")
+        for call_path, payload in self._clients[-1].calls:
+            if call_path == path:
+                return payload
+        raise AssertionError(f"No payload recorded for path {path}.")
 
 
 class _FakeApiClient:

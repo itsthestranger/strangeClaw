@@ -99,6 +99,13 @@ class LLMClient:
         else:
             raise ValueError("llm.provider_settings must be an object when provided.")
 
+        api_base = config.get("api_base")
+        if api_base is not None:
+            if not isinstance(api_base, str) or not api_base.strip():
+                raise ValueError("llm.api_base must be a non-empty string when provided.")
+            parsed_provider_settings = dict(parsed_provider_settings)
+            parsed_provider_settings.setdefault("api_base", api_base.strip())
+
         return cls(
             model=str(config["model"]),
             api_key=str(config.get("api_key", "")),
