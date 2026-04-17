@@ -140,6 +140,9 @@ sudo dnf install -y socat
 socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
 ```
 
+Run the `socat` command in a separate terminal and keep it running while
+strangeclaw is using Fire mode with the proxied local LLM.
+
 Then point strangeclaw to the proxy port (`api_base: http://localhost:1235/v1`)
 and expose that port (`host_expose.ports: [1235]`).
 
