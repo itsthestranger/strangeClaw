@@ -237,6 +237,20 @@ def test_main_rejects_unsupported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         main.main([])
 
 
+def test_main_rejects_resume_for_fire_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    bad = _config()
+    bad["mode"] = "fire"
+    monkeypatch.setattr(main, "load_config", lambda: bad)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Cannot resume Fire mode sessions — VM filesystem is ephemeral. "
+            "Start a new session."
+        ),
+    ):
+        main.main(["--resume", "abc-1"])
+
+
 def test_main_rejects_unsupported_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = _config()
     bad["adapters"] = {"enabled": ["discord"]}

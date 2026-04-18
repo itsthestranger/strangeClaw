@@ -153,6 +153,11 @@ def main(argv: list[str] | None = None) -> None:
     """Run the strangeclaw application."""
     args = _parse_args(argv)
     config = load_config()
+    if config["mode"] == "fire" and args.resume:
+        raise ValueError(
+            "Cannot resume Fire mode sessions — VM filesystem is ephemeral. "
+            "Start a new session."
+        )
     if config["mode"] != "yolo":
         raise ValueError(f"Unsupported mode: {config['mode']}")
 
