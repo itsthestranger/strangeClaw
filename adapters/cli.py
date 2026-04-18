@@ -43,7 +43,7 @@ class CLIAdapter:
 
     def get_task(self) -> dict[str, Any]:
         """Get next task from the user."""
-        text = self._input("Task: ").strip()
+        text = self._read_input("Task: ").strip()
         if self._is_exit_command(text):
             raise CLIExitRequested()
         if not text:
@@ -100,19 +100,19 @@ class CLIAdapter:
     def get_reply(self, role: str) -> dict[str, Any]:
         """Get user feedback for plan review or clarification."""
         if role == "plan":
-            answer = self._input("Approve plan? [y/n]: ").strip().lower()
+            answer = self._read_input("Approve plan? [y/n]: ").strip().lower()
             if self._is_exit_command(answer):
                 raise CLIExitRequested()
             approved = answer in {"y", "yes"}
             if approved:
                 return {"approved": True, "text": ""}
-            feedback = self._input("Plan feedback: ").strip()
+            feedback = self._read_input("Plan feedback: ").strip()
             if self._is_exit_command(feedback):
                 raise CLIExitRequested()
             return {"approved": False, "text": feedback}
 
         if role == "clarification":
-            text = self._input("Reply: ").strip()
+            text = self._read_input("Reply: ").strip()
             if self._is_exit_command(text):
                 raise CLIExitRequested()
             return {"approved": True, "text": text}
@@ -253,3 +253,9 @@ class CLIAdapter:
     @staticmethod
     def _state_for_follow_up(state: dict[str, Any]) -> dict[str, Any]:
         return state_for_follow_up(state)
+
+    def _read_input(self, prompt: str) -> str:
+        try:
+            return self._input(prompt)
+        except EOFError as exc:
+            raise CLIExitRequested() from exc
