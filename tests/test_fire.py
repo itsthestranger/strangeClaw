@@ -22,6 +22,7 @@ from sandbox.fire import (
     TapDeviceManager,
     TapNetworkAllocation,
     VMBootError,
+    _default_popen_factory,
     configure_microvm_preboot,
     load_firecracker_config,
 )
@@ -130,6 +131,42 @@ def test_load_firecracker_config_parses_host_expose(tmp_path: Path) -> None:
 
     assert loaded.host_expose_enabled is True
     assert loaded.host_expose_ports == (11434,)
+
+
+def test_default_popen_factory_detaches_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeProcess:
+        stderr = None
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            return
+
+        def kill(self) -> None:
+            return
+
+    def fake_popen(args: list[str], **kwargs: Any) -> _FakeProcess:
+        captured["args"] = list(args)
+        captured["kwargs"] = dict(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr("sandbox.fire.subprocess.Popen", fake_popen)
+
+    process = _default_popen_factory(["firecracker", "--api-sock", "/tmp/fc.sock"])
+
+    assert isinstance(process, _FakeProcess)
+    assert captured["args"] == ["firecracker", "--api-sock", "/tmp/fc.sock"]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["stdout"] is subprocess.DEVNULL
+    assert captured["kwargs"]["stderr"] is subprocess.PIPE
+    assert captured["kwargs"]["text"] is True
 
 
 def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path) -> None:

@@ -290,6 +290,7 @@ def _default_command_runner(args: list[str]) -> subprocess.CompletedProcess[str]
 def _default_popen_factory(args: list[str]) -> PopenProcess:
     return subprocess.Popen(
         args,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
