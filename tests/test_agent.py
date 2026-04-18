@@ -291,6 +291,48 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     assert payload["recent_history"] == [{"type": "action", "idx": 3}]
     assert "skill_contracts" in payload
     assert "web-search" in payload["skill_contracts"]
+    assert payload["output_instruction"] == "Place any files for the user in /output/."
+
+
+def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "too-big.txt").write_bytes(b"0123456789abcdef")
+
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        output_dir=str(output_dir),
+        max_output_total_bytes=8,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    assert done_event["success"] is False
+    assert "Output export error" in done_event["reply"]
+    assert "exceeds output limit" in done_event["reply"]
+    assert done_event["files"] == []
 
 
 def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:

@@ -169,6 +169,38 @@ def test_run_persists_done_state_and_output_files(
     assert sandbox.stop_calls == 1
 
 
+def test_run_rejects_traversal_output_file_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    file_content = b"escape"
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "Finished.",
+                "state": {"goal": "x", "history": []},
+                "files": [
+                    {
+                        "path": "../escape.txt",
+                        "content_b64": base64.b64encode(file_content).decode("ascii"),
+                        "size_bytes": len(file_content),
+                    }
+                ],
+            }
+        ]
+    )
+    answers = iter(["Persist this"])
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: next(answers))
+
+    with pytest.raises(ValueError, match="Invalid output file path"):
+        adapter.run()
+    assert sandbox.stop_calls == 1
+    assert not (tmp_path / ".strangeclaw" / "sessions" / "escape.txt").exists()
+
+
 def test_get_task_uses_resume_state_with_new_prompted_task() -> None:
     sandbox = FakeSandbox(events=[])
     adapter = CLIAdapter(

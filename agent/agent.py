@@ -156,18 +156,13 @@ class Agent:
             }
         )
         self._send(
-            {
-                "type": "done",
-                "success": False,
-                "reply": "Stopped after reaching iteration limit.",
-                "state": {
-                    "goal": goal,
-                    "plan": plan,
-                    "history": history,
-                    "summary": self._history_summary or "",
-                },
-                "files": self._collect_output_files(),
-            }
+            self._build_done_event(
+                goal=goal,
+                plan=plan,
+                history=history,
+                success=False,
+                reply="Stopped after reaching iteration limit.",
+            )
         )
 
     def _resume_context(
@@ -339,18 +334,13 @@ class Agent:
         if decision.action == "done":
             reply = _string_arg(decision.args, "reply", fallback="Task completed.")
             self._send(
-                {
-                    "type": "done",
-                    "success": True,
-                    "reply": reply,
-                    "state": {
-                        "goal": goal,
-                        "plan": current_plan,
-                        "history": history,
-                        "summary": self._history_summary or "",
-                    },
-                    "files": self._collect_output_files(),
-                }
+                self._build_done_event(
+                    goal=goal,
+                    plan=current_plan,
+                    history=history,
+                    success=True,
+                    reply=reply,
+                )
             )
             return {"done": True, "plan": current_plan, "observation": None}
 
@@ -416,22 +406,58 @@ class Agent:
     def _send(self, event: dict[str, Any]) -> None:
         self._transport.send(event)
 
-    def _collect_output_files(self) -> list[dict[str, Any]]:
+    def _build_done_event(
+        self,
+        *,
+        goal: str,
+        plan: Any,
+        history: list[dict[str, Any]],
+        success: bool,
+        reply: str,
+    ) -> dict[str, Any]:
+        files, output_error = self._collect_output_files()
+        final_success = success
+        final_reply = reply
+        if output_error is not None:
+            final_success = False
+            final_reply = f"{reply}\n\nOutput export error: {output_error}"
+        return {
+            "type": "done",
+            "success": final_success,
+            "reply": final_reply,
+            "state": {
+                "goal": goal,
+                "plan": plan,
+                "history": history,
+                "summary": self._history_summary or "",
+            },
+            "files": files,
+        }
+
+    def _collect_output_files(self) -> tuple[list[dict[str, Any]], str | None]:
         if not self._output_dir.exists():
-            return []
+            return [], None
 
         files: list[dict[str, Any]] = []
+        root = self._output_dir.resolve()
+        limit_bytes = self._max_output_total_bytes
         total_bytes = 0
         for file_path in sorted(self._output_dir.rglob("*")):
             if not file_path.is_file() or file_path.is_symlink():
                 continue
-            size_bytes = file_path.stat().st_size
-            if size_bytes > self._max_output_total_bytes:
-                continue
-            if total_bytes + size_bytes > self._max_output_total_bytes:
-                continue
-            rel_path = file_path.relative_to(self._output_dir).as_posix()
-            content = file_path.read_bytes()
+            resolved_path = file_path.resolve()
+            if root not in resolved_path.parents:
+                return [], f"Invalid output file path: {file_path}"
+            rel_path = resolved_path.relative_to(root).as_posix()
+            size_bytes = resolved_path.stat().st_size
+            if size_bytes > limit_bytes:
+                return (
+                    [],
+                    f"Output file '{rel_path}' exceeds output limit of {limit_bytes} bytes.",
+                )
+            if total_bytes + size_bytes > limit_bytes:
+                return [], f"Total output size exceeds output limit of {limit_bytes} bytes."
+            content = resolved_path.read_bytes()
             total_bytes += len(content)
             files.append(
                 {
@@ -440,7 +466,7 @@ class Agent:
                     "size_bytes": len(content),
                 }
             )
-        return files
+        return files, None
 
     def _require_llm(self) -> LLMRuntime:
         if self._llm is None:
