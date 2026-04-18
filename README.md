@@ -91,6 +91,12 @@ Run the Fire prerequisite checker directly:
 bash scripts/fire-check.sh
 ```
 
+Run unified Fire verification checks:
+
+```bash
+sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python scripts/verify_fire.py --check all --goal "Say hello briefly."
+```
+
 ## Running In Fire Mode
 
 Fire mode needs elevated privileges for host networking operations (`ip tuntap`,
