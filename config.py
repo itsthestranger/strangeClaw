@@ -129,6 +129,7 @@ def _validate_required_fields(config: dict[str, Any], source_path: Path) -> None
 def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_llm_optional_fields(config)
     _validate_firecracker_optional_fields(config)
+    _validate_session_journal_optional_fields(config)
 
 
 def _validate_llm_optional_fields(config: dict[str, Any]) -> None:
@@ -194,3 +195,29 @@ def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
             "firecracker.host_expose is enabled but no ports were configured; "
             "this setting currently has no effect."
         )
+
+
+def _validate_session_journal_optional_fields(config: dict[str, Any]) -> None:
+    journal_section = config.get("session_journal")
+    if journal_section is None:
+        config["session_journal"] = {"enabled": False, "max_bytes": 1 * 1024 * 1024}
+        return
+    if not isinstance(journal_section, dict):
+        raise ConfigError("Config field session_journal must be a mapping.")
+
+    enabled = journal_section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("Config field session_journal.enabled must be a boolean.")
+
+    max_bytes_raw = journal_section.get("max_bytes", 1 * 1024 * 1024)
+    if isinstance(max_bytes_raw, bool):
+        raise ConfigError("Config field session_journal.max_bytes must be an integer.")
+    try:
+        max_bytes = int(max_bytes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Config field session_journal.max_bytes must be an integer.") from exc
+    if max_bytes <= 0:
+        raise ConfigError("Config field session_journal.max_bytes must be greater than zero.")
+
+    journal_section["enabled"] = enabled
+    journal_section["max_bytes"] = max_bytes

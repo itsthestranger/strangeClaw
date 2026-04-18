@@ -106,6 +106,16 @@ def _coordinator_max_active_sessions(
     return value
 
 
+def _session_journal_config(config: dict[str, Any]) -> dict[str, Any]:
+    journal_cfg = config.get("session_journal", {})
+    if not isinstance(journal_cfg, dict):
+        raise ValueError("Config field session_journal must be a mapping.")
+    return {
+        "enabled": bool(journal_cfg.get("enabled", False)),
+        "max_bytes": int(journal_cfg.get("max_bytes", 1 * 1024 * 1024)),
+    }
+
+
 def _build_adapter(
     *,
     adapter_name: str,
@@ -190,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
             config=config,
             enabled_adapters=enabled_adapters,
         ),
+        session_journal=_session_journal_config(config),
     )
     created: list[tuple[str, CLIAdapter | TelegramAdapter]] = []
     for adapter_name in enabled_adapters:

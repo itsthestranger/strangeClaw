@@ -106,6 +106,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
 
     assert loaded["llm"]["api_base"] is None
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
+    assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
 
 
 def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
@@ -142,3 +143,18 @@ def test_load_config_warns_when_host_expose_enabled_without_ports(
 
     assert loaded["firecracker"]["host_expose"] == {"enabled": True, "ports": []}
     assert "enabled but no ports were configured" in caplog.text
+
+
+def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["session_journal"] = {"enabled": "yes", "max_bytes": "huge"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"session_journal\.enabled"):
+        load_config(config_path)
+
+    config["session_journal"] = {"enabled": True, "max_bytes": 0}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"session_journal\.max_bytes"):
+        load_config(config_path)

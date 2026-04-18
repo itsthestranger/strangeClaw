@@ -92,11 +92,13 @@ class FakeCoordinator:
         approval_mode: str,
         llm_config: dict[str, Any] | None = None,
         max_active_sessions: int | None = None,
+        session_journal: dict[str, Any] | None = None,
     ) -> None:
         self.sandbox_factory = sandbox_factory
         self.approval_mode = approval_mode
         self.llm_config = llm_config
         self.max_active_sessions = max_active_sessions
+        self.session_journal = session_journal
         self.seed_calls: list[tuple[str, dict[str, Any]]] = []
         self.stop_session_calls: list[str] = []
         self.stop_all_called = False

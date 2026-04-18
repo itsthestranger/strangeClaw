@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,14 @@ class FakeSandbox:
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+class FailingSandbox(FakeSandbox):
+    """Sandbox stub that fails on run()."""
+
+    def run(self, task: dict[str, Any]) -> None:
+        del task
+        raise RuntimeError("boom")
 
 
 def _wait_until(predicate: Any, timeout_seconds: float = 2.0) -> bool:
@@ -133,3 +142,75 @@ def test_coordinator_reports_busy_for_running_session() -> None:
     assert status_one == "started"
     assert status_two == "busy"
     coordinator.stop_all()
+
+
+def test_coordinator_writes_redacted_bounded_session_journal(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    secret = "sk-secret-123"
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "message",
+                "role": "status",
+                "content": {"api_key": secret, "Authorization": "Bearer x"},
+            },
+            {
+                "type": "done",
+                "success": True,
+                "reply": "ok",
+                "state": {"goal": "g", "llm": {"api_key": secret}},
+                "files": [],
+            },
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_journal={"enabled": True, "max_bytes": 300},
+    )
+    seen_events: list[dict[str, Any]] = []
+
+    status = coordinator.start_task(session_id="sess-1", text="task", sink=seen_events.append)
+    assert status == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in seen_events))
+
+    journal_path = tmp_path / ".strangeclaw" / "sessions" / "sess-1" / "events.jsonl"
+    assert journal_path.exists()
+    assert journal_path.stat().st_size <= 300
+
+    content = journal_path.read_text(encoding="utf-8")
+    assert secret not in content
+    assert "[REDACTED]" in content
+    lines = [line for line in content.splitlines() if line.strip()]
+    assert lines
+    parsed_last = json.loads(lines[-1])
+    assert parsed_last["event"]["type"] == "done"
+
+
+def test_coordinator_emits_done_on_sandbox_runtime_error(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FailingSandbox(events=[])
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_journal={"enabled": True, "max_bytes": 4096},
+    )
+    seen_events: list[dict[str, Any]] = []
+
+    status = coordinator.start_task(session_id="sess-err", text="task", sink=seen_events.append)
+    assert status == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in seen_events))
+
+    done = [event for event in seen_events if event.get("type") == "done"][-1]
+    assert done["success"] is False
+    assert "Sandbox runtime error" in str(done["reply"])
+
+    journal_path = tmp_path / ".strangeclaw" / "sessions" / "sess-err" / "events.jsonl"
+    assert journal_path.exists()
+    journal_text = journal_path.read_text(encoding="utf-8")
+    assert "Sandbox runtime error" in journal_text

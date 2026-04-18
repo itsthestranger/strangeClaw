@@ -47,6 +47,10 @@ context:
 loop:
   max_iterations: 50
 
+session_journal:
+  enabled: false               # write per-session events.jsonl when true
+  max_bytes: 1048576           # hard cap per session journal file (bytes)
+
 skills:
   directory: ./skills
 
