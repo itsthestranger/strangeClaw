@@ -91,6 +91,26 @@ Run the Fire prerequisite checker directly:
 bash scripts/fire-check.sh
 ```
 
+## Running In Fire Mode
+
+Fire mode needs elevated privileges for host networking operations (`ip tuntap`,
+`iptables`). Running `main` without elevation will fail with errors such as:
+`ioctl(TUNSETIFF): Operation not permitted`.
+
+1. Set `mode: fire` in `~/.strangeclaw/config.yaml`.
+2. Start strangeclaw with `sudo` and preserve `HOME` so the same user config/session
+   path is used:
+   ```bash
+   sudo --preserve-env=HOME .venv/bin/python -m main
+   ```
+3. If `llm.api_key` uses `${ENV_VAR}` interpolation, preserve that env var too:
+   ```bash
+   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
+   ```
+
+Note: seeing `Task:` immediately is expected. The Firecracker VM is launched when
+you submit a task.
+
 ## Fire Mode With Local LLMs (Opt-In)
 
 By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM
@@ -113,12 +133,6 @@ firecracker:
 Notes:
 - In Fire mode, strangeclaw rewrites `localhost` / `127.0.0.1` `api_base` to
   the TAP gateway IP before sending config to the guest.
-- Fire mode networking setup (`ip tuntap`, `iptables`) requires elevated
-  privileges. Run Fire verification/usage commands with `sudo` and preserve your
-  user config path:
-  ```bash
-  sudo --preserve-env=HOME .venv/bin/python scripts/verify_b24.py --goal "Say hello briefly." --approval-mode auto
-  ```
 - For security trade-offs of `host_expose`, see `strangeclaw_spec.md` §13.
 
 ### LM Studio Loopback Gotcha
