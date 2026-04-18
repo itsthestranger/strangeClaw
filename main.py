@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from adapters.cli import CLIAdapter
 from adapters.telegram import TelegramAdapter, TelegramLimits
 from config import load_config
 from coordinator import Coordinator
+from sandbox.fire import FireSandbox, load_firecracker_config
 from sandbox.yolo import YoloSandbox
 from session import load as load_session
 
@@ -28,6 +30,17 @@ def _build_yolo_sandbox(config: dict[str, Any]) -> YoloSandbox:
         token_budget=int(config["context"]["token_budget"]),
         summary_threshold=int(config["context"]["summary_threshold"]),
     )
+
+
+def _build_sandbox_factory(config: dict[str, Any]) -> Callable[[], Any]:
+    mode = config.get("mode")
+    if mode == "yolo":
+        return lambda: _build_yolo_sandbox(config)
+    if mode == "fire":
+        fire_cfg = load_firecracker_config(config)
+        llm_cfg = dict(config["llm"])
+        return lambda: FireSandbox(firecracker_config=fire_cfg, llm_config=dict(llm_cfg))
+    raise ValueError(f"Unsupported mode: {mode}")
 
 
 def _enabled_adapters(config: dict[str, Any]) -> list[str]:
@@ -100,6 +113,7 @@ def _build_adapter(
     args: argparse.Namespace,
     multi_adapter_mode: bool,
     coordinator: Coordinator,
+    sandbox_factory: Callable[[], Any],
 ) -> CLIAdapter | TelegramAdapter:
     if adapter_name == "cli":
         resume_state = None
@@ -126,7 +140,7 @@ def _build_adapter(
             multi_adapter_mode=multi_adapter_mode,
         )
         telegram_adapter = TelegramAdapter(
-            sandbox_factory=lambda: _build_yolo_sandbox(config),
+            sandbox_factory=sandbox_factory,
             coordinator=coordinator,
             approval_mode=str(config["approval_mode"]),
             llm_config=dict(config["llm"]),
@@ -158,8 +172,7 @@ def main(argv: list[str] | None = None) -> None:
             "Cannot resume Fire mode sessions — VM filesystem is ephemeral. "
             "Start a new session."
         )
-    if config["mode"] != "yolo":
-        raise ValueError(f"Unsupported mode: {config['mode']}")
+    sandbox_factory = _build_sandbox_factory(config)
 
     enabled_adapters = _enabled_adapters(config)
     unsupported = [name for name in enabled_adapters if name not in {"cli", "telegram"}]
@@ -170,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
 
     multi_adapter_mode = len(enabled_adapters) > 1
     coordinator = Coordinator(
-        sandbox_factory=lambda: _build_yolo_sandbox(config),
+        sandbox_factory=sandbox_factory,
         approval_mode=str(config["approval_mode"]),
         llm_config=dict(config["llm"]),
         max_active_sessions=_coordinator_max_active_sessions(
@@ -186,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
             args=args,
             multi_adapter_mode=multi_adapter_mode,
             coordinator=coordinator,
+            sandbox_factory=sandbox_factory,
         )
         created.append((adapter_name, adapter))
 

@@ -231,7 +231,7 @@ def test_main_stops_sandbox_on_keyboard_interrupt(monkeypatch: pytest.MonkeyPatc
 
 def test_main_rejects_unsupported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = _config()
-    bad["mode"] = "fire"
+    bad["mode"] = "nimbus"
     monkeypatch.setattr(main, "load_config", lambda: bad)
     with pytest.raises(ValueError, match="Unsupported mode"):
         main.main([])
@@ -249,6 +249,51 @@ def test_main_rejects_resume_for_fire_mode(monkeypatch: pytest.MonkeyPatch) -> N
         ),
     ):
         main.main(["--resume", "abc-1"])
+
+
+def test_main_wires_fire_mode_sandbox_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    cfg["mode"] = "fire"
+    created: dict[str, Any] = {}
+
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    monkeypatch.setattr(main, "load_firecracker_config", lambda _: {"fire": "cfg"})
+
+    def fake_fire_sandbox_factory(**kwargs: Any) -> FakeSandbox:
+        sandbox = FakeSandbox(**kwargs)
+        created["sandbox"] = sandbox
+        return sandbox
+
+    def fake_coordinator_factory(**kwargs: Any) -> FakeCoordinator:
+        coordinator = FakeCoordinator(**kwargs)
+        created["coordinator"] = coordinator
+        return coordinator
+
+    def fake_adapter_factory(
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+    ) -> FakeAdapter:
+        adapter = FakeAdapter(
+            coordinator=coordinator,
+            approval_mode=approval_mode,
+            llm_config=llm_config,
+            **kwargs,
+        )
+        created["adapter"] = adapter
+        return adapter
+
+    monkeypatch.setattr(main, "FireSandbox", fake_fire_sandbox_factory)
+    monkeypatch.setattr(main, "Coordinator", fake_coordinator_factory)
+    monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
+
+    main.main([])
+
+    coordinator = created["coordinator"]
+    adapter = created["adapter"]
+    sandbox = coordinator.sandbox_factory()
+    assert sandbox.kwargs["firecracker_config"] == {"fire": "cfg"}
+    assert sandbox.kwargs["llm_config"] == {"model": "x", "api_key": "k"}
+    assert adapter.coordinator is coordinator
+    assert adapter.run_called is True
 
 
 def test_main_rejects_unsupported_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
