@@ -117,6 +117,25 @@ Fire mode needs elevated privileges for host networking operations (`ip tuntap`,
 Note: seeing `Task:` immediately is expected. The Firecracker VM is launched when
 you submit a task.
 
+### Fire Session Semantics (Current Behavior)
+
+- Fire mode is currently **per-task ephemeral**: each submitted task boots a fresh
+  microVM, runs the agent until `done`, then tears the VM down.
+- Follow-up tasks in the same CLI/Telegram session reuse **persisted host-side
+  state** (`state.json`), not a still-running guest VM.
+- Because a fresh VM is started per task, you may see a Fire startup status line
+  again on each new task.
+
+Why this design today:
+- **Simplicity:** single-task VM lifecycle is easier to reason about and debug.
+- **Security:** short-lived guests reduce dwell time if in-guest code is
+  compromised.
+- **Maintainability:** cleanup and failure recovery are deterministic at task
+  boundaries.
+
+This is intentional; a persistent-per-session Fire VM mode may be added later as
+an explicit opt-in if lower latency is required.
+
 ## Fire Mode With Local LLMs (Opt-In)
 
 By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM
