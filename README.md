@@ -211,3 +211,7 @@ Notes:
 - `--resume` is only allowed when exactly one adapter is enabled.
 - In multi-adapter mode, Telegram session IDs are namespaced as
   `telegram-<chat_id>` to avoid collisions.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](./LICENSE).
