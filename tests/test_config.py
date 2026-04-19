@@ -67,6 +67,7 @@ def test_load_config_falls_back_to_example_when_user_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fallback-key")
 
     loaded = load_config()
 
@@ -106,6 +107,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
 
     assert loaded["llm"]["api_base"] is None
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
+    assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
 
 
@@ -126,6 +128,21 @@ def test_load_config_rejects_invalid_host_expose_ports(tmp_path: Path) -> None:
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"host_expose\.ports"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_fire_log_export_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["log_export"] = {"enabled": "yes", "max_bytes": "huge"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"log_export\.enabled"):
+        load_config(config_path)
+
+    config["firecracker"]["log_export"] = {"enabled": True, "max_bytes": 0}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"log_export\.max_bytes"):
         load_config(config_path)
 
 

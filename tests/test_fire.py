@@ -131,6 +131,35 @@ def test_load_firecracker_config_parses_host_expose(tmp_path: Path) -> None:
 
     assert loaded.host_expose_enabled is True
     assert loaded.host_expose_ports == (11434,)
+    assert loaded.log_export_enabled is False
+    assert loaded.log_export_max_bytes == 32 * 1024
+
+
+def test_load_firecracker_config_parses_log_export(tmp_path: Path) -> None:
+    binary = tmp_path / "firecracker"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    kernel = tmp_path / "vmlinux"
+    kernel.write_text("kernel", encoding="utf-8")
+    rootfs = tmp_path / "agent.ext4"
+    rootfs.write_text("rootfs", encoding="utf-8")
+
+    config = {
+        "firecracker": {
+            "binary": str(binary),
+            "kernel": str(kernel),
+            "rootfs": str(rootfs),
+            "vcpu": 1,
+            "mem_mb": 512,
+            "host_iface": "eth0",
+            "boot_timeout": 30,
+            "log_export": {"enabled": True, "max_bytes": 4096},
+        }
+    }
+    loaded = load_firecracker_config(config)
+
+    assert loaded.log_export_enabled is True
+    assert loaded.log_export_max_bytes == 4096
 
 
 def test_default_popen_factory_detaches_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -970,11 +999,81 @@ def test_fire_sandbox_stop_never_raises_and_is_idempotent(tmp_path: Path) -> Non
     assert sandbox._session_temp_dir is None  # noqa: SLF001
 
 
+def test_fire_sandbox_stop_exports_redacted_log_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = _build_firecracker_config(
+        tmp_path,
+        log_export_enabled=True,
+        log_export_max_bytes=128,
+    )
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    log_path = runtime_dir / "firecracker.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "line-before-tail",
+                "token=abc123",
+                "Authorization: Bearer super-secret",
+                "api_key=sk-test-secret-123456",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=_RaisingTapManager(_build_allocation()),
+        iptables_manager=_RaisingIptablesManager(),
+        cid_manager=_RaisingCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=_FakeSocketFactory([]),
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+    sandbox._session_id = "sess-log-export"  # noqa: SLF001
+    sandbox._log_path = log_path  # noqa: SLF001
+    sandbox._session_temp_dir = runtime_dir  # noqa: SLF001
+    sandbox._process = cast(Any, _FakeProcess())  # noqa: SLF001
+
+    sandbox.stop()
+
+    artifact = (
+        tmp_path
+        / ".strangeclaw"
+        / "sessions"
+        / "sess-log-export"
+        / "outputs"
+        / "system"
+        / "firecracker.log.tail.txt"
+    )
+    assert artifact.exists()
+    content = artifact.read_text(encoding="utf-8")
+    assert "abc123" not in content
+    assert "super-secret" not in content
+    assert "sk-test-secret-123456" not in content
+    assert "[REDACTED]" in content
+    assert len(content.encode("utf-8")) <= 128 + 1
+
+
 def _build_firecracker_config(
     tmp_path: Path,
     *,
     host_expose_enabled: bool = False,
     host_expose_ports: tuple[int, ...] = (),
+    log_export_enabled: bool = False,
+    log_export_max_bytes: int = 32 * 1024,
 ) -> FirecrackerConfig:
     binary = tmp_path / "firecracker"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -993,6 +1092,8 @@ def _build_firecracker_config(
         boot_timeout=30,
         host_expose_enabled=host_expose_enabled,
         host_expose_ports=host_expose_ports,
+        log_export_enabled=log_export_enabled,
+        log_export_max_bytes=log_export_max_bytes,
     )
 
 

@@ -157,7 +157,7 @@ def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
     host_expose = firecracker_section.get("host_expose")
     if host_expose is None:
         firecracker_section["host_expose"] = {"enabled": False, "ports": []}
-        return
+        host_expose = firecracker_section["host_expose"]
     if not isinstance(host_expose, dict):
         raise ConfigError("Config field firecracker.host_expose must be a mapping.")
 
@@ -195,6 +195,34 @@ def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
             "firecracker.host_expose is enabled but no ports were configured; "
             "this setting currently has no effect."
         )
+
+    log_export = firecracker_section.get("log_export")
+    if log_export is None:
+        firecracker_section["log_export"] = {"enabled": False, "max_bytes": 32 * 1024}
+        log_export = firecracker_section["log_export"]
+    if not isinstance(log_export, dict):
+        raise ConfigError("Config field firecracker.log_export must be a mapping.")
+
+    log_export_enabled = log_export.get("enabled", False)
+    if not isinstance(log_export_enabled, bool):
+        raise ConfigError("Config field firecracker.log_export.enabled must be a boolean.")
+
+    max_bytes_raw = log_export.get("max_bytes", 32 * 1024)
+    if isinstance(max_bytes_raw, bool):
+        raise ConfigError("Config field firecracker.log_export.max_bytes must be an integer.")
+    try:
+        max_bytes = int(max_bytes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field firecracker.log_export.max_bytes must be an integer."
+        ) from exc
+    if max_bytes <= 0:
+        raise ConfigError(
+            "Config field firecracker.log_export.max_bytes must be greater than zero."
+        )
+
+    log_export["enabled"] = log_export_enabled
+    log_export["max_bytes"] = max_bytes
 
 
 def _validate_session_journal_optional_fields(config: dict[str, Any]) -> None:

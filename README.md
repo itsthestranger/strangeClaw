@@ -136,6 +136,28 @@ Why this design today:
 This is intentional; a persistent-per-session Fire VM mode may be added later as
 an explicit opt-in if lower latency is required.
 
+### Session Journal vs Firecracker Runtime Log
+
+These are different diagnostics layers:
+
+- `session_journal` (`events.jsonl`): host-side strangeclaw event journal (`message`, `action`,
+  `done`, runtime status/errors), JSONL, redacted, bounded.
+- Firecracker runtime log artifact (`outputs/system/firecracker.log.tail.txt`): host-side VMM
+  diagnostics (boot/MMDS/vsock/network lifecycle), plain text, sanitized tail export.
+
+Enable both independently:
+
+```yaml
+session_journal:
+  enabled: true
+  max_bytes: 1048576
+
+firecracker:
+  log_export:
+    enabled: true
+    max_bytes: 32768
+```
+
 ## Fire Mode With Local LLMs (Opt-In)
 
 By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM

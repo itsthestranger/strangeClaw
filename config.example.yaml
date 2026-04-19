@@ -77,6 +77,13 @@ firecracker:
     #   socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
     # and set llm.api_base: http://localhost:1235/v1
 
+  # Optional Firecracker runtime log export (host-side diagnostics artifact).
+  # Writes a sanitized tail to:
+  # ~/.strangeclaw/sessions/<session_id>/outputs/system/firecracker.log.tail.txt
+  log_export:
+    enabled: false
+    max_bytes: 32768
+
 telegram:
   token: ""
   local_mode: true               # set false in non-local deployments

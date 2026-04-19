@@ -44,6 +44,27 @@ _CID_MAX = 4294967294
 _CID_RETRY_ATTEMPTS = 10
 _DEFAULT_CID_LOCK_PATH = Path("~/.strangeclaw/firecracker_cids.json").expanduser()
 _LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1"}
+_DEFAULT_LOG_EXPORT_MAX_BYTES = 32 * 1024
+_LOG_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?i)\b(authorization)\b(\s*[:=]\s*)(bearer\s+[^\s,;]+)"),
+        r"\1\2[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|authorization|token|secret|password)\b(\s*[:=]\s*)([^\s,;]+)"
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+"),
+        r"\1 [REDACTED]",
+    ),
+    (
+        re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"),
+        "[REDACTED]",
+    ),
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -72,6 +93,8 @@ class FirecrackerConfig:
     boot_timeout: float
     host_expose_enabled: bool = False
     host_expose_ports: tuple[int, ...] = ()
+    log_export_enabled: bool = False
+    log_export_max_bytes: int = _DEFAULT_LOG_EXPORT_MAX_BYTES
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> FirecrackerConfig:
@@ -103,6 +126,7 @@ class FirecrackerConfig:
         )
         host_iface = _validate_host_iface(fire_section.get("host_iface"))
         host_expose_enabled, host_expose_ports = _parse_host_expose(fire_section)
+        log_export_enabled, log_export_max_bytes = _parse_log_export(fire_section)
 
         return cls(
             binary=binary,
@@ -114,6 +138,8 @@ class FirecrackerConfig:
             boot_timeout=boot_timeout,
             host_expose_enabled=host_expose_enabled,
             host_expose_ports=host_expose_ports,
+            log_export_enabled=log_export_enabled,
+            log_export_max_bytes=log_export_max_bytes,
         )
 
 
@@ -954,6 +980,7 @@ class FireSandbox:
         self._log_path: Path | None = None
         self._session_temp_dir: Path | None = None
         self._rootfs_copy_path: Path | None = None
+        self._session_id: str | None = None
         self._allocation: TapNetworkAllocation | None = None
         self._guest_cid: int | None = None
         self._vsock_conn: ConnectedSocket | None = None
@@ -983,6 +1010,7 @@ class FireSandbox:
             self._register_exit_handlers()
 
         session_id = sanitize_session_id(str(task.get("session_id", "")))
+        self._session_id = session_id
         llm_payload = self._resolve_llm_payload(task)
         task_event = dict(task)
         task_event.pop("llm", None)
@@ -1088,6 +1116,7 @@ class FireSandbox:
         try:
             self._safe_teardown_step(self._close_vsock_conn)
             self._safe_teardown_step(self._graceful_shutdown_process)
+            self._safe_teardown_step(self._export_firecracker_log_artifact)
             if self._allocation is not None:
                 allocation = self._allocation
                 host_expose_ports = self._host_expose_ports()
@@ -1112,6 +1141,7 @@ class FireSandbox:
             self._vsock_uds_path = None
             self._log_path = None
             self._rootfs_copy_path = None
+            self._session_id = None
             self._recv_buffer = ""
         finally:
             self._process = None
@@ -1390,13 +1420,54 @@ class FireSandbox:
             return ""
 
     def _read_log_tail_best_effort(self) -> str:
+        data = self._read_log_tail_bytes_best_effort(max_bytes=4096)
+        if not data:
+            return ""
+        return data.decode("utf-8", errors="replace").strip()
+
+    def _read_log_tail_bytes_best_effort(self, *, max_bytes: int) -> bytes:
+        if max_bytes <= 0:
+            return b""
         if self._log_path is None or not self._log_path.exists():
-            return ""
+            return b""
         try:
-            data = self._log_path.read_text(encoding="utf-8", errors="replace")
-            return data[-2000:].strip()
+            with self._log_path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                to_read = min(size, max_bytes)
+                if to_read <= 0:
+                    return b""
+                handle.seek(-to_read, os.SEEK_END)
+                return handle.read(to_read)
         except Exception:
-            return ""
+            return b""
+
+    def _export_firecracker_log_artifact(self) -> None:
+        if not self._firecracker_config.log_export_enabled:
+            return
+        if self._session_id is None:
+            return
+        log_tail = self._read_log_tail_bytes_best_effort(
+            max_bytes=self._firecracker_config.log_export_max_bytes
+        )
+        if not log_tail:
+            return
+
+        session_outputs_dir = (
+            Path.home() / ".strangeclaw" / "sessions" / self._session_id / "outputs" / "system"
+        )
+        session_outputs_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = session_outputs_dir / "firecracker.log.tail.txt"
+        redacted_text = self._redact_log_text(log_tail.decode("utf-8", errors="replace")).strip()
+        if not redacted_text:
+            return
+        artifact_path.write_text(redacted_text + "\n", encoding="utf-8")
+
+    def _redact_log_text(self, text: str) -> str:
+        redacted = text
+        for pattern, replacement in _LOG_REDACT_PATTERNS:
+            redacted = pattern.sub(replacement, redacted)
+        return redacted
 
     def _register_exit_handlers(self) -> None:
         if self._atexit_registered:
@@ -1526,6 +1597,38 @@ def _parse_host_expose(fire_section: Mapping[str, Any]) -> tuple[bool, tuple[int
         ports.append(item)
 
     return enabled, tuple(ports)
+
+
+def _parse_log_export(fire_section: Mapping[str, Any]) -> tuple[bool, int]:
+    raw = fire_section.get("log_export")
+    if raw is None:
+        return False, _DEFAULT_LOG_EXPORT_MAX_BYTES
+    if not isinstance(raw, Mapping):
+        raise FirecrackerConfigError("Config field firecracker.log_export must be a mapping.")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise FirecrackerConfigError(
+            "Config field firecracker.log_export.enabled must be a boolean."
+        )
+
+    max_bytes_raw = raw.get("max_bytes", _DEFAULT_LOG_EXPORT_MAX_BYTES)
+    if isinstance(max_bytes_raw, bool):
+        raise FirecrackerConfigError(
+            "Config field firecracker.log_export.max_bytes must be an integer."
+        )
+    try:
+        max_bytes = int(max_bytes_raw)
+    except (TypeError, ValueError) as exc:
+        raise FirecrackerConfigError(
+            "Config field firecracker.log_export.max_bytes must be an integer."
+        ) from exc
+    if max_bytes <= 0:
+        raise FirecrackerConfigError(
+            "Config field firecracker.log_export.max_bytes must be greater than zero."
+        )
+
+    return enabled, max_bytes
 
 
 def _validate_preboot_config(preboot: FirePrebootConfig) -> None:
