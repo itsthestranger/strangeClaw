@@ -1,12 +1,27 @@
 # strangeclaw
 
-strangeclaw is a minimal, self-hosted autonomous AI agent designed around four
-drivers: simplicity, security, maintainability, and expandability.
+If you think, "what, another claw?" then yes, another claw. But this one is my
+claw: strangeclaw.
 
-It runs a fully agentic loop:
+I built it because I wanted to understand how agent systems like openclaw work
+by actually building one myself, not just using one.
+
+I also had a practical concern: I do not want an autonomous agent with
+free-roaming access to my computer. So I wanted a design where I can run fast
+when I trust the task and switch to isolation when I do not.
+
+That is where Firecracker comes in: `yolo` mode for trusted local speed, and
+`fire` mode for microVM isolation with a real VM boundary.
+
+strangeclaw is my minimal, self-hosted autonomous AI agent focused on
+simplicity, security, and clear architecture.
+
+The core loop is fully agentic:
 `Inspect -> Choose -> Act -> Observe -> Repeat`.
 
-## Quickstart (Yolo mode)
+## Quick Setup
+
+### 1) Fastest path (Yolo mode, CLI)
 
 1. Create a virtual environment and install dependencies:
    ```bash
@@ -18,15 +33,17 @@ It runs a fully agentic loop:
    mkdir -p ~/.strangeclaw
    cp config.example.yaml ~/.strangeclaw/config.yaml
    ```
-3. Configure the LLM in `~/.strangeclaw/config.yaml`:
-   - Hosted API models: set `llm.api_key` either directly or via `${ENV_VAR}`.
-   - Local models (LM Studio/Ollama): API key is optional and can be empty.
-   - `llm.model` uses `{provider}/{model_name}` format.
-     Examples:
-     - Anthropic: `anthropic/claude-sonnet-4-20250514`
-     - OpenAI: `openai/gpt-4.1-mini`
-     - LM Studio: `lm_studio/qwen2.5-coder-7b-instruct`
-4. Run the agent:
+3. In `~/.strangeclaw/config.yaml`, set at minimum:
+   ```yaml
+   mode: yolo
+   adapters:
+     enabled: [cli]
+
+   llm:
+     model: anthropic/claude-sonnet-4-20250514
+     api_key: ${ANTHROPIC_API_KEY}
+   ```
+4. Run strangeclaw:
    ```bash
    .venv/bin/python -m main
    ```
@@ -37,134 +54,110 @@ Resume a saved session:
 .venv/bin/python -m main --resume <session_id>
 ```
 
-## Web Search Endpoint Override
+### 2) Fire mode setup (isolated microVM)
 
-`web-search` uses DuckDuckGo by default. You can override the search endpoint with:
-
-```bash
-export SC_WEB_SEARCH_ENDPOINT="https://your-endpoint.example/search"
-```
-
-Behavior:
-- Applies to `web-search` `search` action only.
-- If the value contains `{query}`, strangeclaw substitutes it with URL-encoded query text.
-- If the value starts with `file://` or `data:`, it is used as-is.
-- Otherwise, strangeclaw appends standard query params (`q`, `format`, `no_redirect`, `no_html`, `skip_disambig`).
-
-Expected endpoint response is a JSON object. Supported fields:
-- `AbstractText` + `AbstractURL` (optional top result)
-- `RelatedTopics` array with items like `{"Text": "...", "FirstURL": "..."}` (supports nested `Topics`)
-
-## Modes
-
-- `yolo`: direct host execution for trusted local workflows.
-- `fire`: Firecracker microVM isolation (in progress).
-
-## Fire Mode Prerequisite Setup
-
-Run host setup (installs/updates prerequisites and then runs checks):
+Run host setup (installs/updates prerequisites and runs checks):
 
 ```bash
 bash scripts/setup-fire.sh
 ```
 
-`setup-fire.sh` keeps IP forwarding unchanged by default (runtime-managed policy).
-Use explicit flags only when you want setup to change it:
+Useful variants:
 
 ```bash
-# Enable for current runtime only (no persistent sysctl file)
+# Checks only (no host changes)
+bash scripts/setup-fire.sh --check-only
+
+# Direct prerequisite checker
+bash scripts/fire-check.sh
+
+# Optional: enable IP forwarding for current runtime only
 bash scripts/setup-fire.sh --enable-ip-forwarding-now
 
-# Enable and persist in /etc/sysctl.d/99-strangeclaw-fire.conf
+# Optional: enable + persist IP forwarding
 bash scripts/setup-fire.sh --persist-ip-forwarding
 ```
 
-Run checks only (no host changes):
-
-```bash
-bash scripts/setup-fire.sh --check-only
-```
-
-Run the Fire prerequisite checker directly:
-
-```bash
-bash scripts/fire-check.sh
-```
-
-Run unified Fire verification checks:
-
-```bash
-sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python scripts/verify_fire.py --check all --goal "Say hello briefly."
-```
-
-## Running In Fire Mode
-
-Fire mode needs elevated privileges for host networking operations (`ip tuntap`,
-`iptables`). Running `main` without elevation will fail with errors such as:
-`ioctl(TUNSETIFF): Operation not permitted`.
-
-1. Set `mode: fire` in `~/.strangeclaw/config.yaml`.
-2. Start strangeclaw with `sudo` and preserve `HOME` so the same user config/session
-   path is used:
-   ```bash
-   sudo --preserve-env=HOME .venv/bin/python -m main
-   ```
-3. If `llm.api_key` uses `${ENV_VAR}` interpolation, preserve that env var too:
-   ```bash
-   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
-   ```
-
-Note: seeing `Task:` immediately is expected. The Firecracker VM is launched when
-you submit a task.
-
-### Fire Session Semantics (Current Behavior)
-
-- Fire mode is currently **per-task ephemeral**: each submitted task boots a fresh
-  microVM, runs the agent until `done`, then tears the VM down.
-- Follow-up tasks in the same CLI/Telegram session reuse **persisted host-side
-  state** (`state.json`), not a still-running guest VM.
-- Because a fresh VM is started per task, you may see a Fire startup status line
-  again on each new task.
-
-Why this design today:
-- **Simplicity:** single-task VM lifecycle is easier to reason about and debug.
-- **Security:** short-lived guests reduce dwell time if in-guest code is
-  compromised.
-- **Maintainability:** cleanup and failure recovery are deterministic at task
-  boundaries.
-
-This is intentional; a persistent-per-session Fire VM mode may be added later as
-an explicit opt-in if lower latency is required.
-
-### Session Journal vs Firecracker Runtime Log
-
-These are different diagnostics layers:
-
-- `session_journal` (`events.jsonl`): host-side strangeclaw event journal (`message`, `action`,
-  `done`, runtime status/errors), JSONL, redacted, bounded.
-- Firecracker runtime log artifact (`outputs/system/firecracker.log.tail.txt`): host-side VMM
-  diagnostics (boot/MMDS/vsock/network lifecycle), plain text, sanitized tail export.
-
-Enable both independently:
+Switch config to Fire mode:
 
 ```yaml
-session_journal:
-  enabled: true
-  max_bytes: 1048576
-
-firecracker:
-  log_export:
-    enabled: true
-    max_bytes: 32768
-  lifecycle_status_messages: true
+mode: fire
+adapters:
+  enabled: [cli]
 ```
 
-## Fire Mode With Local LLMs (Opt-In)
+Run with elevated privileges (required for TAP + iptables):
 
-By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM
-server (Ollama, LM Studio), you must opt in with `firecracker.host_expose`.
+```bash
+sudo --preserve-env=HOME .venv/bin/python -m main
+```
 
-Example config:
+If your API key is from env interpolation, preserve it too:
+
+```bash
+sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
+```
+
+### 3) Telegram setup (optional)
+
+1. Create a bot with `@BotFather` and copy the token.
+2. Configure:
+   ```yaml
+   adapters:
+     enabled: [telegram]
+
+   telegram:
+     token: "123456789:AA..."
+     local_mode: true
+     allowed_chat_ids: []
+   ```
+3. Run:
+   ```bash
+   .venv/bin/python -m main
+   ```
+
+`telegram.allowed_chat_ids` behavior:
+- Empty/missing: any Telegram chat can use the bot.
+- Non-empty: only listed chat IDs are allowed.
+
+## Features
+
+- Fully agentic loop with plan/review, clarification, execution, and completion.
+- Provider-agnostic LLM layer via LiteLLM (`anthropic`, `openai`, `lm_studio`, `ollama`, and others).
+- Pluggable skills loaded from `skills/<name>/` via `SKILL.md` + `schema.json`.
+- Two execution modes:
+  - `yolo`: direct host execution for trusted workflows.
+  - `fire`: Firecracker microVM isolation.
+- CLI and Telegram adapters (including multi-adapter runs).
+- Session persistence (`state.json`) plus output file export.
+- Optional redacted session event journal (`events.jsonl`).
+- Optional Firecracker runtime log artifact export to session outputs.
+- Optional Fire-mode local LLM routing via `firecracker.host_expose`.
+
+## Architecture
+
+High-level runtime shape:
+
+```text
+Host (main/coordinator/adapters)
+  -> Sandbox (Yolo or Fire)
+    -> Agent loop (plan -> act -> observe -> iterate)
+      -> Skills + LLM calls inside sandbox
+```
+
+For full design rationale and threat model, see [`strangeclaw_spec.md`](./strangeclaw_spec.md).
+
+## Fire Mode Behavior (Current)
+
+- Fire mode is currently per-task ephemeral: each task boots a fresh microVM,
+  runs until `done`, then tears down.
+- Follow-up tasks reuse host-side persisted state, not a still-running guest VM.
+- `--resume` is intentionally rejected in Fire mode.
+
+## Local LLMs In Fire Mode (Opt-In)
+
+By default, Fire mode blocks guest-to-host traffic.
+To use a host-local LLM server (Ollama/LM Studio), opt in with:
 
 ```yaml
 llm:
@@ -179,65 +172,34 @@ firecracker:
 ```
 
 Notes:
-- In Fire mode, strangeclaw rewrites `localhost` / `127.0.0.1` `api_base` to
-  the TAP gateway IP before sending config to the guest.
-- For security trade-offs of `host_expose`, see `strangeclaw_spec.md` §13.
+- In Fire mode, `localhost` / `127.0.0.1` in `llm.api_base` is rewritten to the
+  TAP gateway IP before being sent to the guest.
+- Enabling `host_expose` weakens isolation; read the security analysis in
+  `strangeclaw_spec.md` §13 before using it.
 
-### LM Studio Loopback Gotcha
+LM Studio loopback gotcha:
+- If LM Studio listens only on `127.0.0.1:1234`, expose a host proxy port:
+  ```bash
+  socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
+  ```
 
-LM Studio often listens on loopback only (`127.0.0.1:<port>`). In that case,
-the Fire guest cannot reach it through exposed host ports.
+## Web Search Endpoint Override
 
-Check listener:
-
-```bash
-ss -ltnp | grep 1234
-```
-
-If LM Studio is loopback-only, use a host proxy port that listens on all
-interfaces:
+`web-search` uses DuckDuckGo by default. Override with:
 
 ```bash
-sudo dnf install -y socat
-socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
+export SC_WEB_SEARCH_ENDPOINT="https://your-endpoint.example/search"
 ```
 
-Run the `socat` command in a separate terminal and keep it running while
-strangeclaw is using Fire mode with the proxied local LLM.
+Behavior:
+- Applies only to `web-search` `search` action.
+- If value contains `{query}`, strangeclaw substitutes URL-encoded query text.
+- If value starts with `file://` or `data:`, it is used as-is.
+- Otherwise, strangeclaw appends standard query params (`q`, `format`,
+  `no_redirect`, `no_html`, `skip_disambig`).
 
-Then point strangeclaw to the proxy port (`api_base: http://localhost:1235/v1`)
-and expose that port (`host_expose.ports: [1235]`).
-
-## Telegram Setup
-
-1. Create a bot with BotFather:
-   - Open Telegram and start a chat with `@BotFather`.
-   - Run `/newbot`.
-   - Follow prompts for bot name and username.
-   - Copy the API token BotFather returns.
-2. Update `~/.strangeclaw/config.yaml`:
-   ```yaml
-   adapters:
-     enabled: [telegram]
-
-   telegram:
-     token: "123456789:AA..."
-     local_mode: true
-     allowed_chat_ids: []
-   ```
-3. Start strangeclaw:
-   ```bash
-   .venv/bin/python -m main
-   ```
-4. Open your bot chat in Telegram and send a task message.
-
-`telegram.allowed_chat_ids` behavior:
-- Empty or missing list: any Telegram chat can use the bot (good for local personal use).
-- Non-empty list: only listed chat IDs are allowed; all other chats receive a polite "not authorized" reply.
-
-Security note:
-- Treat `telegram.token` as a secret like your LLM API key.
-- Do not commit bot tokens to git or share them in logs/screenshots.
+Expected endpoint response: JSON object with optional `AbstractText`,
+`AbstractURL`, and `RelatedTopics` entries.
 
 ## Multiple Adapters
 
@@ -250,36 +212,5 @@ adapters:
 
 Notes:
 - `--resume` is only allowed when exactly one adapter is enabled.
-- In multi-adapter mode, Telegram session IDs are namespaced (`telegram-<chat_id>`) to avoid persistence collisions with other adapters.
-
-## Telegram Session Behavior
-
-When `telegram` is enabled in `adapters.enabled`, strangeclaw maps Telegram session identity to the
-Telegram `chat_id`.
-
-- A new task message in a chat starts a run for that chat.
-- While a run is active, extra messages are only accepted when the agent is
-  explicitly waiting for plan feedback or clarification.
-- After `done`, the in-memory run state is cleared for that chat.
-- Follow-up tasks in the same chat start a new run and automatically reuse the
-  last completed task state from that chat (with re-planning forced).
-- To create a truly separate session, use a different Telegram chat (different
-  `chat_id`).
-
-## Telegram Security Defaults
-
-- For local development, keep `telegram.local_mode: true`.
-- For non-local deployments, set `telegram.local_mode: false` and configure
-  `telegram.allowed_chat_ids` to an explicit allowlist.
-- Runtime limits are enforced:
-  - `telegram.max_active_sessions`
-  - `telegram.max_output_total_bytes`
-  - `telegram.max_output_file_bytes`
-
-## Validation
-
-```bash
-.venv/bin/ruff check .
-.venv/bin/mypy
-.venv/bin/pytest -q
-```
+- In multi-adapter mode, Telegram session IDs are namespaced as
+  `telegram-<chat_id>` to avoid collisions.
