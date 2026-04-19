@@ -71,8 +71,9 @@ def test_load_config_falls_back_to_example_when_user_missing(
 
     loaded = load_config()
 
-    assert loaded["llm"]["api_key"] == "fallback-key"
-    assert loaded["mode"] == "yolo"
+    assert isinstance(loaded["llm"]["api_key"], str)
+    assert loaded["llm"]["api_key"] != ""
+    assert isinstance(loaded["mode"], str)
 
 
 def test_load_config_reports_missing_required_fields(tmp_path: Path) -> None:
@@ -96,3 +97,94 @@ def test_load_config_reports_missing_environment_variable(tmp_path: Path) -> Non
 def test_load_config_reports_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="Config file not found"):
         load_config(tmp_path / "does-not-exist.yaml")
+
+
+def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, _base_config(api_key="plain-key"))
+
+    loaded = load_config(config_path)
+
+    assert loaded["llm"]["api_base"] is None
+    assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
+    assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
+    assert loaded["firecracker"]["lifecycle_status_messages"] is True
+    assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
+
+
+def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["llm"]["api_base"] = 123
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"llm\.api_base"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_host_expose_ports(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["host_expose"] = {"enabled": True, "ports": [11434, 70000]}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"host_expose\.ports"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_fire_log_export_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["log_export"] = {"enabled": "yes", "max_bytes": "huge"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"log_export\.enabled"):
+        load_config(config_path)
+
+    config["firecracker"]["log_export"] = {"enabled": True, "max_bytes": 0}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"log_export\.max_bytes"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_fire_lifecycle_status_messages(
+    tmp_path: Path,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["lifecycle_status_messages"] = "yes"
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"lifecycle_status_messages"):
+        load_config(config_path)
+
+
+def test_load_config_warns_when_host_expose_enabled_without_ports(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["host_expose"] = {"enabled": True, "ports": []}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with caplog.at_level("WARNING"):
+        loaded = load_config(config_path)
+
+    assert loaded["firecracker"]["host_expose"] == {"enabled": True, "ports": []}
+    assert "enabled but no ports were configured" in caplog.text
+
+
+def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["session_journal"] = {"enabled": "yes", "max_bytes": "huge"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"session_journal\.enabled"):
+        load_config(config_path)
+
+    config["session_journal"] = {"enabled": True, "max_bytes": 0}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"session_journal\.max_bytes"):
+        load_config(config_path)

@@ -60,6 +60,154 @@ Expected endpoint response is a JSON object. Supported fields:
 - `yolo`: direct host execution for trusted local workflows.
 - `fire`: Firecracker microVM isolation (in progress).
 
+## Fire Mode Prerequisite Setup
+
+Run host setup (installs/updates prerequisites and then runs checks):
+
+```bash
+bash scripts/setup-fire.sh
+```
+
+`setup-fire.sh` keeps IP forwarding unchanged by default (runtime-managed policy).
+Use explicit flags only when you want setup to change it:
+
+```bash
+# Enable for current runtime only (no persistent sysctl file)
+bash scripts/setup-fire.sh --enable-ip-forwarding-now
+
+# Enable and persist in /etc/sysctl.d/99-strangeclaw-fire.conf
+bash scripts/setup-fire.sh --persist-ip-forwarding
+```
+
+Run checks only (no host changes):
+
+```bash
+bash scripts/setup-fire.sh --check-only
+```
+
+Run the Fire prerequisite checker directly:
+
+```bash
+bash scripts/fire-check.sh
+```
+
+Run unified Fire verification checks:
+
+```bash
+sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python scripts/verify_fire.py --check all --goal "Say hello briefly."
+```
+
+## Running In Fire Mode
+
+Fire mode needs elevated privileges for host networking operations (`ip tuntap`,
+`iptables`). Running `main` without elevation will fail with errors such as:
+`ioctl(TUNSETIFF): Operation not permitted`.
+
+1. Set `mode: fire` in `~/.strangeclaw/config.yaml`.
+2. Start strangeclaw with `sudo` and preserve `HOME` so the same user config/session
+   path is used:
+   ```bash
+   sudo --preserve-env=HOME .venv/bin/python -m main
+   ```
+3. If `llm.api_key` uses `${ENV_VAR}` interpolation, preserve that env var too:
+   ```bash
+   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
+   ```
+
+Note: seeing `Task:` immediately is expected. The Firecracker VM is launched when
+you submit a task.
+
+### Fire Session Semantics (Current Behavior)
+
+- Fire mode is currently **per-task ephemeral**: each submitted task boots a fresh
+  microVM, runs the agent until `done`, then tears the VM down.
+- Follow-up tasks in the same CLI/Telegram session reuse **persisted host-side
+  state** (`state.json`), not a still-running guest VM.
+- Because a fresh VM is started per task, you may see a Fire startup status line
+  again on each new task.
+
+Why this design today:
+- **Simplicity:** single-task VM lifecycle is easier to reason about and debug.
+- **Security:** short-lived guests reduce dwell time if in-guest code is
+  compromised.
+- **Maintainability:** cleanup and failure recovery are deterministic at task
+  boundaries.
+
+This is intentional; a persistent-per-session Fire VM mode may be added later as
+an explicit opt-in if lower latency is required.
+
+### Session Journal vs Firecracker Runtime Log
+
+These are different diagnostics layers:
+
+- `session_journal` (`events.jsonl`): host-side strangeclaw event journal (`message`, `action`,
+  `done`, runtime status/errors), JSONL, redacted, bounded.
+- Firecracker runtime log artifact (`outputs/system/firecracker.log.tail.txt`): host-side VMM
+  diagnostics (boot/MMDS/vsock/network lifecycle), plain text, sanitized tail export.
+
+Enable both independently:
+
+```yaml
+session_journal:
+  enabled: true
+  max_bytes: 1048576
+
+firecracker:
+  log_export:
+    enabled: true
+    max_bytes: 32768
+  lifecycle_status_messages: true
+```
+
+## Fire Mode With Local LLMs (Opt-In)
+
+By default, Fire mode blocks guest-to-host traffic. To use a host-local LLM
+server (Ollama, LM Studio), you must opt in with `firecracker.host_expose`.
+
+Example config:
+
+```yaml
+llm:
+  model: lm_studio/your-model-id
+  api_key: ""
+  api_base: "http://localhost:1235/v1"
+
+firecracker:
+  host_expose:
+    enabled: true
+    ports: [1235]
+```
+
+Notes:
+- In Fire mode, strangeclaw rewrites `localhost` / `127.0.0.1` `api_base` to
+  the TAP gateway IP before sending config to the guest.
+- For security trade-offs of `host_expose`, see `strangeclaw_spec.md` §13.
+
+### LM Studio Loopback Gotcha
+
+LM Studio often listens on loopback only (`127.0.0.1:<port>`). In that case,
+the Fire guest cannot reach it through exposed host ports.
+
+Check listener:
+
+```bash
+ss -ltnp | grep 1234
+```
+
+If LM Studio is loopback-only, use a host proxy port that listens on all
+interfaces:
+
+```bash
+sudo dnf install -y socat
+socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
+```
+
+Run the `socat` command in a separate terminal and keep it running while
+strangeclaw is using Fire mode with the proxied local LLM.
+
+Then point strangeclaw to the proxy port (`api_base: http://localhost:1235/v1`)
+and expose that port (`host_expose.ports: [1235]`).
+
 ## Telegram Setup
 
 1. Create a bot with BotFather:
