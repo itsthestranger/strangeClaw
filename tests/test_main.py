@@ -93,12 +93,14 @@ class FakeCoordinator:
         llm_config: dict[str, Any] | None = None,
         max_active_sessions: int | None = None,
         session_journal: dict[str, Any] | None = None,
+        fire_lifecycle_status_messages: bool = True,
     ) -> None:
         self.sandbox_factory = sandbox_factory
         self.approval_mode = approval_mode
         self.llm_config = llm_config
         self.max_active_sessions = max_active_sessions
         self.session_journal = session_journal
+        self.fire_lifecycle_status_messages = fire_lifecycle_status_messages
         self.seed_calls: list[tuple[str, dict[str, Any]]] = []
         self.stop_session_calls: list[str] = []
         self.stop_all_called = False
@@ -194,6 +196,7 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     assert adapter.approval_mode == "review"
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator
+    assert coordinator.fire_lifecycle_status_messages is True
     assert adapter.run_called is True
 
 
@@ -296,6 +299,30 @@ def test_main_wires_fire_mode_sandbox_factory(monkeypatch: pytest.MonkeyPatch) -
     assert sandbox.kwargs["llm_config"] == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator
     assert adapter.run_called is True
+
+
+def test_main_passes_fire_lifecycle_status_messages_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _config()
+    cfg["firecracker"] = {"lifecycle_status_messages": False}
+    created: dict[str, Any] = {}
+
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    monkeypatch.setattr(main, "Coordinator", lambda **kwargs: FakeCoordinator(**kwargs))
+
+    def fake_adapter_factory(
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+    ) -> FakeAdapter:
+        del approval_mode
+        del llm_config
+        del kwargs
+        created["coordinator"] = coordinator
+        return FakeAdapter(coordinator=coordinator, approval_mode="review", llm_config={})
+
+    monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
+
+    main.main([])
+
+    assert created["coordinator"].fire_lifecycle_status_messages is False
 
 
 def test_main_rejects_unsupported_adapter(monkeypatch: pytest.MonkeyPatch) -> None:

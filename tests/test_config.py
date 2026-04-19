@@ -108,6 +108,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["llm"]["api_base"] is None
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
+    assert loaded["firecracker"]["lifecycle_status_messages"] is True
     assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
 
 
@@ -143,6 +144,18 @@ def test_load_config_rejects_invalid_fire_log_export_fields(tmp_path: Path) -> N
     config["firecracker"]["log_export"] = {"enabled": True, "max_bytes": 0}
     _write_config(config_path, config)
     with pytest.raises(ConfigError, match=r"log_export\.max_bytes"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_fire_lifecycle_status_messages(
+    tmp_path: Path,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["lifecycle_status_messages"] = "yes"
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"lifecycle_status_messages"):
         load_config(config_path)
 
 

@@ -84,6 +84,10 @@ firecracker:
     enabled: false
     max_bytes: 32768
 
+  # Emit Fire lifecycle status messages into adapter output.
+  # Applies to host-side status events such as sandbox start/teardown.
+  lifecycle_status_messages: true
+
 telegram:
   token: ""
   local_mode: true               # set false in non-local deployments

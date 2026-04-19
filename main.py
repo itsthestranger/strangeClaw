@@ -116,6 +116,16 @@ def _session_journal_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _fire_lifecycle_status_messages_enabled(config: dict[str, Any]) -> bool:
+    fire_cfg = config.get("firecracker", {})
+    if not isinstance(fire_cfg, dict):
+        raise ValueError("Config field firecracker must be a mapping.")
+    value = fire_cfg.get("lifecycle_status_messages", True)
+    if not isinstance(value, bool):
+        raise ValueError("Config field firecracker.lifecycle_status_messages must be a boolean.")
+    return value
+
+
 def _build_adapter(
     *,
     adapter_name: str,
@@ -201,6 +211,7 @@ def main(argv: list[str] | None = None) -> None:
             enabled_adapters=enabled_adapters,
         ),
         session_journal=_session_journal_config(config),
+        fire_lifecycle_status_messages=_fire_lifecycle_status_messages_enabled(config),
     )
     created: list[tuple[str, CLIAdapter | TelegramAdapter]] = []
     for adapter_name in enabled_adapters:

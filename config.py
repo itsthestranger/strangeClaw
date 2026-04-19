@@ -224,6 +224,13 @@ def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
     log_export["enabled"] = log_export_enabled
     log_export["max_bytes"] = max_bytes
 
+    lifecycle_status_messages = firecracker_section.get("lifecycle_status_messages", True)
+    if not isinstance(lifecycle_status_messages, bool):
+        raise ConfigError(
+            "Config field firecracker.lifecycle_status_messages must be a boolean."
+        )
+    firecracker_section["lifecycle_status_messages"] = lifecycle_status_messages
+
 
 def _validate_session_journal_optional_fields(config: dict[str, Any]) -> None:
     journal_section = config.get("session_journal")

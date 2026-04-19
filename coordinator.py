@@ -39,6 +39,7 @@ class Coordinator:
         llm_config: dict[str, Any] | None = None,
         max_active_sessions: int | None = None,
         session_journal: dict[str, Any] | None = None,
+        fire_lifecycle_status_messages: bool = True,
     ) -> None:
         if max_active_sessions is not None and max_active_sessions <= 0:
             raise ValueError("max_active_sessions must be positive when set.")
@@ -49,6 +50,7 @@ class Coordinator:
         journal = dict(session_journal) if session_journal is not None else {}
         self._journal_enabled = bool(journal.get("enabled", False))
         self._journal_max_bytes = int(journal.get("max_bytes", 1 * 1024 * 1024))
+        self._fire_lifecycle_status_messages = bool(fire_lifecycle_status_messages)
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionRecord] = {}
 
@@ -105,6 +107,7 @@ class Coordinator:
                 on_event=on_event,
                 on_exit=on_exit,
                 on_error=on_error,
+                fire_lifecycle_status_messages=self._fire_lifecycle_status_messages,
             )
             record.worker = worker
             record.pending_role = None
@@ -236,12 +239,14 @@ class _SessionWorker:
         on_event: Callable[[dict[str, Any]], None],
         on_exit: Callable[[], None],
         on_error: Callable[[Exception], None],
+        fire_lifecycle_status_messages: bool = True,
     ) -> None:
         self._sandbox = sandbox
         self._task_event = task_event
         self._on_event = on_event
         self._on_exit = on_exit
         self._on_error = on_error
+        self._fire_lifecycle_status_messages = fire_lifecycle_status_messages
         self._reply_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -269,25 +274,38 @@ class _SessionWorker:
             pass
 
     def _run(self) -> None:
+        sandbox_stopped = False
+
+        def stop_sandbox() -> bool:
+            nonlocal sandbox_stopped
+            if sandbox_stopped:
+                return True
+            try:
+                self._sandbox.stop()
+                sandbox_stopped = True
+                return True
+            except Exception:
+                return False
+
         try:
             self._sandbox.run(self._task_event)
-            if self._is_fire_sandbox():
-                self._on_event(
-                    {
-                        "type": "message",
-                        "role": "status",
-                        "content": "Firecracker sandbox started successfully.",
-                    }
-                )
+            self._emit_fire_status_message("Firecracker sandbox started successfully.")
             while not self._stop_event.is_set():
                 event = self._sandbox.receive(timeout_seconds=0.2)
                 if event is None:
                     continue
+
+                if event.get("type") == "done":
+                    if stop_sandbox():
+                        self._emit_fire_status_message(
+                            "Firecracker sandbox torn down successfully."
+                        )
+                    self._on_event(event)
+                    return
+
                 self._on_event(event)
 
                 if event.get("type") != "message":
-                    if event.get("type") == "done":
-                        return
                     continue
 
                 role = event.get("role")
@@ -307,10 +325,8 @@ class _SessionWorker:
         except Exception as exc:
             self._on_error(exc)
         finally:
-            try:
-                self._sandbox.stop()
-            except Exception:
-                pass
+            if not sandbox_stopped:
+                stop_sandbox()
             self._on_exit()
 
     def _wait_for_reply(self) -> dict[str, Any] | None:
@@ -324,3 +340,16 @@ class _SessionWorker:
 
     def _is_fire_sandbox(self) -> bool:
         return bool(self._sandbox.__class__.__name__ == "FireSandbox")
+
+    def _emit_fire_status_message(self, content: str) -> None:
+        if not self._fire_lifecycle_status_messages:
+            return
+        if not self._is_fire_sandbox():
+            return
+        self._on_event(
+            {
+                "type": "message",
+                "role": "status",
+                "content": content,
+            }
+        )

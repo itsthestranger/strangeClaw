@@ -156,6 +156,7 @@ firecracker:
   log_export:
     enabled: true
     max_bytes: 32768
+  lifecycle_status_messages: true
 ```
 
 ## Fire Mode With Local LLMs (Opt-In)
