@@ -851,6 +851,51 @@ def test_fire_sandbox_run_raises_boot_error_with_diagnostics(tmp_path: Path) -> 
         )
 
 
+def test_fire_sandbox_boot_diagnostics_redacts_sensitive_log_content(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    process_factory = _SecretPopenFactory()
+    socket_factory = _FakeSocketFactory([_FakeConnectedSocket(recv_chunks=[b"BAD\n"])])
+    api_factory = _SecretApiFactory()
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        llm_config={
+            "model": "openai/gpt-4.1-mini",
+            "api_key": "sk-host",
+            "max_tokens": 1024,
+            "temperature": 0.2,
+        },
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    with pytest.raises(VMBootError) as excinfo:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "hello",
+                "session_id": "sess-redact",
+                "approval_mode": "review",
+            }
+        )
+
+    err_text = str(excinfo.value)
+    assert "sk-secret-stderr" not in err_text
+    assert "sk-secret-log" not in err_text
+    assert "[REDACTED]" in err_text
+
+
 def test_fire_sandbox_rewrites_localhost_api_base_for_host_expose(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1396,6 +1441,28 @@ class _FakeApiClient:
             self._vsock_uds.write_text("", encoding="utf-8")
 
 
+class _SecretApiFactory:
+    def __init__(self) -> None:
+        self._clients: list[_SecretApiClient] = []
+
+    def make(self, api_socket: str) -> _SecretApiClient:
+        client = _SecretApiClient(api_socket=Path(api_socket))
+        self._clients.append(client)
+        return client
+
+
+class _SecretApiClient(_FakeApiClient):
+    def put(self, path: str, payload: Mapping[str, Any]) -> None:
+        super().put(path, payload)
+        if path == "/logger":
+            log_path = payload.get("log_path")
+            if isinstance(log_path, str):
+                Path(log_path).write_text(
+                    "Authorization: Bearer sk-secret-log\n",
+                    encoding="utf-8",
+                )
+
+
 class _FakePopenFactory:
     def __init__(self) -> None:
         self.processes: list[_FakeProcess] = []
@@ -1406,6 +1473,16 @@ class _FakePopenFactory:
         api_path.write_text("", encoding="utf-8")
         process = _FakeProcess()
         self.processes.append(process)
+        return process
+
+
+class _SecretPopenFactory:
+    def __call__(self, args: list[str]) -> _FakeProcess:
+        api_index = args.index("--api-sock") + 1
+        api_path = Path(args[api_index])
+        api_path.write_text("", encoding="utf-8")
+        process = _FakeProcess()
+        process.stderr = _FakeStderr("api_key=sk-secret-stderr")
         return process
 
 

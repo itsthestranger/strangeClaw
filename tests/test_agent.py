@@ -471,6 +471,9 @@ def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) 
     assert captured["config"] == llm_from_file
     assert events[-1]["type"] == "done"
     assert events[-1]["success"] is True
+    event_dump = json.dumps(events, ensure_ascii=True)
+    assert "file-key" not in event_dump
+    assert "/run/strangeclaw/llm.json" not in event_dump
 
 
 def test_agent_main_requires_vsock_port() -> None:

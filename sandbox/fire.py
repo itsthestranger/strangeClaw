@@ -1397,10 +1397,12 @@ class FireSandbox:
         parts: list[str] = []
         stderr_text = self._read_process_stderr_best_effort()
         if self._process is not None:
-            parts.append(f"firecracker stderr: {stderr_text or '<empty>'}")
+            parts.append(
+                f"firecracker stderr: {self._redact_log_text(stderr_text) or '<empty>'}"
+            )
         log_tail = self._read_log_tail_best_effort()
         if self._log_path is not None:
-            parts.append(f"firecracker log tail: {log_tail or '<empty>'}")
+            parts.append(f"firecracker log tail: {self._redact_log_text(log_tail) or '<empty>'}")
         if not parts:
             return ""
         return " | " + " | ".join(parts)
