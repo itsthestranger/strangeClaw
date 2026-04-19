@@ -1,27 +1,25 @@
-# strangeclaw
+# strangeClaw
 
-If you think, "what, another claw?" then yes, another claw. But this one is my
-claw: strangeclaw.
+Yes, I know another OpenClaw alternative is not what the world needs right now.
+But OpenClaw is a really cool project, I love the idea of AI assistants, and I wanted to understand it better.
 
-I built it because I wanted to understand how agent systems like openclaw work
-by actually building one myself, not just using one.
+I also really wanted to try whether it is possible to run agents inside a Firecracker microVM - I kinda like my PC and I am not trying to let an agent freestyle on my files. That is why I
+created my own claw: strangeClaw.
 
-I also had a practical concern: I do not want an autonomous agent with
-free-roaming access to my computer. So I wanted a design where I can run fast
-when I trust the task and switch to isolation when I do not.
+strangeClaw is not a production-ready tool by any means, and it also does not have the skills or connections OpenClaw has, at least not yet.
 
-That is where Firecracker comes in: `yolo` mode for trusted local speed, and
-`fire` mode for microVM isolation with a real VM boundary.
+Right now it supports Telegram and two different modes: `yolo` and `fire`.
+`yolo` is more for trying things out quickly, and `fire` is where the Firecracker sandbox comes in.
 
-strangeclaw is my minimal, self-hosted autonomous AI agent focused on
-simplicity, security, and clear architecture.
-
-The core loop is fully agentic:
-`Inspect -> Choose -> Act -> Observe -> Repeat`.
 
 ## Quick Setup
 
-### 1) Fastest path (Yolo mode, CLI)
+### Modes
+
+- `yolo`: direct host execution for trusted local workflows.
+- `fire`: Firecracker microVM isolation.
+
+### Yolo Mode Quickstart
 
 1. Create a virtual environment and install dependencies:
    ```bash
@@ -54,7 +52,7 @@ Resume a saved session:
 .venv/bin/python -m main --resume <session_id>
 ```
 
-### 2) Fire mode setup (isolated microVM)
+### Fire Mode Setup
 
 Run host setup (installs/updates prerequisites and runs checks):
 
@@ -98,55 +96,6 @@ If your API key is from env interpolation, preserve it too:
 sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
 ```
 
-### 3) Telegram setup (optional)
-
-1. Create a bot with `@BotFather` and copy the token.
-2. Configure:
-   ```yaml
-   adapters:
-     enabled: [telegram]
-
-   telegram:
-     token: "123456789:AA..."
-     local_mode: true
-     allowed_chat_ids: []
-   ```
-3. Run:
-   ```bash
-   .venv/bin/python -m main
-   ```
-
-`telegram.allowed_chat_ids` behavior:
-- Empty/missing: any Telegram chat can use the bot.
-- Non-empty: only listed chat IDs are allowed.
-
-## Features
-
-- Fully agentic loop with plan/review, clarification, execution, and completion.
-- Provider-agnostic LLM layer via LiteLLM (`anthropic`, `openai`, `lm_studio`, `ollama`, and others).
-- Pluggable skills loaded from `skills/<name>/` via `SKILL.md` + `schema.json`.
-- Two execution modes:
-  - `yolo`: direct host execution for trusted workflows.
-  - `fire`: Firecracker microVM isolation.
-- CLI and Telegram adapters (including multi-adapter runs).
-- Session persistence (`state.json`) plus output file export.
-- Optional redacted session event journal (`events.jsonl`).
-- Optional Firecracker runtime log artifact export to session outputs.
-- Optional Fire-mode local LLM routing via `firecracker.host_expose`.
-
-## Architecture
-
-High-level runtime shape:
-
-```text
-Host (main/coordinator/adapters)
-  -> Sandbox (Yolo or Fire)
-    -> Agent loop (plan -> act -> observe -> iterate)
-      -> Skills + LLM calls inside sandbox
-```
-
-For full design rationale and threat model, see [`strangeclaw_spec.md`](./strangeclaw_spec.md).
-
 ## Fire Mode Behavior (Current)
 
 - Fire mode is currently per-task ephemeral: each task boots a fresh microVM,
@@ -183,6 +132,32 @@ LM Studio loopback gotcha:
   socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
   ```
 
+
+## Features
+
+- Fully agentic loop with plan/review, clarification, execution, and completion.
+- Provider-agnostic LLM layer via LiteLLM (`anthropic`, `openai`, `lm_studio`, `ollama`, and others).
+- Pluggable skills loaded from `skills/<name>/` via `SKILL.md` + `schema.json`.
+- Two execution modes:
+  - `yolo`: direct host execution for trusted workflows.
+  - `fire`: Firecracker microVM isolation.
+- CLI and Telegram adapters (including multi-adapter runs).
+- Session persistence (`state.json`) plus output file export.
+- Optional redacted session event journal (`events.jsonl`).
+- Optional Firecracker runtime log artifact export to session outputs.
+- Optional Fire-mode local LLM routing via `firecracker.host_expose`.
+
+## Architecture
+
+High-level runtime shape:
+
+```text
+Host (main/coordinator/adapters)
+  -> Sandbox (Yolo or Fire)
+    -> Agent loop (plan -> act -> observe -> iterate)
+      -> Skills + LLM calls inside sandbox
+```
+
 ## Web Search Endpoint Override
 
 `web-search` uses DuckDuckGo by default. Override with:
@@ -200,6 +175,28 @@ Behavior:
 
 Expected endpoint response: JSON object with optional `AbstractText`,
 `AbstractURL`, and `RelatedTopics` entries.
+
+## Telegram Setup
+
+1. Create a bot with `@BotFather` and copy the token.
+2. Configure:
+   ```yaml
+   adapters:
+     enabled: [telegram]
+
+   telegram:
+     token: "123456789:AA..."
+     local_mode: true
+     allowed_chat_ids: []
+   ```
+3. Run:
+   ```bash
+   .venv/bin/python -m main
+   ```
+
+`telegram.allowed_chat_ids` behavior:
+- Empty/missing: any Telegram chat can use the bot.
+- Non-empty: only listed chat IDs are allowed.
 
 ## Multiple Adapters
 
