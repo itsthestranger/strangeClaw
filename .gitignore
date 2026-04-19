@@ -25,5 +25,7 @@ web-search-not-working.md
 web-search-not-working-again.md
 investigation_web_search_and_native_tool_mode.md
 web-search-investigation-findings.md
+scripts/check-b13-runtime.sh
+scripts/check-b21-vsock.sh
 scripts/check-b41-api-key-safety.sh
 scripts/check-b41-api-key-safety.local.sh
