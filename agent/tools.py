@@ -8,13 +8,22 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+from requests import Response
 
 from agent.llm import ToolCall
+
+try:
+    import trafilatura
+except ImportError:  # pragma: no cover - handled at runtime
+    trafilatura = None
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
 _DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 30.0
 _DEFAULT_WEB_SEARCH_USER_AGENT = "strangeclaw/0.1 (+local)"
+_DEFAULT_WEB_FETCH_USER_AGENT = "strangeclaw/0.1 (+fetch)"
+_DEFAULT_WEB_FETCH_MAX_CHARS = 20000
+_WEB_FETCH_MAX_BYTES = 5 * 1024 * 1024
 _KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
 
 
@@ -54,6 +63,8 @@ class Tools:
             schemas.append(self._shell_schema())
         if "web_search" in self._enabled:
             schemas.append(self._web_search_schema())
+        if "web_fetch" in self._enabled:
+            schemas.append(self._web_fetch_schema())
         return schemas
 
     def execute(self, tool_call: ToolCall) -> ToolResult:
@@ -82,6 +93,8 @@ class Tools:
             return self._execute_shell(args)
         if tool_name == "web_search":
             return self._execute_web_search(args)
+        if tool_name == "web_fetch":
+            return self._execute_web_fetch(args)
         return ToolResult(
             exit_code=1,
             stdout="",
@@ -165,6 +178,21 @@ class Tools:
                     "query": {"type": "string"},
                 },
                 "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _web_fetch_schema() -> dict[str, Any]:
+        return {
+            "name": "web_fetch",
+            "description": "Fetch a URL and extract readable content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                },
+                "required": ["url"],
                 "additionalProperties": False,
             },
         }
@@ -267,6 +295,126 @@ class Tools:
         wrapped = _wrap_external_data({"query": query.strip(), "results": results})
         return ToolResult(exit_code=0, stdout=wrapped, stderr="")
 
+    def _execute_web_fetch(self, args: dict[str, Any]) -> ToolResult:
+        url = args.get("url")
+        if not isinstance(url, str) or not url.strip():
+            return ToolResult(exit_code=1, stdout="", stderr="web_fetch.url must be a string.")
+        target_url = url.strip()
+
+        web_fetch_cfg = self._config.get("web_fetch", {})
+        if not isinstance(web_fetch_cfg, dict):
+            web_fetch_cfg = {}
+        raw_max_chars = web_fetch_cfg.get("max_chars", _DEFAULT_WEB_FETCH_MAX_CHARS)
+        if isinstance(raw_max_chars, bool):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_fetch.max_chars must be a positive integer.",
+            )
+        try:
+            max_chars = int(raw_max_chars)
+        except (TypeError, ValueError):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_fetch.max_chars must be a positive integer.",
+            )
+        if max_chars <= 0:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_fetch.max_chars must be a positive integer.",
+            )
+
+        response: Response | Any | None = None
+        try:
+            response = requests.get(
+                target_url,
+                headers={"User-Agent": _DEFAULT_WEB_FETCH_USER_AGENT},
+                timeout=(10.0, 30.0),
+                stream=True,
+            )
+            status_code = int(getattr(response, "status_code", 0))
+            response.raise_for_status()
+            raw_body, size_limited = _read_limited_bytes(response, byte_limit=_WEB_FETCH_MAX_BYTES)
+            raw_content_type = ""
+            headers = getattr(response, "headers", {})
+            if isinstance(headers, dict):
+                header_value = headers.get("Content-Type", "")
+                if isinstance(header_value, str):
+                    raw_content_type = header_value
+            elif headers is not None:
+                header_value = getattr(headers, "get", lambda *_: "")("Content-Type", "")
+                if isinstance(header_value, str):
+                    raw_content_type = header_value
+            content_type = _normalize_content_type(raw_content_type)
+
+            title: str | None = None
+            if content_type == "text/html":
+                if trafilatura is None:
+                    error_payload = _wrap_external_data(
+                        {
+                            "success": False,
+                            "url": target_url,
+                            "error": "trafilatura dependency is required for HTML extraction.",
+                        }
+                    )
+                    return ToolResult(exit_code=1, stdout=error_payload, stderr="")
+                html = raw_body.decode("utf-8", errors="replace")
+                extracted = trafilatura.extract(
+                    html,
+                    include_links=True,
+                    include_tables=True,
+                )
+                metadata = trafilatura.extract_metadata(html)
+                maybe_title = getattr(metadata, "title", None) if metadata is not None else None
+                if isinstance(maybe_title, str) and maybe_title.strip():
+                    title = maybe_title.strip()
+                text = extracted if isinstance(extracted, str) and extracted.strip() else html
+            elif content_type in {"text/plain", "application/json", "text/xml", "application/xml"}:
+                text = raw_body.decode("utf-8", errors="replace")
+            elif content_type == "application/pdf":
+                text = (
+                    f"PDF document, {len(raw_body)} bytes. "
+                    "Use shell tool with pdftotext to extract content."
+                )
+            else:
+                display_type = content_type or "application/octet-stream"
+                text = f"Binary content ({display_type}), {len(raw_body)} bytes. No text extracted."
+
+            original_length = len(text)
+            truncated_text, was_truncated = _truncate_text(text, limit=max_chars)
+            if size_limited:
+                truncated_text = (
+                    f"{truncated_text}\n\n[... response body capped at {_WEB_FETCH_MAX_BYTES} bytes ...]"
+                )
+                was_truncated = True
+
+            payload = _wrap_external_data(
+                {
+                    "success": True,
+                    "url": target_url,
+                    "status_code": status_code,
+                    "content_type": content_type,
+                    "title": title,
+                    "text": truncated_text,
+                    "truncated": was_truncated,
+                    "original_length": original_length,
+                }
+            )
+            return ToolResult(exit_code=0, stdout=payload, stderr="")
+        except requests.RequestException as exc:
+            error_payload = _wrap_external_data(
+                {
+                    "success": False,
+                    "url": target_url,
+                    "error": f"web_fetch request failed: {exc}",
+                }
+            )
+            return ToolResult(exit_code=1, stdout=error_payload, stderr="")
+        finally:
+            _safe_close_response(response)
+
 
 def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
     if len(text) <= chunk_size * 2:
@@ -327,3 +475,44 @@ def _normalize_searxng_results(payload: dict[str, Any], *, max_results: int) -> 
 def _wrap_external_data(payload: dict[str, Any]) -> str:
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     return f"--- BEGIN DATA ---\n{body}\n--- END DATA ---"
+
+
+def _read_limited_bytes(response: Response | Any, *, byte_limit: int) -> tuple[bytes, bool]:
+    collected = bytearray()
+    limited = False
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        if len(collected) + len(chunk) > byte_limit:
+            keep = byte_limit - len(collected)
+            if keep > 0:
+                collected.extend(chunk[:keep])
+            limited = True
+            break
+        collected.extend(chunk)
+    return bytes(collected), limited
+
+
+def _normalize_content_type(raw: str) -> str:
+    lowered = raw.lower().strip()
+    if ";" in lowered:
+        lowered = lowered.split(";", 1)[0].strip()
+    return lowered
+
+
+def _truncate_text(text: str, *, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    notice = f"\n\n[... truncated, original {len(text)} chars ...]"
+    return text[:limit] + notice, True
+
+
+def _safe_close_response(response: Response | Any | None) -> None:
+    if response is None:
+        return
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            return
