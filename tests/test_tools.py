@@ -54,6 +54,19 @@ class _FakeStreamingResponse:
         return
 
 
+class _FakeHTTPResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+
+
 class _FakeMetadata:
     def __init__(self, title: str | None) -> None:
         self.title = title
@@ -348,6 +361,80 @@ def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
     payload = _unwrap_data(result.stdout)
     assert payload["truncated"] is True
     assert "response body capped at 5242880 bytes" in str(payload["text"])
+
+
+def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
+        captured.update(kwargs)
+        return _FakeHTTPResponse(
+            status_code=201,
+            headers={"Content-Type": "application/json"},
+            text='{"ok":true}',
+        )
+
+    monkeypatch.setattr("agent.tools.requests.request", fake_request)
+    tools = Tools(config={})
+
+    result = tools.execute(
+        _Call(
+            tool="http_request",
+            args={
+                "method": "post",
+                "url": "https://api.example.com/items",
+                "headers": {"Authorization": "Bearer token"},
+                "body": '{"name":"x"}',
+            },
+        )
+    )
+
+    assert result.exit_code == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://api.example.com/items"
+    assert captured["data"] == '{"name":"x"}'
+    assert captured["headers"]["Authorization"] == "Bearer token"
+    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is True
+    assert payload["status_code"] == 201
+    assert payload["body"] == '{"ok":true}'
+    assert payload["truncated"] is False
+
+
+def test_tools_http_request_invalid_method_rejected() -> None:
+    tools = Tools(config={})
+
+    result = tools.execute(
+        _Call(
+            tool="http_request",
+            args={"method": "OPTIONS", "url": "https://api.example.com"},
+        )
+    )
+
+    assert result.exit_code == 1
+    assert "http_request.method must be one of" in result.stderr
+
+
+def test_tools_http_request_request_error(monkeypatch: Any) -> None:
+    def fake_request(**kwargs: Any) -> Any:
+        del kwargs
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr("agent.tools.requests.request", fake_request)
+    tools = Tools(config={})
+
+    result = tools.execute(
+        _Call(
+            tool="http_request",
+            args={"method": "GET", "url": "https://api.example.com"},
+        )
+    )
+
+    assert result.exit_code == 1
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is False
+    assert "http_request failed" in str(payload["error"])
 
 
 def _unwrap_data(text: str) -> dict[str, Any]:

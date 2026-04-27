@@ -24,6 +24,9 @@ _DEFAULT_WEB_SEARCH_USER_AGENT = "strangeclaw/0.1 (+local)"
 _DEFAULT_WEB_FETCH_USER_AGENT = "strangeclaw/0.1 (+fetch)"
 _DEFAULT_WEB_FETCH_MAX_CHARS = 20000
 _WEB_FETCH_MAX_BYTES = 5 * 1024 * 1024
+_DEFAULT_HTTP_REQUEST_USER_AGENT = "strangeclaw/0.1 (+http)"
+_DEFAULT_HTTP_REQUEST_MAX_CHARS = 20000
+_HTTP_REQUEST_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 _KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
 
 
@@ -65,6 +68,8 @@ class Tools:
             schemas.append(self._web_search_schema())
         if "web_fetch" in self._enabled:
             schemas.append(self._web_fetch_schema())
+        if "http_request" in self._enabled:
+            schemas.append(self._http_request_schema())
         return schemas
 
     def execute(self, tool_call: ToolCall) -> ToolResult:
@@ -95,6 +100,8 @@ class Tools:
             return self._execute_web_search(args)
         if tool_name == "web_fetch":
             return self._execute_web_fetch(args)
+        if tool_name == "http_request":
+            return self._execute_http_request(args)
         return ToolResult(
             exit_code=1,
             stdout="",
@@ -193,6 +200,24 @@ class Tools:
                     "url": {"type": "string"},
                 },
                 "required": ["url"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _http_request_schema() -> dict[str, Any]:
+        return {
+            "name": "http_request",
+            "description": "Make structured HTTP requests and return status, headers, and body.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string"},
+                    "url": {"type": "string"},
+                    "headers": {"type": "object"},
+                    "body": {"type": ["string", "null"]},
+                },
+                "required": ["method", "url"],
                 "additionalProperties": False,
             },
         }
@@ -415,6 +440,89 @@ class Tools:
         finally:
             _safe_close_response(response)
 
+    def _execute_http_request(self, args: dict[str, Any]) -> ToolResult:
+        method_raw = args.get("method")
+        if not isinstance(method_raw, str) or not method_raw.strip():
+            return ToolResult(exit_code=1, stdout="", stderr="http_request.method must be a string.")
+        method = method_raw.strip().upper()
+        if method not in _HTTP_REQUEST_ALLOWED_METHODS:
+            allowed = ", ".join(sorted(_HTTP_REQUEST_ALLOWED_METHODS))
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"http_request.method must be one of: {allowed}.",
+            )
+
+        url = args.get("url")
+        if not isinstance(url, str) or not url.strip():
+            return ToolResult(exit_code=1, stdout="", stderr="http_request.url must be a string.")
+        target_url = url.strip()
+
+        headers = args.get("headers", {})
+        if headers is None:
+            headers = {}
+        if not isinstance(headers, dict):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="http_request.headers must be an object when provided.",
+            )
+        normalized_headers: dict[str, str] = {}
+        for key, value in headers.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                return ToolResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="http_request.headers must contain only string keys and values.",
+                )
+            normalized_headers[key] = value
+        normalized_headers.setdefault("User-Agent", _DEFAULT_HTTP_REQUEST_USER_AGENT)
+
+        body = args.get("body")
+        if body is not None and not isinstance(body, str):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="http_request.body must be a string or null.",
+            )
+
+        try:
+            response = requests.request(
+                method=method,
+                url=target_url,
+                headers=normalized_headers,
+                data=body,
+                timeout=(10.0, 30.0),
+            )
+        except requests.RequestException as exc:
+            error_payload = _wrap_external_data(
+                {
+                    "success": False,
+                    "method": method,
+                    "url": target_url,
+                    "error": f"http_request failed: {exc}",
+                }
+            )
+            return ToolResult(exit_code=1, stdout=error_payload, stderr="")
+
+        response_headers = _headers_to_dict(getattr(response, "headers", {}))
+        raw_text = getattr(response, "text", "")
+        if not isinstance(raw_text, str):
+            raw_text = str(raw_text)
+        body_text, truncated = _truncate_text(raw_text, limit=_DEFAULT_HTTP_REQUEST_MAX_CHARS)
+        payload = _wrap_external_data(
+            {
+                "success": True,
+                "method": method,
+                "url": target_url,
+                "status_code": int(getattr(response, "status_code", 0)),
+                "headers": response_headers,
+                "body": body_text,
+                "truncated": truncated,
+            }
+        )
+        return ToolResult(exit_code=0, stdout=payload, stderr="")
+
 
 def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
     if len(text) <= chunk_size * 2:
@@ -516,3 +624,15 @@ def _safe_close_response(response: Response | Any | None) -> None:
             close()
         except Exception:
             return
+
+
+def _headers_to_dict(raw_headers: Any) -> dict[str, str]:
+    if isinstance(raw_headers, dict):
+        return {str(key): str(value) for key, value in raw_headers.items()}
+    items_method = getattr(raw_headers, "items", None)
+    if callable(items_method):
+        try:
+            return {str(key): str(value) for key, value in items_method()}
+        except Exception:
+            return {}
+    return {}
