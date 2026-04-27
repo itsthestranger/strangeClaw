@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+
+import requests
 
 from agent.llm import ToolCall
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
+_DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 30.0
+_DEFAULT_WEB_SEARCH_USER_AGENT = "strangeclaw/0.1 (+local)"
 _KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
 
 
@@ -26,6 +31,7 @@ class Tools:
     """Built-in capability registry and dispatcher."""
 
     def __init__(self, config: dict[str, Any]) -> None:
+        self._config = dict(config)
         raw_tools = config.get("tools")
         if isinstance(raw_tools, dict):
             enabled: set[str] = {
@@ -46,6 +52,8 @@ class Tools:
         schemas: list[dict[str, Any]] = []
         if "shell" in self._enabled:
             schemas.append(self._shell_schema())
+        if "web_search" in self._enabled:
+            schemas.append(self._web_search_schema())
         return schemas
 
     def execute(self, tool_call: ToolCall) -> ToolResult:
@@ -72,6 +80,8 @@ class Tools:
             )
         if tool_name == "shell":
             return self._execute_shell(args)
+        if tool_name == "web_search":
+            return self._execute_web_search(args)
         return ToolResult(
             exit_code=1,
             stdout="",
@@ -144,6 +154,119 @@ class Tools:
             },
         }
 
+    @staticmethod
+    def _web_search_schema() -> dict[str, Any]:
+        return {
+            "name": "web_search",
+            "description": "Search the web and return normalized result snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+
+    def _execute_web_search(self, args: dict[str, Any]) -> ToolResult:
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ToolResult(exit_code=1, stdout="", stderr="web_search.query must be a string.")
+
+        web_search_cfg = self._config.get("web_search", {})
+        if not isinstance(web_search_cfg, dict):
+            web_search_cfg = {}
+        endpoint = web_search_cfg.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search endpoint is not configured.",
+            )
+
+        raw_format = web_search_cfg.get("format", "brave")
+        search_format = str(raw_format).strip().lower()
+        raw_max_results = web_search_cfg.get("max_results", 10)
+        if isinstance(raw_max_results, bool):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search.max_results must be a positive integer.",
+            )
+        try:
+            max_results = int(raw_max_results)
+        except (TypeError, ValueError):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search.max_results must be a positive integer.",
+            )
+        if max_results <= 0:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search.max_results must be a positive integer.",
+            )
+
+        request_kwargs: dict[str, Any] = {
+            "timeout": _DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+            "headers": {"User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT},
+        }
+        if search_format == "brave":
+            api_key = web_search_cfg.get("api_key")
+            if not isinstance(api_key, str) or not api_key.strip():
+                return ToolResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="web_search.api_key is required when web_search.format is brave.",
+                )
+            request_kwargs["headers"] = {
+                "User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT,
+                "X-Subscription-Token": api_key.strip(),
+            }
+            request_kwargs["params"] = {"q": query.strip()}
+        elif search_format == "searxng":
+            request_kwargs["headers"] = {
+                "User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT,
+                "Accept": "application/json",
+            }
+            request_kwargs["params"] = {"q": query.strip(), "format": "json"}
+        else:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"Unsupported web_search.format: {search_format}",
+            )
+
+        try:
+            response = requests.get(endpoint.strip(), **request_kwargs)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"web_search request failed: {exc}",
+            )
+        except ValueError as exc:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"web_search returned invalid JSON: {exc}",
+            )
+
+        if not isinstance(payload, dict):
+            return ToolResult(exit_code=1, stdout="", stderr="web_search response must be JSON.")
+
+        if search_format == "brave":
+            results = _normalize_brave_results(payload, max_results=max_results)
+        else:
+            results = _normalize_searxng_results(payload, max_results=max_results)
+
+        wrapped = _wrap_external_data({"query": query.strip(), "results": results})
+        return ToolResult(exit_code=0, stdout=wrapped, stderr="")
+
 
 def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
     if len(text) <= chunk_size * 2:
@@ -154,3 +277,53 @@ def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
         f"...[truncated {omitted_chars} chars]...\n"
         f"{text[-chunk_size:]}"
     )
+
+
+def _normalize_brave_results(payload: dict[str, Any], *, max_results: int) -> list[dict[str, str]]:
+    raw_web = payload.get("web")
+    if not isinstance(raw_web, dict):
+        return []
+    raw_results = raw_web.get("results")
+    if not isinstance(raw_results, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        url = item.get("url")
+        snippet = item.get("description", "")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        if not isinstance(snippet, str):
+            snippet = str(snippet)
+        normalized.append({"title": title, "url": url, "snippet": snippet})
+        if len(normalized) >= max_results:
+            break
+    return normalized
+
+
+def _normalize_searxng_results(payload: dict[str, Any], *, max_results: int) -> list[dict[str, str]]:
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        url = item.get("url")
+        snippet = item.get("content", "")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        if not isinstance(snippet, str):
+            snippet = str(snippet)
+        normalized.append({"title": title, "url": url, "snippet": snippet})
+        if len(normalized) >= max_results:
+            break
+    return normalized
+
+
+def _wrap_external_data(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    return f"--- BEGIN DATA ---\n{body}\n--- END DATA ---"
