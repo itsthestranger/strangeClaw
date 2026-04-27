@@ -13,6 +13,7 @@ import yaml
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 LOGGER = logging.getLogger(__name__)
+_KNOWN_TOOL_NAMES = {"shell", "web_search", "web_fetch", "http_request"}
 
 REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("mode",),
@@ -128,6 +129,10 @@ def _validate_required_fields(config: dict[str, Any], source_path: Path) -> None
 
 def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_llm_optional_fields(config)
+    _validate_tools_optional_fields(config)
+    _validate_web_search_optional_fields(config)
+    _validate_web_fetch_optional_fields(config)
+    _validate_skills_optional_fields(config)
     _validate_firecracker_optional_fields(config)
     _validate_session_journal_optional_fields(config)
 
@@ -147,6 +152,122 @@ def _validate_llm_optional_fields(config: dict[str, Any]) -> None:
     if not isinstance(api_base, str) or not api_base.strip():
         raise ConfigError("Config field llm.api_base must be a non-empty string or null.")
     llm_section["api_base"] = api_base.strip()
+
+
+def _validate_tools_optional_fields(config: dict[str, Any]) -> None:
+    tools_section = config.get("tools")
+    default_tools = {
+        "shell": True,
+        "web_search": True,
+        "web_fetch": True,
+        "http_request": True,
+    }
+    if tools_section is None:
+        config["tools"] = default_tools
+        return
+    if not isinstance(tools_section, dict):
+        raise ConfigError("Config field tools must be a mapping.")
+
+    normalized = dict(default_tools)
+    for key, value in tools_section.items():
+        if not isinstance(key, str):
+            raise ConfigError("Config field tools keys must be strings.")
+        if not isinstance(value, bool):
+            raise ConfigError(f"Config field tools.{key} must be a boolean.")
+        if key not in _KNOWN_TOOL_NAMES:
+            LOGGER.warning(
+                "Unknown tool name in config.tools: %s. Supported tools: %s",
+                key,
+                ", ".join(sorted(_KNOWN_TOOL_NAMES)),
+            )
+            continue
+        normalized[key] = value
+    config["tools"] = normalized
+
+
+def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
+    web_search = config.get("web_search")
+    if web_search is None:
+        config["web_search"] = {
+            "endpoint": "https://api.search.brave.com/res/v1/web/search",
+            "format": "brave",
+            "api_key": "",
+            "max_results": 10,
+        }
+        web_search = config["web_search"]
+    if not isinstance(web_search, dict):
+        raise ConfigError("Config field web_search must be a mapping.")
+
+    endpoint = web_search.get("endpoint", "https://api.search.brave.com/res/v1/web/search")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ConfigError("Config field web_search.endpoint must be a non-empty string.")
+    web_search["endpoint"] = endpoint.strip()
+
+    fmt = web_search.get("format", "brave")
+    if not isinstance(fmt, str):
+        raise ConfigError("Config field web_search.format must be a string.")
+    normalized_format = fmt.strip().lower()
+    if normalized_format not in {"brave", "searxng"}:
+        raise ConfigError("Config field web_search.format must be either 'brave' or 'searxng'.")
+    web_search["format"] = normalized_format
+
+    api_key = web_search.get("api_key", "")
+    if not isinstance(api_key, str):
+        raise ConfigError("Config field web_search.api_key must be a string.")
+    web_search["api_key"] = api_key
+    if normalized_format == "brave" and not api_key.strip():
+        LOGGER.warning(
+            "web_search.format is brave but web_search.api_key is empty. "
+            "Brave requests will fail until an API key is set."
+        )
+
+    max_results_raw = web_search.get("max_results", 10)
+    if isinstance(max_results_raw, bool):
+        raise ConfigError("Config field web_search.max_results must be an integer.")
+    try:
+        max_results = int(max_results_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Config field web_search.max_results must be an integer.") from exc
+    if max_results <= 0:
+        raise ConfigError("Config field web_search.max_results must be greater than zero.")
+    web_search["max_results"] = max_results
+
+
+def _validate_web_fetch_optional_fields(config: dict[str, Any]) -> None:
+    web_fetch = config.get("web_fetch")
+    if web_fetch is None:
+        config["web_fetch"] = {"max_chars": 20000}
+        return
+    if not isinstance(web_fetch, dict):
+        raise ConfigError("Config field web_fetch must be a mapping.")
+
+    max_chars_raw = web_fetch.get("max_chars", 20000)
+    if isinstance(max_chars_raw, bool):
+        raise ConfigError("Config field web_fetch.max_chars must be an integer.")
+    try:
+        max_chars = int(max_chars_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Config field web_fetch.max_chars must be an integer.") from exc
+    if max_chars <= 0:
+        raise ConfigError("Config field web_fetch.max_chars must be greater than zero.")
+    web_fetch["max_chars"] = max_chars
+
+
+def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
+    skills = config.get("skills")
+    if not isinstance(skills, dict):
+        raise ConfigError("Config field skills must be a mapping.")
+
+    max_file_chars_raw = skills.get("max_file_chars", 20000)
+    if isinstance(max_file_chars_raw, bool):
+        raise ConfigError("Config field skills.max_file_chars must be an integer.")
+    try:
+        max_file_chars = int(max_file_chars_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Config field skills.max_file_chars must be an integer.") from exc
+    if max_file_chars <= 0:
+        raise ConfigError("Config field skills.max_file_chars must be greater than zero.")
+    skills["max_file_chars"] = max_file_chars
 
 
 def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:

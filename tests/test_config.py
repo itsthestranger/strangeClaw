@@ -106,6 +106,20 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     loaded = load_config(config_path)
 
     assert loaded["llm"]["api_base"] is None
+    assert loaded["tools"] == {
+        "shell": True,
+        "web_search": True,
+        "web_fetch": True,
+        "http_request": True,
+    }
+    assert loaded["web_search"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "api_key": "",
+        "max_results": 10,
+    }
+    assert loaded["web_fetch"] == {"max_chars": 20000}
+    assert loaded["skills"]["max_file_chars"] == 20000
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -173,6 +187,73 @@ def test_load_config_warns_when_host_expose_enabled_without_ports(
 
     assert loaded["firecracker"]["host_expose"] == {"enabled": True, "ports": []}
     assert "enabled but no ports were configured" in caplog.text
+
+
+def test_load_config_warns_on_unknown_tool_names(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["tools"] = {"shell": True, "not_a_real_tool": False}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with caplog.at_level("WARNING"):
+        loaded = load_config(config_path)
+
+    assert loaded["tools"]["shell"] is True
+    assert "not_a_real_tool" not in loaded["tools"]
+    assert "Unknown tool name in config.tools" in caplog.text
+
+
+def test_load_config_rejects_invalid_web_search_format(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_search"] = {"endpoint": "http://localhost:8080/search", "format": "duck"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"web_search\.format"):
+        load_config(config_path)
+
+
+def test_load_config_warns_when_brave_without_api_key(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_search"] = {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "api_key": "",
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with caplog.at_level("WARNING"):
+        loaded = load_config(config_path)
+
+    assert loaded["web_search"]["format"] == "brave"
+    assert "web_search.api_key is empty" in caplog.text
+
+
+def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_fetch"] = {"max_chars": 0}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"web_fetch\.max_chars"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_skills_max_file_chars(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["skills"]["max_file_chars"] = 0
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"skills\.max_file_chars"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:

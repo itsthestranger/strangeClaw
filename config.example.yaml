@@ -39,6 +39,23 @@ llm:
   #   api_base: http://127.0.0.1:1234/v1
   provider_settings: {}
 
+tools:
+  shell: true                   # High risk: command execution
+  web_search: true              # Low risk: search endpoint queries
+  web_fetch: true               # Low risk: URL retrieval/extraction
+  http_request: true            # Medium risk: arbitrary HTTP API calls
+
+web_search:
+  # Quick-start: Brave API endpoint (requires api_key).
+  # Self-hosted recommendation: set endpoint to SearXNG and format to "searxng".
+  endpoint: "https://api.search.brave.com/res/v1/web/search"
+  format: "brave"               # brave | searxng
+  api_key: ""                   # required for brave; not needed for searxng
+  max_results: 10
+
+web_fetch:
+  max_chars: 20000              # truncate extracted text (~5k tokens)
+
 context:
   token_budget: 4000
   summary_threshold: 10
@@ -53,6 +70,7 @@ session_journal:
 
 skills:
   directory: ./skills
+  max_file_chars: 20000         # read_file truncation limit (~5k tokens)
 
 firecracker:
   binary: /usr/local/bin/firecracker
