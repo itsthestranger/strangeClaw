@@ -11,12 +11,11 @@ from agent.llm import LLMClient
 ACTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "skill": {"type": "string"},
-        "action": {"type": "string"},
+        "tool": {"type": "string"},
         "args": {"type": "object"},
         "reason": {"type": "string"},
     },
-    "required": ["skill", "action", "args"],
+    "required": ["tool", "args"],
 }
 
 
@@ -99,7 +98,7 @@ def test_native_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
                                 "function": {
                                     "name": "submit_tool_call",
                                     "arguments": (
-                                        '{"skill":"shell","action":"run","args":{"command":"pwd"},'
+                                        '{"tool":"shell.run","args":{"command":"pwd"},'
                                         '"reason":"Need cwd"}'
                                     ),
                                 },
@@ -125,8 +124,7 @@ def test_native_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     )
 
     assert result.action is not None
-    assert result.action.skill == "shell"
-    assert result.action.action == "run"
+    assert result.action.tool == "shell.run"
     assert result.action.args == {"command": "pwd"}
     assert result.action.reason == "Need cwd"
     assert "tools" in captured
@@ -151,7 +149,7 @@ def test_native_structured_output_can_use_string_tool_choice(
                                 "function": {
                                     "name": "submit_tool_call",
                                     "arguments": (
-                                        '{"skill":"shell","action":"run",'
+                                        '{"tool":"shell.run",'
                                         '"args":{"command":"pwd"}}'
                                     ),
                                 },
@@ -201,7 +199,7 @@ def test_native_probe_falls_back_from_forced_function_to_required(
                                     "function": {
                                         "name": "submit_tool_call",
                                         "arguments": (
-                                            '{"skill":"shell","action":"run",'
+                                            '{"tool":"shell.run",'
                                             '"args":{"command":"echo probe"}}'
                                         ),
                                     },
@@ -222,7 +220,7 @@ def test_native_probe_falls_back_from_forced_function_to_required(
                                 "function": {
                                     "name": "submit_tool_call",
                                     "arguments": (
-                                        '{"skill":"shell","action":"run",'
+                                        '{"tool":"shell.run",'
                                         '"args":{"command":"pwd"}}'
                                     ),
                                 },
@@ -268,7 +266,7 @@ def test_native_probe_can_fallback_to_prompt_when_native_is_unavailable(
                 {
                     "message": {
                         "content": (
-                            '{"skill":"http-request","action":"request","args":{"method":"GET"},'
+                            '{"tool":"http-request.request","args":{"method":"GET"},'
                             '"reason":"Need data"}'
                         )
                     }
@@ -292,7 +290,7 @@ def test_native_probe_can_fallback_to_prompt_when_native_is_unavailable(
     )
 
     assert result.action is not None
-    assert result.action.skill == "http-request"
+    assert result.action.tool == "http-request.request"
     assert "tool_choice" in calls[0]
     assert "tool_choice" in calls[1]
     assert "tool_choice" not in calls[2]
@@ -314,7 +312,7 @@ def test_native_probe_falls_back_to_prompt_when_probe_returns_no_native_action(
                 {
                     "message": {
                         "content": (
-                            '{"skill":"http-request","action":"request","args":{"method":"GET"},'
+                            '{"tool":"http-request.request","args":{"method":"GET"},'
                             '"reason":"Need data"}'
                         )
                     }
@@ -352,7 +350,7 @@ def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
                 {
                     "message": {
                         "content": (
-                            '{"skill":"http-request","action":"request","args":{"method":"GET"},'
+                            '{"tool":"http-request.request","args":{"method":"GET"},'
                             '"reason":"Need data"}'
                         )
                     }
@@ -374,8 +372,7 @@ def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     )
 
     assert result.action is not None
-    assert result.action.skill == "http-request"
-    assert result.action.action == "request"
+    assert result.action.tool == "http-request.request"
     assert result.action.args == {"method": "GET"}
     assert result.action.reason == "Need data"
     assert captured["messages"][0]["role"] == "system"

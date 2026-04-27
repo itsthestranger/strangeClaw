@@ -182,14 +182,18 @@ def _normalize_tool_call(tool_call: Any) -> tuple[str, str, dict[str, Any]]:
         raw_action = tool_call.get("action")
         raw_args = tool_call.get("args")
     else:
-        raw_skill = getattr(tool_call, "skill", None)
-        raw_action = getattr(tool_call, "action", None)
+        raw_tool = getattr(tool_call, "tool", None)
+        if isinstance(raw_tool, str) and "." in raw_tool:
+            raw_skill, raw_action = raw_tool.split(".", 1)
+        else:
+            raw_skill = getattr(tool_call, "skill", None)
+            raw_action = getattr(tool_call, "action", None)
         raw_args = getattr(tool_call, "args", None)
 
     if not isinstance(raw_skill, str) or not raw_skill:
-        raise SkillsError("tool_call.skill must be a non-empty string.")
+        raise SkillsError("tool_call must include a non-empty skill segment.")
     if not isinstance(raw_action, str) or not raw_action:
-        raise SkillsError("tool_call.action must be a non-empty string.")
+        raise SkillsError("tool_call must include a non-empty action segment.")
     if not isinstance(raw_args, dict):
         raise SkillsError("tool_call.args must be an object.")
     return raw_skill, raw_action, raw_args

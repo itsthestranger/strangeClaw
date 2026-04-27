@@ -52,8 +52,7 @@ def test_yolo_sandbox_runs_agent_and_exchanges_events() -> None:
             LLMResponse(
                 text="",
                 action=ToolCall(
-                    skill="__agent__",
-                    action="done",
+                    tool="__agent__.done",
                     args={"reply": "hello"},
                 ),
                 usage=None,

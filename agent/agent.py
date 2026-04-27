@@ -22,9 +22,9 @@ PLANNING_SYSTEM_PROMPT = (
 EXECUTION_SYSTEM_PROMPT = (
     "You are in an agentic loop: Inspect -> Choose -> Act -> Observe -> Repeat. "
     "On each turn, inspect goal/plan/history and choose exactly one structured decision. "
-    "Use a normal skill/action/args tool call to execute tools. "
+    "Use a normal tool/args tool call to execute tools. "
     "Use skill_contracts in the user payload to satisfy required args and defaults. "
-    "For control decisions, use skill='__agent__' and one of actions: done, clarify, replan. "
+    "For control decisions, use tool='__agent__.done', '__agent__.clarify', or '__agent__.replan'. "
     "For done use args.reply. For clarify use args.question. "
     "For replan you may set args.feedback."
 )
@@ -37,12 +37,11 @@ SUMMARY_SYSTEM_PROMPT = (
 EXECUTION_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "skill": {"type": "string"},
-        "action": {"type": "string"},
+        "tool": {"type": "string"},
         "args": {"type": "object"},
         "reason": {"type": "string"},
     },
-    "required": ["skill", "action", "args"],
+    "required": ["tool", "args"],
     "additionalProperties": False,
 }
 
@@ -273,7 +272,7 @@ class Agent:
             stderr=(
                 "Decision parse error: "
                 f"{error} "
-                "Return a valid JSON tool call with skill/action/args and re-check "
+                "Return a valid JSON tool call with tool/args and re-check "
                 "the skill contracts."
             ),
         )
@@ -296,20 +295,42 @@ class Agent:
         current_plan: Any,
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if decision.skill == "__agent__":
+        if decision.tool.startswith("__agent__."):
+            control_action = decision.tool.split(".", 1)[1]
             return self._handle_control_decision(
                 decision=decision,
+                control_action=control_action,
                 goal=goal,
                 approval_mode=approval_mode,
                 current_plan=current_plan,
                 history=history,
             )
 
+        skill_name, action_name = _split_tool_name(decision.tool)
+        if skill_name is None or action_name is None:
+            invalid_result = ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    f"Invalid tool name '{decision.tool}'. "
+                    "Expected '<skill>.<action>' during legacy execution path."
+                ),
+            )
+            action_event = {
+                "type": "action",
+                "skill": "__agent__",
+                "action": "invalid_tool_name",
+                "args": {"tool": decision.tool},
+                "result": asdict(invalid_result),
+            }
+            self._send(action_event)
+            return {"done": False, "plan": current_plan, "observation": action_event}
+
         result = self._execute_tool(decision)
         action_event = {
             "type": "action",
-            "skill": decision.skill,
-            "action": decision.action,
+            "skill": skill_name,
+            "action": action_name,
             "args": decision.args,
             "result": asdict(result),
         }
@@ -326,12 +347,13 @@ class Agent:
         self,
         *,
         decision: ToolCall,
+        control_action: str,
         goal: str,
         approval_mode: str,
         current_plan: Any,
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if decision.action == "done":
+        if control_action == "done":
             reply = _string_arg(decision.args, "reply", fallback="Task completed.")
             self._send(
                 self._build_done_event(
@@ -344,7 +366,7 @@ class Agent:
             )
             return {"done": True, "plan": current_plan, "observation": None}
 
-        if decision.action == "clarify":
+        if control_action == "clarify":
             question = _string_arg(
                 decision.args,
                 "question",
@@ -362,7 +384,7 @@ class Agent:
                 },
             }
 
-        if decision.action == "replan":
+        if control_action == "replan":
             feedback = _string_arg(decision.args, "feedback", fallback="")
             new_plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
             observation: dict[str, Any] | None = None
@@ -375,17 +397,27 @@ class Agent:
             "plan": current_plan,
             "observation": {
                 "type": "control_error",
-                "action": decision.action,
+                "action": control_action,
                 "reason": "unsupported __agent__ action",
             },
         }
 
     def _execute_tool(self, decision: ToolCall) -> ToolResult:
+        skill_name, action_name = _split_tool_name(decision.tool)
+        if skill_name is None or action_name is None:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    f"Invalid tool name '{decision.tool}'. "
+                    "Expected '<skill>.<action>' during legacy execution path."
+                ),
+            )
         try:
             return self._skills.execute(
                 {
-                    "skill": decision.skill,
-                    "action": decision.action,
+                    "skill": skill_name,
+                    "action": action_name,
                     "args": decision.args,
                 }
             )
@@ -582,15 +614,19 @@ def _parse_text_fallback_action(text: str) -> ToolCall | None:
     payload = _first_json_object_or_array(text)
     if not isinstance(payload, dict):
         return None
-    skill = payload.get("skill")
-    action = payload.get("action")
+    tool = payload.get("tool")
+    if not isinstance(tool, str):
+        skill = payload.get("skill")
+        action = payload.get("action")
+        if isinstance(skill, str) and isinstance(action, str):
+            tool = f"{skill}.{action}"
     args = payload.get("args")
     reason = payload.get("reason")
-    if not isinstance(skill, str) or not isinstance(action, str) or not isinstance(args, dict):
+    if not isinstance(tool, str) or not isinstance(args, dict):
         return None
     if reason is not None and not isinstance(reason, str):
         reason = None
-    return ToolCall(skill=skill, action=action, args=args, reason=reason)
+    return ToolCall(tool=tool, args=args, reason=reason)
 
 
 def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
@@ -598,6 +634,15 @@ def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
     if isinstance(value, str) and value:
         return value
     return fallback
+
+
+def _split_tool_name(tool: str) -> tuple[str | None, str | None]:
+    if "." not in tool:
+        return None, None
+    skill_name, action_name = tool.split(".", 1)
+    if not skill_name or not action_name:
+        return None, None
+    return skill_name, action_name
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

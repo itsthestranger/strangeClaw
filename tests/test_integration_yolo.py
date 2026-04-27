@@ -79,12 +79,12 @@ def test_yolo_integration_success_path() -> None:
             LLMResponse(text='{"steps":["check version"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "python3 --version"}),
+                action=ToolCall(tool="shell.run", args={"command": "python3 --version"}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "Done."}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "Done."}),
                 usage=None,
             ),
         ]
@@ -110,7 +110,7 @@ def test_yolo_integration_plan_rejection_and_replan() -> None:
             LLMResponse(text='{"steps":["replanned"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -140,16 +140,14 @@ def test_yolo_integration_clarification_round_trip() -> None:
             LLMResponse(text='{"steps":["clarify"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="__agent__",
-                    action="clarify",
+                action=ToolCall(tool="__agent__.clarify",
                     args={"question": "Which environment?"},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "clarified"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "clarified"}),
                 usage=None,
             ),
         ]
@@ -176,12 +174,12 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
             LLMResponse(text='{"steps":["attempt invalid shell"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={}),
+                action=ToolCall(tool="shell.run", args={}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -207,7 +205,7 @@ def test_yolo_integration_max_iteration_guard() -> None:
             LLMResponse(text='{"steps":["loop"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "printf loop"}),
+                action=ToolCall(tool="shell.run", args={"command": "printf loop"}),
                 usage=None,
             ),
         ]
@@ -235,7 +233,7 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         responses=[
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "resumed"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "resumed"}),
                 usage=None,
             )
         ]

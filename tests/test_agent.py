@@ -106,32 +106,26 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "python3 --version"}),
+                action=ToolCall(tool="shell.run", args={"command": "python3 --version"}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="shell",
-                    action="run",
+                action=ToolCall(tool="shell.run",
                     args={"command": f'printf \'print("hello")\\n\' > {quoted_hello}'},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="shell",
-                    action="run",
+                action=ToolCall(tool="shell.run",
                     args={"command": f"printf artifact > {quoted_output}"},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="__agent__",
-                    action="done",
+                action=ToolCall(tool="__agent__.done",
                     args={"reply": "Completed successfully."},
                 ),
                 usage=None,
@@ -183,9 +177,7 @@ def test_agent_plan_rejection_replans_in_review_mode() -> None:
             LLMResponse(text='{"steps":["updated plan"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="__agent__",
-                    action="done",
+                action=ToolCall(tool="__agent__.done",
                     args={"reply": "Done after replan."},
                 ),
                 usage=None,
@@ -230,7 +222,7 @@ def test_agent_emits_clarification_when_max_iterations_reached() -> None:
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "printf one-step"}),
+                action=ToolCall(tool="shell.run", args={"command": "printf one-step"}),
                 usage=None,
             ),
         ]
@@ -304,7 +296,7 @@ def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> 
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -341,20 +333,18 @@ def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
             LLMResponse(text='{"steps":["s1","s2"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "printf step1"}),
+                action=ToolCall(tool="shell.run", args={"command": "printf step1"}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="shell", action="run", args={"command": "printf step2"}),
+                action=ToolCall(tool="shell.run", args={"command": "printf step2"}),
                 usage=None,
             ),
             LLMResponse(text="summarized previous observations", action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(
-                    skill="__agent__",
-                    action="done",
+                action=ToolCall(tool="__agent__.done",
                     args={"reply": "done with summary"},
                 ),
                 usage=None,
@@ -391,7 +381,7 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
             LLMResponse(text="not json", action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "recovered"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "recovered"}),
                 usage=None,
             ),
         ]
@@ -438,7 +428,7 @@ def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) 
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(skill="__agent__", action="done", args={"reply": "done"}),
+                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
                 usage=None,
             ),
         ]

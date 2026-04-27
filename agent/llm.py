@@ -13,8 +13,7 @@ import litellm
 class ToolCall:
     """Normalized tool call."""
 
-    skill: str
-    action: str
+    tool: str
     args: dict[str, Any]
     reason: str | None = None
 
@@ -296,11 +295,10 @@ def _probe_action_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "skill": {"type": "string"},
-            "action": {"type": "string"},
+            "tool": {"type": "string"},
             "args": {"type": "object"},
         },
-        "required": ["skill", "action", "args"],
+        "required": ["tool", "args"],
         "additionalProperties": False,
     }
 
@@ -395,15 +393,20 @@ def _parse_action_payload(raw_args: Any) -> ToolCall | None:
 def _action_from_dict(payload: Any) -> ToolCall | None:
     if not isinstance(payload, dict):
         return None
-    skill = payload.get("skill")
-    action = payload.get("action")
+    tool = payload.get("tool")
     args = payload.get("args")
     reason = payload.get("reason")
-    if not isinstance(skill, str) or not isinstance(action, str) or not isinstance(args, dict):
+    if not isinstance(tool, str):
+        # Backward-compatible decode path while the runtime migrates.
+        skill = payload.get("skill")
+        action = payload.get("action")
+        if isinstance(skill, str) and isinstance(action, str):
+            tool = f"{skill}.{action}"
+    if not isinstance(tool, str) or not isinstance(args, dict):
         return None
     if reason is not None and not isinstance(reason, str):
         reason = None
-    return ToolCall(skill=skill, action=action, args=args, reason=reason)
+    return ToolCall(tool=tool, args=args, reason=reason)
 
 
 def _extract_usage(response: Any) -> dict[str, int] | None:
