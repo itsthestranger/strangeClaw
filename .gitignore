@@ -32,3 +32,4 @@ scripts/check-b41-api-key-safety.local.sh
 scripts/local-test-web-search.py
 scripts/local-test-searxng-endpoint.py
 scripts/local-test-web-fetch.py
+scripts/local-test-http-request.py
