@@ -380,6 +380,38 @@ def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     assert "tools" not in captured
 
 
+def test_prompt_structured_output_rejects_legacy_skill_action_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_completion(**_: Any) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"skill":"http-request","action":"request",'
+                            '"args":{"method":"GET"},"reason":"Need data"}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="ollama/llama3.1",
+        api_key="",
+        structured_output="prompt",
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Fetch data"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is None
+
+
 def test_count_tokens_uses_litellm_token_counter(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 

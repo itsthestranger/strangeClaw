@@ -396,12 +396,6 @@ def _action_from_dict(payload: Any) -> ToolCall | None:
     tool = payload.get("tool")
     args = payload.get("args")
     reason = payload.get("reason")
-    if not isinstance(tool, str):
-        # Backward-compatible decode path while the runtime migrates.
-        skill = payload.get("skill")
-        action = payload.get("action")
-        if isinstance(skill, str) and isinstance(action, str):
-            tool = f"{skill}.{action}"
     if not isinstance(tool, str) or not isinstance(args, dict):
         return None
     if reason is not None and not isinstance(reason, str):
