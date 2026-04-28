@@ -81,11 +81,10 @@ class CLIAdapter:
             return
 
         if event_type == "action":
-            skill = event.get("skill", "unknown")
-            action = event.get("action", "unknown")
+            tool = event.get("tool", "unknown")
             result = event.get("result", {})
             exit_code = result.get("exit_code")
-            print(f"\nAction: {skill}.{action} (exit={exit_code})")
+            print(f"\nAction: {tool} (exit={exit_code})")
             return
 
         if event_type == "done":

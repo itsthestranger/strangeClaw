@@ -154,8 +154,7 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
     assert events[0]["role"] == "plan"
     action_events = [event for event in events if event["type"] == "action"]
     assert len(action_events) == 3
-    assert action_events[0]["skill"] == "shell"
-    assert action_events[0]["action"] == "run"
+    assert action_events[0]["tool"] == "shell.run"
     assert hello_path.read_text(encoding="utf-8") == 'print("hello")\n'
 
     done_event = events[-1]
@@ -406,10 +405,9 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
     error_actions = [
         event
         for event in events
-        if event["type"] == "action" and event["skill"] == "__agent__"
+        if event["type"] == "action" and event["tool"] == "__agent__.decision_error"
     ]
     assert error_actions
-    assert error_actions[0]["action"] == "decision_error"
     assert error_actions[0]["result"]["exit_code"] == 1
     assert "Decision parse error" in error_actions[0]["result"]["stderr"]
     assert events[-1]["type"] == "done"

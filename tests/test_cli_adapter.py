@@ -71,8 +71,7 @@ def test_run_handles_plan_approval_and_done(
             {"type": "message", "role": "plan", "content": {"steps": ["one", "two"]}},
             {
                 "type": "action",
-                "skill": "shell",
-                "action": "run",
+                "tool": "shell.run",
                 "result": {"exit_code": 0, "stdout": "", "stderr": ""},
             },
             {"type": "done", "success": True, "reply": "All good.", "state": {}, "files": []},

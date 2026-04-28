@@ -26,8 +26,7 @@ ROUNDTRIP_EVENTS = [
     {"type": "message", "role": "status", "content": "working"},
     {
         "type": "action",
-        "skill": "shell",
-        "action": "run",
+        "tool": "shell.run",
         "args": {"command": "python3 --version"},
         "result": {"exit_code": 0, "stdout": "Python 3.13.0", "stderr": ""},
     },

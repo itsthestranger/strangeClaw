@@ -80,8 +80,7 @@ def validate_event(event: dict[str, Any]) -> None:
         return
 
     if event_type == "action":
-        _require_str(event, "skill")
-        _require_str(event, "action")
+        _require_str(event, "tool")
         _require_dict(event, "args")
         _require_dict(event, "result")
         return

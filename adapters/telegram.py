@@ -477,8 +477,7 @@ class TelegramAdapter:
 
     @staticmethod
     def _format_action(event: dict[str, Any]) -> str:
-        skill = event.get("skill", "unknown")
-        action = event.get("action", "unknown")
+        tool = event.get("tool", "unknown")
         result = event.get("result")
 
         status = ""
@@ -494,7 +493,7 @@ class TelegramAdapter:
             elif isinstance(stderr, str) and stderr.strip():
                 preview = stderr.strip()
 
-        header = f"*Action:* {TelegramAdapter._escape_markdown_v2(f'{skill}.{action}{status}')}"
+        header = f"*Action:* {TelegramAdapter._escape_markdown_v2(f'{tool}{status}')}"
         if preview:
             preview = preview[:3000]
             escaped_preview = TelegramAdapter._escape_markdown_v2_code(preview)

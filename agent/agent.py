@@ -278,8 +278,7 @@ class Agent:
         )
         action_event = {
             "type": "action",
-            "skill": "__agent__",
-            "action": "decision_error",
+            "tool": "__agent__.decision_error",
             "args": {},
             "result": asdict(error_result),
         }
@@ -318,8 +317,7 @@ class Agent:
             )
             action_event = {
                 "type": "action",
-                "skill": "__agent__",
-                "action": "invalid_tool_name",
+                "tool": "__agent__.invalid_tool_name",
                 "args": {"tool": decision.tool},
                 "result": asdict(invalid_result),
             }
@@ -329,8 +327,7 @@ class Agent:
         result = self._execute_tool(decision)
         action_event = {
             "type": "action",
-            "skill": skill_name,
-            "action": action_name,
+            "tool": f"{skill_name}.{action_name}",
             "args": decision.args,
             "result": asdict(result),
         }
