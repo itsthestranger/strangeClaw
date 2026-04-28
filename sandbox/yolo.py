@@ -16,6 +16,7 @@ class YoloSandbox:
     def __init__(
         self,
         *,
+        agent_config: dict[str, Any] | None = None,
         skills_dir: str = "./skills",
         max_iterations: int = 50,
         output_dir: str = "/output",
@@ -23,6 +24,19 @@ class YoloSandbox:
         summary_threshold: int = 10,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
     ) -> None:
+        self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
+        if self._agent_config is not None:
+            skills_cfg = self._agent_config.get("skills")
+            if isinstance(skills_cfg, dict) and isinstance(skills_cfg.get("directory"), str):
+                skills_dir = str(skills_cfg["directory"])
+            loop_cfg = self._agent_config.get("loop")
+            if isinstance(loop_cfg, dict):
+                max_iterations = int(loop_cfg.get("max_iterations", max_iterations))
+            context_cfg = self._agent_config.get("context")
+            if isinstance(context_cfg, dict):
+                token_budget = int(context_cfg.get("token_budget", token_budget))
+                summary_threshold = int(context_cfg.get("summary_threshold", summary_threshold))
+
         self._skills_dir = skills_dir
         self._max_iterations = max_iterations
         self._output_dir = output_dir
@@ -51,15 +65,19 @@ class YoloSandbox:
         agent = Agent(
             transport=agent_transport,
             skills_dir=self._skills_dir,
+            agent_config=self._agent_config,
             max_iterations=self._max_iterations,
             output_dir=self._output_dir,
             token_budget=self._token_budget,
             summary_threshold=self._summary_threshold,
+            allow_task_llm=self._agent_config is None,
             llm_factory=self._llm_factory,
         )
         self._agent_thread = threading.Thread(target=self._run_agent, args=(agent,), daemon=True)
         self._agent_thread.start()
-        self.send(task)
+        task_event = dict(task)
+        task_event.pop("llm", None)
+        self.send(task_event)
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event to the agent."""

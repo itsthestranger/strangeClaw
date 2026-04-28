@@ -37,13 +37,16 @@ def _skills_root() -> Path:
     return Path(__file__).resolve().parents[1] / "skills"
 
 
+def _agent_config() -> dict[str, Any]:
+    return {"llm": {"model": "fake/model", "api_key": "fake-key"}}
+
+
 def _task(approval_mode: str = "auto", state: dict[str, Any] | None = None) -> dict[str, Any]:
     event: dict[str, Any] = {
         "type": "task",
         "text": "integration task",
         "session_id": "sess-1",
         "approval_mode": approval_mode,
-        "llm": {"model": "fake/model", "api_key": "fake-key"},
     }
     if state is not None:
         event["state"] = state
@@ -89,7 +92,11 @@ def test_yolo_integration_success_path() -> None:
             ),
         ]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
     sandbox.run(_task())
     try:
         events = _collect_until_done(sandbox)
@@ -115,7 +122,11 @@ def test_yolo_integration_plan_rejection_and_replan() -> None:
             ),
         ]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
     sandbox.run(_task(approval_mode="review"))
     try:
         events = _collect_until_done(
@@ -152,7 +163,11 @@ def test_yolo_integration_clarification_round_trip() -> None:
             ),
         ]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
     sandbox.run(_task())
     try:
         events = _collect_until_done(
@@ -184,7 +199,11 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
             ),
         ]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
     sandbox.run(_task())
     try:
         _collect_until_done(sandbox)
@@ -214,6 +233,7 @@ def test_yolo_integration_max_iteration_guard() -> None:
         skills_dir=str(_skills_root()),
         max_iterations=1,
         llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
     )
     sandbox.run(_task())
     try:
@@ -244,7 +264,11 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         "history": [{"type": "action", "skill": "shell", "action": "run", "args": {}}],
         "summary": "prior summary",
     }
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
     sandbox.run(_task(state=resume_state))
     try:
         events = _collect_until_done(sandbox)

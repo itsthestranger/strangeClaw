@@ -78,6 +78,7 @@ class Agent:
         *,
         transport: AgentTransport,
         skills_dir: str,
+        agent_config: dict[str, Any] | None = None,
         max_iterations: int = 50,
         output_dir: str = "/output",
         llm_config_path: str = "/run/strangeclaw/llm.json",
@@ -98,6 +99,7 @@ class Agent:
 
         self._transport = transport
         self._skills = Skills(skills_dir)
+        self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
         self._llm_config_path = Path(llm_config_path)
@@ -197,6 +199,12 @@ class Agent:
                 return event
 
     def _resolve_llm_config(self, task_event: dict[str, Any]) -> dict[str, Any]:
+        if self._agent_config is not None:
+            llm_from_config = self._agent_config.get("llm")
+            if isinstance(llm_from_config, dict):
+                return dict(llm_from_config)
+            raise AgentError("Agent config is missing required llm mapping.")
+
         llm_from_task = task_event.get("llm")
         if self._allow_task_llm and isinstance(llm_from_task, dict):
             return llm_from_task

@@ -87,8 +87,6 @@ class Coordinator:
                 "session_id": session_id,
                 "approval_mode": self._approval_mode,
             }
-            if self._llm_config is not None:
-                task["llm"] = dict(self._llm_config)
             if record.latest_state is not None:
                 task["state"] = state_for_follow_up(record.latest_state)
 

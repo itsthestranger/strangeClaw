@@ -103,8 +103,6 @@ class TelegramAdapter:
             "session_id": self._session_id(chat_id),
             "approval_mode": self._approval_mode,
         }
-        if self._llm_config is not None:
-            task["llm"] = dict(self._llm_config)
         return task
 
     async def show(self, event: dict[str, Any], *, chat_id: int) -> None:

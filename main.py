@@ -25,10 +25,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _build_yolo_sandbox(config: dict[str, Any]) -> YoloSandbox:
     return YoloSandbox(
-        skills_dir=str(config["skills"]["directory"]),
-        max_iterations=int(config["loop"]["max_iterations"]),
-        token_budget=int(config["context"]["token_budget"]),
-        summary_threshold=int(config["context"]["summary_threshold"]),
+        agent_config=config,
     )
 
 

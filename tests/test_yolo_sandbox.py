@@ -41,7 +41,6 @@ def _task_event(*, approval_mode: str) -> dict[str, Any]:
         "text": "say hello",
         "session_id": "sess-1",
         "approval_mode": approval_mode,
-        "llm": {"model": "fake/model", "api_key": "fake-key"},
     }
 
 
@@ -59,7 +58,11 @@ def test_yolo_sandbox_runs_agent_and_exchanges_events() -> None:
             ),
         ]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: scripted_llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
+    )
     sandbox.run(_task_event(approval_mode="auto"))
 
     first = sandbox.receive(timeout_seconds=2.0)
@@ -79,7 +82,11 @@ def test_yolo_sandbox_receive_returns_none_on_timeout() -> None:
     scripted_llm = ScriptedLLM(
         responses=[LLMResponse(text='{"steps":["wait"]}', action=None, usage=None)]
     )
-    sandbox = YoloSandbox(skills_dir=str(_skills_root()), llm_factory=lambda _: scripted_llm)
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
+    )
     sandbox.run(_task_event(approval_mode="review"))
 
     plan = sandbox.receive(timeout_seconds=2.0)

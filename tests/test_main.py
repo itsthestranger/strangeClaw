@@ -189,10 +189,11 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     coordinator = created["coordinator"]
     sandbox = coordinator.sandbox_factory()
     adapter = created["adapter"]
-    assert sandbox.kwargs["skills_dir"] == "./skills"
-    assert sandbox.kwargs["max_iterations"] == 7
-    assert sandbox.kwargs["token_budget"] == 1234
-    assert sandbox.kwargs["summary_threshold"] == 9
+    assert sandbox.kwargs["agent_config"]["skills"]["directory"] == "./skills"
+    assert sandbox.kwargs["agent_config"]["loop"]["max_iterations"] == 7
+    assert sandbox.kwargs["agent_config"]["context"]["token_budget"] == 1234
+    assert sandbox.kwargs["agent_config"]["context"]["summary_threshold"] == 9
+    assert sandbox.kwargs["agent_config"]["llm"] == {"model": "x", "api_key": "k"}
     assert adapter.approval_mode == "review"
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator

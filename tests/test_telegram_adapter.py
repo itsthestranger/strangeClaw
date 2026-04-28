@@ -139,7 +139,6 @@ def test_get_task_uses_chat_id_session_and_llm() -> None:
         "text": "build a tool",
         "session_id": "42",
         "approval_mode": "review",
-        "llm": {"model": "x", "api_key": "k"},
     }
 
 
@@ -365,11 +364,13 @@ def test_telegram_integration_task_plan_approve_execute_done(
         sandbox_factory=lambda: YoloSandbox(
             skills_dir=str(_skills_root()),
             llm_factory=lambda _: llm,
+            agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
         ),
         coordinator=Coordinator(
             sandbox_factory=lambda: YoloSandbox(
                 skills_dir=str(_skills_root()),
                 llm_factory=lambda _: llm,
+                agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
             ),
             approval_mode="review",
             llm_config={"model": "fake/model", "api_key": "fake-key"},

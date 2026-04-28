@@ -55,8 +55,6 @@ class CLIAdapter:
             "session_id": self._session_id,
             "approval_mode": self._approval_mode,
         }
-        if self._llm_config is not None:
-            task["llm"] = self._llm_config
         if self._latest_state is not None:
             task["state"] = self._state_for_follow_up(self._latest_state)
         return task

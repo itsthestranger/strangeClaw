@@ -37,7 +37,7 @@ class FakeSandbox:
         self.stop_calls += 1
 
 
-def test_get_task_includes_type_session_and_llm() -> None:
+def test_get_task_includes_type_session() -> None:
     sandbox = FakeSandbox(events=[])
     adapter = CLIAdapter(
         sandbox=sandbox,
@@ -51,7 +51,7 @@ def test_get_task_includes_type_session_and_llm() -> None:
     assert task["text"] == "Do the thing"
     assert task["approval_mode"] == "review"
     assert isinstance(task["session_id"], str)
-    assert task["llm"] == {"model": "x", "api_key": "k"}
+    assert "llm" not in task
 
 
 def test_get_task_rejects_empty_text() -> None:
