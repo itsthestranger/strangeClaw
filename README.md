@@ -136,6 +136,9 @@ LM Studio loopback gotcha:
 ## Features
 
 - Fully agentic loop with plan/review, clarification, execution, and completion.
+- Design decision (current): if planning references unknown skills, the agent will
+  replan up to 3 times, then fail fast instead of looping indefinitely (may
+  become configurable later).
 - Provider-agnostic LLM layer via LiteLLM (`anthropic`, `openai`, `lm_studio`, `ollama`, and others).
 - Pluggable skills loaded from `skills/<name>/` via `SKILL.md` + `schema.json`.
 - Two execution modes:

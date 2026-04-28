@@ -11,20 +11,22 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.llm import LLMClient, LLMResponse, ToolCall
-from agent.skills import Skills, SkillsError, ToolResult
+from agent.skills import Skills, SkillsError
+from agent.tools import ToolResult, Tools
 from agent.transport import VsockTransport
 
 PLANNING_SYSTEM_PROMPT = (
     "You are strangeclaw, a self-hosted autonomous agent. "
-    "Create a concise, executable plan for the user goal using available skills."
+    "Create a concise, executable plan for the user goal using available tools and skills."
 )
 
 EXECUTION_SYSTEM_PROMPT = (
     "You are in an agentic loop: Inspect -> Choose -> Act -> Observe -> Repeat. "
     "On each turn, inspect goal/plan/history and choose exactly one structured decision. "
     "Use a normal tool/args tool call to execute tools. "
-    "Use skill_contracts in the user payload to satisfy required args and defaults. "
+    "Use activated_skills in the user payload for workflow guidance and references. "
     "For control decisions, use tool='__agent__.done', '__agent__.clarify', or '__agent__.replan'. "
+    "For stage-3 skill references, use tool='__agent__.read_skill_file' with args.skill and args.path. "
     "For done use args.reply. For clarify use args.question. "
     "For replan you may set args.feedback."
 )
@@ -56,7 +58,7 @@ class LLMRuntime(Protocol):
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse: ...
 
     def count_tokens(self, messages: list[dict[str, Any]]) -> int: ...
@@ -98,8 +100,10 @@ class Agent:
             raise AgentError("max_output_total_bytes must be greater than zero.")
 
         self._transport = transport
-        self._skills = Skills(skills_dir)
         self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
+        skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
+        self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
+        self._tools = Tools(self._agent_config or {})
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
         self._llm_config_path = Path(llm_config_path)
@@ -128,9 +132,20 @@ class Agent:
         history, plan = self._resume_context(task_event)
         if plan is None:
             plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
+        plan = self._normalize_plan(plan, goal=goal)
+        plan, activated_skills = self._activate_referenced_skills(
+            goal=goal,
+            approval_mode=approval_mode,
+            plan=plan,
+        )
 
         for _ in range(self._max_iterations):
-            decision = self._choose_next_decision(goal=goal, plan=plan, history=history)
+            decision = self._choose_next_decision(
+                goal=goal,
+                plan=plan,
+                history=history,
+                activated_skills=activated_skills,
+            )
             if decision is None:
                 continue
 
@@ -142,6 +157,13 @@ class Agent:
                 history=history,
             )
             plan = outcome["plan"]
+            if outcome.get("replanned"):
+                plan = self._normalize_plan(plan, goal=goal)
+                plan, activated_skills = self._activate_referenced_skills(
+                    goal=goal,
+                    approval_mode=approval_mode,
+                    plan=plan,
+                )
             self._observe(history=history, observation=outcome["observation"])
             if outcome["done"]:
                 return
@@ -240,18 +262,89 @@ class Agent:
         response = llm.complete(messages)
         return _parse_json_if_possible(response.text)
 
+    def _normalize_plan(self, plan: Any, *, goal: str) -> dict[str, Any]:
+        if isinstance(plan, dict):
+            normalized_goal = plan.get("goal")
+            if not isinstance(normalized_goal, str) or not normalized_goal.strip():
+                normalized_goal = goal
+            raw_steps = plan.get("steps")
+            steps: list[str] = []
+            if isinstance(raw_steps, list):
+                steps = [str(step).strip() for step in raw_steps if str(step).strip()]
+            raw_refs = plan.get("referenced_skills")
+            referenced_skills: list[str] = []
+            if isinstance(raw_refs, list):
+                referenced_skills = [
+                    str(name).strip() for name in raw_refs if isinstance(name, str) and name.strip()
+                ]
+            return {
+                "goal": normalized_goal,
+                "steps": steps,
+                "referenced_skills": referenced_skills,
+            }
+        if isinstance(plan, str):
+            return {"goal": goal, "steps": [plan], "referenced_skills": []}
+        return {"goal": goal, "steps": [], "referenced_skills": []}
+
+    def _activate_referenced_skills(
+        self,
+        *,
+        goal: str,
+        approval_mode: str,
+        plan: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        current_plan = plan
+        attempts = 0
+        while True:
+            attempts += 1
+            if attempts > 3:
+                raise AgentError(
+                    "Failed to produce a valid plan after 3 replan attempts due to unknown referenced_skills."
+                )
+            activated: dict[str, dict[str, Any]] = {}
+            refs = current_plan.get("referenced_skills", [])
+            if not isinstance(refs, list):
+                refs = []
+            activation_error: str | None = None
+            for name in refs:
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                skill_name = name.strip()
+                try:
+                    activated[skill_name] = self._skills.get_doc_bundle(skill_name)
+                except SkillsError as exc:
+                    activation_error = (
+                        f"Unknown referenced skill '{skill_name}' in plan: {exc}. "
+                        "Re-planning with available skills only."
+                    )
+                    break
+            if activation_error is None:
+                return current_plan, activated
+
+            self._send({"type": "message", "role": "status", "content": activation_error})
+            current_plan = self._normalize_plan(
+                self._planning_phase(goal=goal, approval_mode=approval_mode),
+                goal=goal,
+            )
+
     def _execution_decision(
         self,
         *,
         goal: str,
         plan: Any,
         history: list[dict[str, Any]],
+        activated_skills: dict[str, dict[str, Any]],
     ) -> ToolCall:
         llm = self._require_llm()
-        messages = self.build_execution_prompt(goal=goal, plan=plan, history=history)
+        messages = self.build_execution_prompt(
+            goal=goal,
+            plan=plan,
+            history=history,
+            activated_skills=activated_skills,
+        )
         response: LLMResponse = llm.complete(
             messages,
-            action_schema=EXECUTION_ACTION_SCHEMA,
+            action_schema=self._tools.schema(),
         )
         if response.action is not None:
             return response.action
@@ -266,9 +359,15 @@ class Agent:
         goal: str,
         plan: Any,
         history: list[dict[str, Any]],
+        activated_skills: dict[str, dict[str, Any]],
     ) -> ToolCall | None:
         try:
-            return self._execution_decision(goal=goal, plan=plan, history=history)
+            return self._execution_decision(
+                goal=goal,
+                plan=plan,
+                history=history,
+                activated_skills=activated_skills,
+            )
         except AgentError as exc:
             history.append(self._emit_decision_parse_error(exc))
             return None
@@ -313,29 +412,10 @@ class Agent:
                 history=history,
             )
 
-        skill_name, action_name = _split_tool_name(decision.tool)
-        if skill_name is None or action_name is None:
-            invalid_result = ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr=(
-                    f"Invalid tool name '{decision.tool}'. "
-                    "Expected '<skill>.<action>' during legacy execution path."
-                ),
-            )
-            action_event = {
-                "type": "action",
-                "tool": "__agent__.invalid_tool_name",
-                "args": {"tool": decision.tool},
-                "result": asdict(invalid_result),
-            }
-            self._send(action_event)
-            return {"done": False, "plan": current_plan, "observation": action_event}
-
         result = self._execute_tool(decision)
         action_event = {
             "type": "action",
-            "tool": f"{skill_name}.{action_name}",
+            "tool": decision.tool,
             "args": decision.args,
             "result": asdict(result),
         }
@@ -395,7 +475,41 @@ class Agent:
             observation: dict[str, Any] | None = None
             if feedback:
                 observation = {"type": "replan", "feedback": feedback}
-            return {"done": False, "plan": new_plan, "observation": observation}
+            return {
+                "done": False,
+                "plan": new_plan,
+                "observation": observation,
+                "replanned": True,
+            }
+
+        if control_action == "read_skill_file":
+            skill_name = _string_arg(decision.args, "skill", fallback="")
+            relative_path = _string_arg(decision.args, "path", fallback="")
+            read_result: ToolResult
+            if not skill_name or not relative_path:
+                read_result = ToolResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="read_skill_file requires args.skill and args.path.",
+                )
+            else:
+                try:
+                    content = self._skills.read_file(skill_name, relative_path)
+                    read_result = ToolResult(exit_code=0, stdout=content, stderr="")
+                except SkillsError as exc:
+                    read_result = ToolResult(
+                        exit_code=1,
+                        stdout="",
+                        stderr=f"Skill file read error: {exc}",
+                    )
+            action_event = {
+                "type": "action",
+                "tool": "__agent__.read_skill_file",
+                "args": {"skill": skill_name, "path": relative_path},
+                "result": asdict(read_result),
+            }
+            self._send(action_event)
+            return {"done": False, "plan": current_plan, "observation": action_event}
 
         return {
             "done": False,
@@ -408,26 +522,7 @@ class Agent:
         }
 
     def _execute_tool(self, decision: ToolCall) -> ToolResult:
-        skill_name, action_name = _split_tool_name(decision.tool)
-        if skill_name is None or action_name is None:
-            return ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr=(
-                    f"Invalid tool name '{decision.tool}'. "
-                    "Expected '<skill>.<action>' during legacy execution path."
-                ),
-            )
-        try:
-            return self._skills.execute(
-                {
-                    "skill": skill_name,
-                    "action": action_name,
-                    "args": decision.args,
-                }
-            )
-        except SkillsError as exc:
-            return ToolResult(exit_code=1, stdout="", stderr=f"Skill execution error: {exc}")
+        return self._tools.execute(decision)
 
     def _wait_for_user_reply(self) -> dict[str, Any]:
         while True:
@@ -520,10 +615,14 @@ class Agent:
         prompt_lines = [
             f"Goal:\n{goal}",
             "",
+            "Available tools:",
+            json.dumps(self._tools.list_enabled(), ensure_ascii=True, indent=2),
+            "",
             "Available skills:",
             json.dumps(self._skills.index(), ensure_ascii=True, indent=2),
             "",
-            "Return a short plan as JSON with keys goal and steps (array of strings).",
+            "Return JSON with keys: goal (string), steps (array of strings), "
+            "referenced_skills (array of skill names, may be empty).",
         ]
         if feedback:
             prompt_lines.extend(["", f"User feedback for re-plan:\n{feedback}"])
@@ -538,6 +637,7 @@ class Agent:
         goal: str,
         plan: Any,
         history: list[dict[str, Any]],
+        activated_skills: dict[str, dict[str, Any]],
     ) -> list[dict[str, str]]:
         """Build execution-phase messages, enforcing token budget."""
         recent_history = self._recent_history(history)
@@ -547,8 +647,9 @@ class Agent:
             user_payload = {
                 "goal": goal,
                 "plan": plan,
-                "skills": self._skills.index(),
-                "skill_contracts": self._skills.contracts(),
+                "enabled_tools": self._tools.list_enabled(),
+                "tool_schemas": self._tools.schema(),
+                "activated_skills": activated_skills,
                 "history_summary": summary,
                 "recent_history": recent_history,
                 "output_instruction": "Place any files for the user in /output/.",
@@ -620,11 +721,6 @@ def _parse_text_fallback_action(text: str) -> ToolCall | None:
     if not isinstance(payload, dict):
         return None
     tool = payload.get("tool")
-    if not isinstance(tool, str):
-        skill = payload.get("skill")
-        action = payload.get("action")
-        if isinstance(skill, str) and isinstance(action, str):
-            tool = f"{skill}.{action}"
     args = payload.get("args")
     reason = payload.get("reason")
     if not isinstance(tool, str) or not isinstance(args, dict):
@@ -641,13 +737,22 @@ def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
     return fallback
 
 
-def _split_tool_name(tool: str) -> tuple[str | None, str | None]:
-    if "." not in tool:
-        return None, None
-    skill_name, action_name = tool.split(".", 1)
-    if not skill_name or not action_name:
-        return None, None
-    return skill_name, action_name
+def _read_skills_max_file_chars(agent_config: dict[str, Any] | None) -> int:
+    if not isinstance(agent_config, dict):
+        return 20000
+    skills_cfg = agent_config.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return 20000
+    raw = skills_cfg.get("max_file_chars", 20000)
+    if isinstance(raw, bool):
+        return 20000
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 20000
+    if value <= 0:
+        return 20000
+    return value
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -18,6 +18,19 @@ ACTION_SCHEMA = {
     "required": ["tool", "args"],
 }
 
+TOOLS_SCHEMA = [
+    {
+        "name": "shell",
+        "description": "Run shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    }
+]
+
 
 class _FakeClientError(RuntimeError):
     def __init__(self, message: str, *, status_code: int) -> None:
@@ -129,6 +142,53 @@ def test_native_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     assert result.action.reason == "Need cwd"
     assert "tools" in captured
     assert captured["tool_choice"]["function"]["name"] == "submit_tool_call"
+
+
+def test_native_structured_output_parses_direct_tool_function_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": '{"command":"pwd"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert result.action.tool == "shell"
+    assert result.action.args == {"command": "pwd"}
+    assert captured["tool_choice"] == "required"
+    assert captured["tools"][0]["function"]["name"] == "shell"
 
 
 def test_native_structured_output_can_use_string_tool_choice(

@@ -106,19 +106,19 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "python3 --version"}),
+                action=ToolCall(tool="shell", args={"command": "python3 --version"}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run",
+                action=ToolCall(tool="shell",
                     args={"command": f'printf \'print("hello")\\n\' > {quoted_hello}'},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run",
+                action=ToolCall(tool="shell",
                     args={"command": f"printf artifact > {quoted_output}"},
                 ),
                 usage=None,
@@ -154,7 +154,7 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
     assert events[0]["role"] == "plan"
     action_events = [event for event in events if event["type"] == "action"]
     assert len(action_events) == 3
-    assert action_events[0]["tool"] == "shell.run"
+    assert action_events[0]["tool"] == "shell"
     assert hello_path.read_text(encoding="utf-8") == 'print("hello")\n'
 
     done_event = events[-1]
@@ -221,7 +221,7 @@ def test_agent_emits_clarification_when_max_iterations_reached() -> None:
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "printf one-step"}),
+                action=ToolCall(tool="shell", args={"command": "printf one-step"}),
                 usage=None,
             ),
         ]
@@ -277,11 +277,17 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
         {"type": "action", "idx": 2},
         {"type": "action", "idx": 3},
     ]
-    messages = agent.build_execution_prompt(goal="g", plan={"steps": []}, history=history)
+    messages = agent.build_execution_prompt(
+        goal="g",
+        plan={"steps": []},
+        history=history,
+        activated_skills={},
+    )
     payload = json.loads(messages[1]["content"])
     assert payload["recent_history"] == [{"type": "action", "idx": 3}]
-    assert "skill_contracts" in payload
-    assert "web-search" in payload["skill_contracts"]
+    assert payload["enabled_tools"] == ["http_request", "shell", "web_fetch", "web_search"]
+    assert isinstance(payload["tool_schemas"], list)
+    assert payload["activated_skills"] == {}
     assert payload["output_instruction"] == "Place any files for the user in /output/."
 
 
@@ -332,12 +338,12 @@ def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
             LLMResponse(text='{"steps":["s1","s2"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "printf step1"}),
+                action=ToolCall(tool="shell", args={"command": "printf step1"}),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "printf step2"}),
+                action=ToolCall(tool="shell", args={"command": "printf step2"}),
                 usage=None,
             ),
             LLMResponse(text="summarized previous observations", action=None, usage=None),
@@ -462,6 +468,101 @@ def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) 
     event_dump = json.dumps(events, ensure_ascii=True)
     assert "file-key" not in event_dump
     assert "/run/strangeclaw/llm.json" not in event_dump
+
+
+def test_agent_stage3_read_skill_file_control_action() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(
+                text='{"goal":"g","steps":["read"],"referenced_skills":["shell"]}',
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="__agent__.read_skill_file",
+                    args={"skill": "shell", "path": "SKILL.md"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_events = [
+        event for event in events if event.get("type") == "action" and event.get("tool") == "__agent__.read_skill_file"
+    ]
+    assert read_events
+    assert read_events[0]["result"]["exit_code"] == 0
+    assert "shell" in read_events[0]["result"]["stdout"].lower()
+
+
+def test_agent_replans_when_plan_references_unknown_skill() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(
+                text='{"goal":"g","steps":["bad"],"referenced_skills":["missing-skill"]}',
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text='{"goal":"g","steps":["good"],"referenced_skills":[]}',
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="__agent__.done", args={"reply": "ok"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    plan_events = [
+        event for event in events if event.get("type") == "message" and event.get("role") == "plan"
+    ]
+    assert len(plan_events) == 2
+    status_events = [
+        event for event in events if event.get("type") == "message" and event.get("role") == "status"
+    ]
+    assert any("Unknown referenced skill" in str(event.get("content")) for event in status_events)
 
 
 def test_agent_main_requires_vsock_port() -> None:

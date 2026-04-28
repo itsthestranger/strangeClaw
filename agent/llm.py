@@ -122,7 +122,7 @@ class LLMClient:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Produce one normalized response."""
         response_action_mode = "none"
@@ -257,26 +257,55 @@ def _extract_text(response: Any) -> str:
 
 
 def _native_tool_call_kwargs(
-    action_schema: dict[str, Any],
+    action_schema: dict[str, Any] | list[dict[str, Any]],
     *,
     tool_choice_mode: str,
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "submit_tool_call",
-                    "description": "Emit a structured tool call decision.",
-                    "parameters": action_schema,
-                },
-            }
-        ]
-    }
-    if tool_choice_mode == "forced_function":
-        kwargs["tool_choice"] = {"type": "function", "function": {"name": "submit_tool_call"}}
+    kwargs: dict[str, Any]
+    if isinstance(action_schema, list):
+        tools: list[dict[str, Any]] = []
+        for item in action_schema:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            params = item.get("parameters")
+            if not isinstance(name, str) or not name.strip() or not isinstance(params, dict):
+                continue
+            description = item.get("description")
+            if not isinstance(description, str):
+                description = f"Run tool {name.strip()}."
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name.strip(),
+                        "description": description,
+                        "parameters": params,
+                    },
+                }
+            )
+        kwargs = {"tools": tools}
+        if tool_choice_mode == "forced_function":
+            kwargs["tool_choice"] = "required"
+        else:
+            kwargs["tool_choice"] = tool_choice_mode
     else:
-        kwargs["tool_choice"] = tool_choice_mode
+        kwargs = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "submit_tool_call",
+                        "description": "Emit a structured tool call decision.",
+                        "parameters": action_schema,
+                    },
+                }
+            ]
+        }
+        if tool_choice_mode == "forced_function":
+            kwargs["tool_choice"] = {"type": "function", "function": {"name": "submit_tool_call"}}
+        else:
+            kwargs["tool_choice"] = tool_choice_mode
     return kwargs
 
 
@@ -327,7 +356,12 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
     if isinstance(tool_calls, list) and tool_calls:
         first_call = tool_calls[0]
         function_block = _get_value(first_call, "function")
+        function_name = _get_value(function_block, "name")
         raw_args = _get_value(function_block, "arguments")
+        if isinstance(function_name, str) and function_name and function_name != "submit_tool_call":
+            parsed_args = _parse_native_function_args(raw_args)
+            if parsed_args is not None:
+                return ToolCall(tool=function_name, args=parsed_args, reason=None)
         payload = _parse_action_payload(raw_args)
         if payload is not None:
             return payload
@@ -340,6 +374,11 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
             if item.get("type") != "tool_use":
                 continue
             payload = _action_from_dict(_get_value(item, "input"))
+            if payload is None:
+                name = item.get("name")
+                input_payload = _get_value(item, "input")
+                if isinstance(name, str) and name and isinstance(input_payload, dict):
+                    payload = ToolCall(tool=name, args=input_payload, reason=None)
             if payload is not None:
                 return payload
     return None
@@ -347,13 +386,21 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
 
 def _inject_prompt_action_schema(
     messages: list[dict[str, Any]],
-    action_schema: dict[str, Any],
+    action_schema: dict[str, Any] | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     schema_text = json.dumps(action_schema, separators=(",", ":"), ensure_ascii=True)
-    instruction = (
-        "When selecting a tool, return ONLY a JSON object matching this schema: "
-        f"{schema_text}. If no tool is needed, respond normally."
-    )
+    if isinstance(action_schema, list):
+        instruction = (
+            "When selecting a tool, return ONLY a JSON object with keys "
+            "tool (string) and args (object) where tool is one of the listed names "
+            "and args matches that tool's parameters. Tool definitions: "
+            f"{schema_text}. If no tool is needed, respond normally."
+        )
+    else:
+        instruction = (
+            "When selecting a tool, return ONLY a JSON object matching this schema: "
+            f"{schema_text}. If no tool is needed, respond normally."
+        )
     return [{"role": "system", "content": instruction}, *messages]
 
 
@@ -388,6 +435,20 @@ def _parse_action_payload(raw_args: Any) -> ToolCall | None:
     except json.JSONDecodeError:
         return None
     return _action_from_dict(parsed)
+
+
+def _parse_native_function_args(raw_args: Any) -> dict[str, Any] | None:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not isinstance(raw_args, str):
+        return None
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 def _action_from_dict(payload: Any) -> ToolCall | None:

@@ -350,7 +350,7 @@ def test_telegram_integration_task_plan_approve_execute_done(
             LLMResponse(text='{"steps":["check shell"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "printf hi"}),
+                action=ToolCall(tool="shell", args={"command": "printf hi"}),
                 usage=None,
             ),
             LLMResponse(

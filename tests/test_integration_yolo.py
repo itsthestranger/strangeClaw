@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent.agent import EXECUTION_ACTION_SCHEMA
 from agent.llm import LLMResponse, ToolCall
+from agent.tools import Tools
 from sandbox.yolo import YoloSandbox
 
 
@@ -82,7 +82,7 @@ def test_yolo_integration_success_path() -> None:
             LLMResponse(text='{"steps":["check version"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "python3 --version"}),
+                action=ToolCall(tool="shell", args={"command": "python3 --version"}),
                 usage=None,
             ),
             LLMResponse(
@@ -189,7 +189,7 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
             LLMResponse(text='{"steps":["attempt invalid shell"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={}),
+                action=ToolCall(tool="shell", args={}),
                 usage=None,
             ),
             LLMResponse(
@@ -215,7 +215,7 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
     history = payload["recent_history"]
     assert history
     assert history[-1]["result"]["exit_code"] == 1
-    assert "Invalid args" in history[-1]["result"]["stderr"]
+    assert "must be a non-empty string" in history[-1]["result"]["stderr"]
 
 
 def test_yolo_integration_max_iteration_guard() -> None:
@@ -224,7 +224,7 @@ def test_yolo_integration_max_iteration_guard() -> None:
             LLMResponse(text='{"steps":["loop"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="shell.run", args={"command": "printf loop"}),
+                action=ToolCall(tool="shell", args={"command": "printf loop"}),
                 usage=None,
             ),
         ]
@@ -261,7 +261,7 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
     resume_state = {
         "goal": "integration task",
         "plan": {"steps": ["already planned"]},
-        "history": [{"type": "action", "skill": "shell", "action": "run", "args": {}}],
+        "history": [{"type": "action", "tool": "shell", "args": {}}],
         "summary": "prior summary",
     }
     sandbox = YoloSandbox(
@@ -276,4 +276,4 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         sandbox.stop()
 
     assert all(not (event["type"] == "message" and event.get("role") == "plan") for event in events)
-    assert llm.calls[0]["action_schema"] == EXECUTION_ACTION_SCHEMA
+    assert llm.calls[0]["action_schema"] == Tools({}).schema()

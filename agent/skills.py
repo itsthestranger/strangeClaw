@@ -50,16 +50,24 @@ class SkillDefinition:
 class Skills:
     """Skill loader/executor."""
 
-    def __init__(self, skills_dir: str, default_timeout_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        skills_dir: str,
+        default_timeout_seconds: float = 60.0,
+        max_file_chars: int = 20000,
+    ) -> None:
         """Initialize skill discovery."""
         root = Path(skills_dir).expanduser()
         if not root.is_dir():
             raise SkillsError(f"Skills directory does not exist: {root}")
         if default_timeout_seconds <= 0:
             raise SkillsError("default_timeout_seconds must be greater than zero.")
+        if max_file_chars <= 0:
+            raise SkillsError("max_file_chars must be greater than zero.")
 
         self._skills_dir = root
         self._default_timeout_seconds = default_timeout_seconds
+        self._max_file_chars = max_file_chars
         self._skills = self._discover(root)
 
     def index(self) -> list[dict[str, str]]:
@@ -76,6 +84,53 @@ class Skills:
         if definition is None:
             raise SkillsError(f"Unknown skill: {skill_name}")
         return definition.doc
+
+    def get_doc_bundle(self, skill_name: str) -> dict[str, Any]:
+        """Return full SKILL.md content and bundled file manifest for one skill."""
+        definition = self._skills.get(skill_name)
+        if definition is None:
+            raise SkillsError(f"Unknown skill: {skill_name}")
+        return {
+            "skill_md": definition.doc,
+            "files": _skill_file_manifest(definition.path),
+        }
+
+    def read_file(self, skill_name: str, relative_path: str) -> str:
+        """Read one skill file with traversal protection and truncation."""
+        definition = self._skills.get(skill_name)
+        if definition is None:
+            raise SkillsError(f"Unknown skill: {skill_name}")
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            raise SkillsError("relative_path must be a non-empty string.")
+
+        requested_path = Path(relative_path.strip())
+        if requested_path.is_absolute():
+            raise SkillsError("read_file path must be relative.")
+        if ".." in requested_path.parts:
+            raise SkillsError("read_file path traversal is not allowed.")
+
+        skill_root = definition.path.resolve()
+        target = (definition.path / requested_path).resolve()
+        if skill_root != target and skill_root not in target.parents:
+            raise SkillsError("read_file target must stay within skill directory.")
+        if not target.is_file():
+            raise SkillsError(f"Skill file not found: {relative_path}")
+        if target.is_symlink():
+            symlink_target = target.resolve()
+            if skill_root != symlink_target and skill_root not in symlink_target.parents:
+                raise SkillsError("read_file symlink target escapes skill directory.")
+
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkillsError(f"Skill file is not UTF-8 decodable: {relative_path}") from exc
+
+        if len(text) <= self._max_file_chars:
+            return text
+        return (
+            f"{text[:self._max_file_chars]}\n\n"
+            f"[... truncated, original {len(text)} chars ...]"
+        )
 
     def contracts(self) -> dict[str, dict[str, dict[str, Any]]]:
         """Return per-skill action schemas for execution-time prompting."""
@@ -310,6 +365,23 @@ def _extract_description(doc_text: str, *, fallback: str) -> str:
         if line:
             return line
     return fallback
+
+
+def _skill_file_manifest(skill_root: Path) -> list[str]:
+    resolved_root = skill_root.resolve()
+    manifest: list[str] = []
+    for dirname in ("scripts", "references", "assets"):
+        subdir = skill_root / dirname
+        if not subdir.is_dir():
+            continue
+        for path in sorted(subdir.rglob("*")):
+            if not path.is_file():
+                continue
+            resolved_path = path.resolve()
+            if resolved_root != resolved_path and resolved_root not in resolved_path.parents:
+                continue
+            manifest.append(resolved_path.relative_to(resolved_root).as_posix())
+    return manifest
 
 
 def _truncate_output(text: str, *, chunk_size: int = 4000) -> str:
