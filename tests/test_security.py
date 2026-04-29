@@ -48,21 +48,11 @@ def test_session_id_sanitization_rejects_invalid_characters() -> None:
         session.create("abc_def")
 
 
-def test_invalid_tool_call_never_reaches_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
-    called = {"run": False}
-
-    def fake_run(*args: Any, **kwargs: Any) -> None:
-        del args
-        del kwargs
-        called["run"] = True
-        raise AssertionError("subprocess.run should not be called for invalid args")
-
-    monkeypatch.setattr("agent.skills.subprocess.run", fake_run)
+def test_read_file_rejects_path_traversal() -> None:
     skills = Skills(str(_skills_root()))
 
-    with pytest.raises(SkillsError, match="Invalid args"):
-        skills.execute({"skill": "shell", "action": "run", "args": {}})
-    assert called["run"] is False
+    with pytest.raises(SkillsError, match="path traversal"):
+        skills.read_file("shell", "../outside.txt")
 
 
 def test_api_key_not_persisted_to_session_state(

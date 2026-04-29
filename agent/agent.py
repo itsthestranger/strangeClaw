@@ -335,7 +335,7 @@ class Agent:
                     continue
                 skill_name = name.strip()
                 try:
-                    activated[skill_name] = self._skills.get_doc_bundle(skill_name)
+                    activated[skill_name] = self._skills.get_doc(skill_name)
                 except SkillsError as exc:
                     activation_error = (
                         f"Unknown referenced skill '{skill_name}' in plan: {exc}. "

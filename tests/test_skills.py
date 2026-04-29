@@ -1,202 +1,235 @@
-"""Tests for skill discovery and execution."""
+"""Tests for Agent Skills discovery and context-file access."""
 
 from __future__ import annotations
 
-import json
+import os
 import shutil
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from agent.skills import Skills, SkillsError
 
 
-def _write_skill(tmp_path: Path, name: str, doc: str, schema: dict[str, Any]) -> Path:
-    skill_dir = tmp_path / name
+def _write_skill(
+    root: Path,
+    dir_name: str,
+    *,
+    name: str,
+    description: str,
+    body: str,
+) -> Path:
+    skill_dir = root / dir_name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(doc, encoding="utf-8")
-    (skill_dir / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    skill_md = (
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        "version: 1.0.0\n"
+        "---\n"
+        f"{body}\n"
+    )
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
     return skill_dir
 
 
 def test_skills_discovery_index_doc_and_directory_changes(tmp_path: Path) -> None:
+    alpha = _write_skill(
+        tmp_path,
+        "alpha-dir",
+        name="alpha",
+        description="Alpha description",
+        body="# Alpha\n\nAlpha body.",
+    )
+    (alpha / "references").mkdir()
+    (alpha / "references" / "guide.md").write_text("alpha guide", encoding="utf-8")
+
     _write_skill(
         tmp_path,
-        "alpha",
-        "---\nname: alpha\ndescription: Alpha description\n---\n# Alpha\n",
-        {
-            "actions": {
-                "run": {
-                    "args_schema": {"type": "object", "additionalProperties": False},
-                    "invoke": ["python3", "-c", "print('ok')"],
-                }
-            }
-        },
+        "beta-dir",
+        name="beta",
+        description="Beta description",
+        body="# Beta\n\nBeta body.",
     )
-    (tmp_path / "missing-schema").mkdir()
-    (tmp_path / "missing-schema" / "SKILL.md").write_text("# Missing schema", encoding="utf-8")
+    (tmp_path / "missing-skill-md").mkdir()
 
     skills = Skills(str(tmp_path))
-    assert skills.index() == [{"name": "alpha", "description": "Alpha description"}]
-    assert "Alpha" in skills.get_doc("alpha")
+    assert skills.index() == [
+        {"name": "alpha", "description": "Alpha description"},
+        {"name": "beta", "description": "Beta description"},
+    ]
+
+    alpha_doc = skills.get_doc("alpha")
+    assert alpha_doc["skill_md"].startswith("# Alpha")
+    assert alpha_doc["files"] == ["references/guide.md"]
 
     _write_skill(
         tmp_path,
-        "beta",
-        "# Beta\n",
-        {
-            "actions": {
-                "run": {
-                    "args_schema": {"type": "object", "additionalProperties": False},
-                    "invoke": ["python3", "-c", "print('beta')"],
-                }
-            }
-        },
+        "gamma-dir",
+        name="gamma",
+        description="Gamma description",
+        body="# Gamma\n\nGamma body.",
     )
     updated = Skills(str(tmp_path))
-    assert [entry["name"] for entry in updated.index()] == ["alpha", "beta"]
+    assert [entry["name"] for entry in updated.index()] == ["alpha", "beta", "gamma"]
 
-    shutil.rmtree(tmp_path / "alpha")
+    shutil.rmtree(tmp_path / "alpha-dir")
     removed = Skills(str(tmp_path))
-    assert removed.index() == [{"name": "beta", "description": "Beta"}]
+    assert [entry["name"] for entry in removed.index()] == ["beta", "gamma"]
 
 
-def test_execute_validates_args_and_captures_stdout_stderr(tmp_path: Path) -> None:
-    skills = Skills(
-        str(
-            _write_skill(
-                tmp_path,
-                "echo",
-                "# Echo\n",
-                {
-                    "actions": {
-                        "run": {
-                            "args_schema": {
-                                "type": "object",
-                                "properties": {"text": {"type": "string"}},
-                                "required": ["text"],
-                                "additionalProperties": False,
-                            },
-                            "invoke": [
-                                "python3",
-                                "-c",
-                                "import sys; print(sys.argv[1]); print('err', file=sys.stderr)",
-                                "{text}",
-                            ],
-                        }
-                    }
-                },
-            ).parent
-        )
+def test_skills_skips_missing_or_invalid_frontmatter(tmp_path: Path) -> None:
+    valid = _write_skill(
+        tmp_path,
+        "valid-skill",
+        name="valid",
+        description="Valid description",
+        body="Valid body.",
+    )
+    del valid
+
+    no_frontmatter_dir = tmp_path / "no-frontmatter"
+    no_frontmatter_dir.mkdir()
+    (no_frontmatter_dir / "SKILL.md").write_text("# no frontmatter\n", encoding="utf-8")
+
+    malformed_yaml_dir = tmp_path / "bad-yaml"
+    malformed_yaml_dir.mkdir()
+    (malformed_yaml_dir / "SKILL.md").write_text(
+        "---\nname: [unterminated\ndescription: bad\n---\nBody\n",
+        encoding="utf-8",
     )
 
-    result = skills.execute({"skill": "echo", "action": "run", "args": {"text": "hello"}})
-    assert result.exit_code == 0
-    assert result.stdout == "hello\n"
-    assert result.stderr == "err\n"
-
-    with pytest.raises(SkillsError, match="Invalid args"):
-        skills.execute({"skill": "echo", "action": "run", "args": {}})
-
-
-def test_execute_truncates_long_output(tmp_path: Path) -> None:
-    skills = Skills(
-        str(
-            _write_skill(
-                tmp_path,
-                "long-output",
-                "# Long output\n",
-                {
-                    "actions": {
-                        "run": {
-                            "args_schema": {"type": "object", "additionalProperties": False},
-                            "invoke": [
-                                "python3",
-                                "-c",
-                                (
-                                    "import sys; "
-                                    "sys.stdout.write('a' * 9001); "
-                                    "sys.stderr.write('b' * 9002)"
-                                ),
-                            ],
-                        }
-                    }
-                },
-            ).parent
-        )
+    missing_name_dir = tmp_path / "missing-name"
+    missing_name_dir.mkdir()
+    (missing_name_dir / "SKILL.md").write_text(
+        "---\ndescription: missing name\n---\nBody\n",
+        encoding="utf-8",
     )
 
-    result = skills.execute({"skill": "long-output", "action": "run", "args": {}})
-    assert result.exit_code == 0
-
-    assert result.stdout.startswith("a" * 4000)
-    assert result.stdout.endswith("a" * 4000)
-    assert "...[truncated " in result.stdout
-
-    assert result.stderr.startswith("b" * 4000)
-    assert result.stderr.endswith("b" * 4000)
-    assert "...[truncated " in result.stderr
-
-
-def test_execute_returns_timeout_result(tmp_path: Path) -> None:
-    skills = Skills(
-        str(
-            _write_skill(
-                tmp_path,
-                "slow",
-                "# Slow\n",
-                {
-                    "actions": {
-                        "run": {
-                            "args_schema": {"type": "object", "additionalProperties": False},
-                            "invoke": ["python3", "-c", "import time; time.sleep(1.0)"],
-                            "timeout_seconds": 0.05,
-                        }
-                    }
-                },
-            ).parent
-        )
+    missing_description_dir = tmp_path / "missing-description"
+    missing_description_dir.mkdir()
+    (missing_description_dir / "SKILL.md").write_text(
+        "---\nname: missing-description\n---\nBody\n",
+        encoding="utf-8",
     )
 
-    result = skills.execute({"skill": "slow", "action": "run", "args": {}})
-    assert result.exit_code == 124
-    assert "timed out" in result.stderr
+    skills = Skills(str(tmp_path))
+    assert skills.index() == [{"name": "valid", "description": "Valid description"}]
 
 
-def test_execute_applies_schema_defaults_before_validation_and_invoke(tmp_path: Path) -> None:
-    skills = Skills(
-        str(
-            _write_skill(
-                tmp_path,
-                "defaults",
-                "# Defaults\n",
-                {
-                    "actions": {
-                        "run": {
-                            "args_schema": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "prefix": {"type": "string", "default": "hello"},
-                                },
-                                "required": ["name"],
-                                "additionalProperties": False,
-                            },
-                            "invoke": [
-                                "python3",
-                                "-c",
-                                "import sys; print(sys.argv[1] + ' ' + sys.argv[2])",
-                                "{prefix}",
-                                "{name}",
-                            ],
-                        }
-                    }
-                },
-            ).parent
-        )
+def test_skills_manifest_uses_standard_subdirectories_only(tmp_path: Path) -> None:
+    skill_dir = _write_skill(
+        tmp_path,
+        "skill",
+        name="api-integration",
+        description="API integration skill",
+        body="Body.",
     )
 
-    result = skills.execute({"skill": "defaults", "action": "run", "args": {"name": "world"}})
-    assert result.exit_code == 0
-    assert result.stdout == "hello world\n"
+    (skill_dir / "references").mkdir()
+    (skill_dir / "references" / "guide.md").write_text("guide", encoding="utf-8")
+    (skill_dir / "scripts").mkdir()
+    (skill_dir / "scripts" / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (skill_dir / "assets").mkdir()
+    (skill_dir / "assets" / "template.txt").write_text("x", encoding="utf-8")
+    (skill_dir / "notes").mkdir()
+    (skill_dir / "notes" / "ignored.txt").write_text("ignore me", encoding="utf-8")
+
+    skills = Skills(str(tmp_path))
+    bundle = skills.get_doc("api-integration")
+    assert bundle["files"] == [
+        "assets/template.txt",
+        "references/guide.md",
+        "scripts/run.sh",
+    ]
+
+
+def test_read_file_returns_content_and_truncates(tmp_path: Path) -> None:
+    skill_dir = _write_skill(
+        tmp_path,
+        "skill",
+        name="reader",
+        description="Read files",
+        body="Body.",
+    )
+    (skill_dir / "references").mkdir()
+    content_path = skill_dir / "references" / "data.txt"
+    content_path.write_text("abcdef", encoding="utf-8")
+
+    skills = Skills(str(tmp_path), max_file_chars=4)
+    assert skills.read_file("reader", "references/data.txt") == "abcd\n\n[... truncated, original 6 chars ...]"
+
+
+def test_read_file_rejects_traversal_absolute_and_missing_paths(tmp_path: Path) -> None:
+    skill_dir = _write_skill(
+        tmp_path,
+        "skill",
+        name="reader",
+        description="Read files",
+        body="Body.",
+    )
+    (skill_dir / "references").mkdir()
+    (skill_dir / "references" / "ok.txt").write_text("ok", encoding="utf-8")
+
+    skills = Skills(str(tmp_path))
+
+    with pytest.raises(SkillsError, match="path traversal"):
+        skills.read_file("reader", "../outside.txt")
+
+    with pytest.raises(SkillsError, match="must be relative"):
+        skills.read_file("reader", str((tmp_path / "absolute.txt").resolve()))
+
+    with pytest.raises(SkillsError, match="not found"):
+        skills.read_file("reader", "references/missing.txt")
+
+
+def test_read_file_rejects_symlink_escape(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlink not supported on this platform")
+
+    skill_dir = _write_skill(
+        tmp_path,
+        "skill",
+        name="reader",
+        description="Read files",
+        body="Body.",
+    )
+    (skill_dir / "references").mkdir()
+
+    external = tmp_path / "external.txt"
+    external.write_text("secret", encoding="utf-8")
+    link = skill_dir / "references" / "outside.txt"
+    link.symlink_to(external)
+
+    skills = Skills(str(tmp_path))
+    with pytest.raises(SkillsError, match="must stay within skill directory"):
+        skills.read_file("reader", "references/outside.txt")
+
+
+def test_read_file_reports_utf8_decode_errors(tmp_path: Path) -> None:
+    skill_dir = _write_skill(
+        tmp_path,
+        "skill",
+        name="reader",
+        description="Read files",
+        body="Body.",
+    )
+    (skill_dir / "assets").mkdir()
+    binary_file = skill_dir / "assets" / "blob.bin"
+    binary_file.write_bytes(b"\xff\xfe\x00")
+
+    skills = Skills(str(tmp_path))
+    with pytest.raises(SkillsError, match="UTF-8 decodable"):
+        skills.read_file("reader", "assets/blob.bin")
+
+
+def test_skills_has_no_execute_api(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        "skill",
+        name="alpha",
+        description="Alpha description",
+        body="Alpha body",
+    )
+    skills = Skills(str(tmp_path))
+    assert not hasattr(skills, "execute")

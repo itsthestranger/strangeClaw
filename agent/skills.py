@@ -1,418 +1,195 @@
-"""Skill discovery and execution."""
+"""Agent Skills discovery and progressive-disclosure file access."""
 
 from __future__ import annotations
 
-import json
-import shlex
-import subprocess
-from copy import deepcopy
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import jsonschema  # type: ignore[import-untyped]
 import yaml
 
-
-@dataclass(slots=True)
-class ToolResult:
-    """Result returned by a skill invocation."""
-
-    exit_code: int
-    stdout: str
-    stderr: str
+LOGGER = logging.getLogger(__name__)
 
 
 class SkillsError(RuntimeError):
-    """Raised when skill discovery or execution fails."""
-
-
-@dataclass(slots=True)
-class SkillAction:
-    """Runtime metadata for one action."""
-
-    args_schema: dict[str, Any]
-    invoke: list[str]
-    timeout_seconds: float
+    """Raised when skill discovery or access fails."""
 
 
 @dataclass(slots=True)
 class SkillDefinition:
-    """Runtime metadata for one skill."""
+    """Discovered Agent Skill metadata and resources."""
 
     name: str
     description: str
-    doc: str
+    body: str
     path: Path
-    actions: dict[str, SkillAction]
+    files: list[str]
 
 
 class Skills:
-    """Skill loader/executor."""
+    """Context-only Agent Skills loader."""
 
-    def __init__(
-        self,
-        skills_dir: str,
-        default_timeout_seconds: float = 60.0,
-        max_file_chars: int = 20000,
-    ) -> None:
-        """Initialize skill discovery."""
+    def __init__(self, skills_dir: str, max_file_chars: int = 20000) -> None:
         root = Path(skills_dir).expanduser()
         if not root.is_dir():
             raise SkillsError(f"Skills directory does not exist: {root}")
-        if default_timeout_seconds <= 0:
-            raise SkillsError("default_timeout_seconds must be greater than zero.")
         if max_file_chars <= 0:
             raise SkillsError("max_file_chars must be greater than zero.")
 
         self._skills_dir = root
-        self._default_timeout_seconds = default_timeout_seconds
         self._max_file_chars = max_file_chars
         self._skills = self._discover(root)
 
     def index(self) -> list[dict[str, str]]:
-        """Return a one-line index for all skills."""
-        items: list[dict[str, str]] = []
-        for skill_name in sorted(self._skills):
-            definition = self._skills[skill_name]
-            items.append({"name": definition.name, "description": definition.description})
-        return items
+        """Stage 1 — discovery: return name/description for each skill."""
+        return [
+            {
+                "name": definition.name,
+                "description": definition.description,
+            }
+            for _, definition in sorted(self._skills.items())
+        ]
 
-    def get_doc(self, skill_name: str) -> str:
-        """Return full SKILL.md content for one skill."""
-        definition = self._skills.get(skill_name)
-        if definition is None:
-            raise SkillsError(f"Unknown skill: {skill_name}")
-        return definition.doc
-
-    def get_doc_bundle(self, skill_name: str) -> dict[str, Any]:
-        """Return full SKILL.md content and bundled file manifest for one skill."""
+    def get_doc(self, skill_name: str) -> dict[str, Any]:
+        """Stage 2 — activation: return body-only SKILL.md and file manifest."""
         definition = self._skills.get(skill_name)
         if definition is None:
             raise SkillsError(f"Unknown skill: {skill_name}")
         return {
-            "skill_md": definition.doc,
-            "files": _skill_file_manifest(definition.path),
+            "skill_md": definition.body,
+            "files": list(definition.files),
         }
 
     def read_file(self, skill_name: str, relative_path: str) -> str:
-        """Read one skill file with traversal protection and truncation."""
+        """Stage 3 — execution-time file read with traversal protection."""
         definition = self._skills.get(skill_name)
         if definition is None:
             raise SkillsError(f"Unknown skill: {skill_name}")
         if not isinstance(relative_path, str) or not relative_path.strip():
             raise SkillsError("relative_path must be a non-empty string.")
 
-        requested_path = Path(relative_path.strip())
-        if requested_path.is_absolute():
+        requested = Path(relative_path.strip())
+        if requested.is_absolute():
             raise SkillsError("read_file path must be relative.")
-        if ".." in requested_path.parts:
+        if ".." in requested.parts:
             raise SkillsError("read_file path traversal is not allowed.")
 
         skill_root = definition.path.resolve()
-        target = (definition.path / requested_path).resolve()
-        if skill_root != target and skill_root not in target.parents:
+        target = (definition.path / requested).resolve()
+        if not _is_within(skill_root, target):
             raise SkillsError("read_file target must stay within skill directory.")
         if not target.is_file():
             raise SkillsError(f"Skill file not found: {relative_path}")
-        if target.is_symlink():
-            symlink_target = target.resolve()
-            if skill_root != symlink_target and skill_root not in symlink_target.parents:
-                raise SkillsError("read_file symlink target escapes skill directory.")
 
         try:
-            text = target.read_text(encoding="utf-8")
+            content = target.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise SkillsError(f"Skill file is not UTF-8 decodable: {relative_path}") from exc
 
-        if len(text) <= self._max_file_chars:
-            return text
+        if len(content) <= self._max_file_chars:
+            return content
         return (
-            f"{text[:self._max_file_chars]}\n\n"
-            f"[... truncated, original {len(text)} chars ...]"
-        )
-
-    def contracts(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Return per-skill action schemas for execution-time prompting."""
-        contracts: dict[str, dict[str, dict[str, Any]]] = {}
-        for skill_name in sorted(self._skills):
-            definition = self._skills[skill_name]
-            actions: dict[str, dict[str, Any]] = {}
-            for action_name in sorted(definition.actions):
-                action = definition.actions[action_name]
-                actions[action_name] = {"args_schema": deepcopy(action.args_schema)}
-            contracts[skill_name] = actions
-        return contracts
-
-    def execute(self, tool_call: dict[str, Any]) -> ToolResult:
-        """Validate and execute one tool call."""
-        skill_name, action_name, args = _normalize_tool_call(tool_call)
-
-        definition = self._skills.get(skill_name)
-        if definition is None:
-            raise SkillsError(f"Unknown skill: {skill_name}")
-
-        action = definition.actions.get(action_name)
-        if action is None:
-            raise SkillsError(f"Unknown action '{action_name}' for skill '{skill_name}'")
-
-        args_with_defaults = _apply_schema_defaults(action.args_schema, args)
-        try:
-            jsonschema.validate(instance=args_with_defaults, schema=action.args_schema)
-        except jsonschema.ValidationError as exc:
-            raise SkillsError(
-                f"Invalid args for {skill_name}.{action_name}: {exc.message}"
-            ) from exc
-
-        command = _render_invoke(action.invoke, args_with_defaults)
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=definition.path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=action.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            timeout_message = f"Command timed out after {action.timeout_seconds:.1f}s."
-            stderr = f"{stderr}\n{timeout_message}" if stderr else timeout_message
-            return ToolResult(
-                exit_code=124,
-                stdout=_truncate_output(stdout),
-                stderr=_truncate_output(stderr),
-            )
-        except OSError as exc:
-            command_text = shlex.join(command)
-            raise SkillsError(
-                f"Failed to execute invoke command for {skill_name}.{action_name}: "
-                f"{command_text}: {exc}"
-            ) from exc
-
-        return ToolResult(
-            exit_code=completed.returncode,
-            stdout=_truncate_output(completed.stdout),
-            stderr=_truncate_output(completed.stderr),
+            f"{content[:self._max_file_chars]}\n\n"
+            f"[... truncated, original {len(content)} chars ...]"
         )
 
     def _discover(self, skills_dir: Path) -> dict[str, SkillDefinition]:
         discovered: dict[str, SkillDefinition] = {}
         for skill_dir in sorted(path for path in skills_dir.iterdir() if path.is_dir()):
             skill_doc_path = skill_dir / "SKILL.md"
-            skill_schema_path = skill_dir / "schema.json"
-            if not skill_doc_path.is_file() or not skill_schema_path.is_file():
+            if not skill_doc_path.is_file():
                 continue
 
-            doc_text = skill_doc_path.read_text(encoding="utf-8")
-            description = _extract_description(doc_text, fallback=skill_dir.name)
-
-            schema_payload: Any
             try:
-                schema_payload = json.loads(skill_schema_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise SkillsError(f"Invalid JSON in {skill_schema_path}: {exc}") from exc
-            if not isinstance(schema_payload, dict):
-                raise SkillsError(f"Skill schema must be an object: {skill_schema_path}")
+                metadata, body = _parse_skill_markdown(skill_doc_path)
+                name = _required_non_empty_string(metadata, "name", skill_doc_path)
+                description = _required_non_empty_string(metadata, "description", skill_doc_path)
+                files = _skill_file_manifest(skill_dir)
+            except SkillsError as exc:
+                LOGGER.warning("Skipping skill '%s': %s", skill_dir.name, exc)
+                continue
 
-            actions = _parse_actions(
-                schema_payload,
-                skill_name=skill_dir.name,
-                default_timeout_seconds=self._default_timeout_seconds,
-            )
-            discovered[skill_dir.name] = SkillDefinition(
-                name=skill_dir.name,
+            if name in discovered:
+                LOGGER.warning(
+                    "Skipping skill '%s': duplicate skill name '%s' already loaded.",
+                    skill_dir.name,
+                    name,
+                )
+                continue
+
+            discovered[name] = SkillDefinition(
+                name=name,
                 description=description,
-                doc=doc_text,
+                body=body,
                 path=skill_dir,
-                actions=actions,
+                files=files,
             )
         return discovered
 
 
-def _normalize_tool_call(tool_call: Any) -> tuple[str, str, dict[str, Any]]:
-    if isinstance(tool_call, dict):
-        raw_skill = tool_call.get("skill")
-        raw_action = tool_call.get("action")
-        raw_args = tool_call.get("args")
-    else:
-        raw_tool = getattr(tool_call, "tool", None)
-        if isinstance(raw_tool, str) and "." in raw_tool:
-            raw_skill, raw_action = raw_tool.split(".", 1)
-        else:
-            raw_skill = getattr(tool_call, "skill", None)
-            raw_action = getattr(tool_call, "action", None)
-        raw_args = getattr(tool_call, "args", None)
+def _parse_skill_markdown(path: Path) -> tuple[dict[str, Any], str]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
 
-    if not isinstance(raw_skill, str) or not raw_skill:
-        raise SkillsError("tool_call must include a non-empty skill segment.")
-    if not isinstance(raw_action, str) or not raw_action:
-        raise SkillsError("tool_call must include a non-empty action segment.")
-    if not isinstance(raw_args, dict):
-        raise SkillsError("tool_call.args must be an object.")
-    return raw_skill, raw_action, raw_args
-
-
-def _parse_actions(
-    schema_payload: dict[str, Any],
-    *,
-    skill_name: str,
-    default_timeout_seconds: float,
-) -> dict[str, SkillAction]:
-    raw_actions = schema_payload.get("actions")
-    if not isinstance(raw_actions, dict) or not raw_actions:
+    if not lines or lines[0].strip() != "---":
         raise SkillsError(
-            f"Skill schema for '{skill_name}' must contain a non-empty 'actions' object."
+            f"Skill frontmatter is required and must start with '---': {path}"
         )
 
-    actions: dict[str, SkillAction] = {}
-    for action_name, action_payload in raw_actions.items():
-        if not isinstance(action_name, str) or not action_name:
-            raise SkillsError(f"Skill '{skill_name}' has an invalid action name.")
-        if not isinstance(action_payload, dict):
-            raise SkillsError(f"Action '{skill_name}.{action_name}' must be an object.")
-
-        args_schema = action_payload.get("args_schema", action_payload.get("schema"))
-        if not isinstance(args_schema, dict):
-            raise SkillsError(
-                f"Action '{skill_name}.{action_name}' must define an object args_schema/schema."
-            )
-        try:
-            jsonschema.Draft202012Validator.check_schema(args_schema)
-        except jsonschema.SchemaError as exc:
-            raise SkillsError(
-                f"Invalid schema for action '{skill_name}.{action_name}': {exc}"
-            ) from exc
-
-        invoke = _normalize_invoke(action_payload.get("invoke"), skill_name, action_name)
-        timeout_raw = action_payload.get("timeout_seconds", default_timeout_seconds)
-        if not isinstance(timeout_raw, int | float) or timeout_raw <= 0:
-            raise SkillsError(
-                f"Action '{skill_name}.{action_name}' timeout_seconds must be a positive number."
-            )
-
-        actions[action_name] = SkillAction(
-            args_schema=args_schema,
-            invoke=invoke,
-            timeout_seconds=float(timeout_raw),
-        )
-
-    return actions
-
-
-def _normalize_invoke(invoke_raw: Any, skill_name: str, action_name: str) -> list[str]:
-    if isinstance(invoke_raw, str):
-        command = shlex.split(invoke_raw)
-    elif isinstance(invoke_raw, list):
-        if not all(isinstance(item, str) for item in invoke_raw):
-            raise SkillsError(
-                f"Action '{skill_name}.{action_name}' invoke list must contain only strings."
-            )
-        command = invoke_raw
-    else:
-        raise SkillsError(f"Action '{skill_name}.{action_name}' must define an invoke command.")
-
-    if not command:
-        raise SkillsError(f"Action '{skill_name}.{action_name}' invoke command cannot be empty.")
-    return command
-
-
-def _render_invoke(invoke: list[str], args: dict[str, Any]) -> list[str]:
-    substitutions = {key: _format_arg_value(value) for key, value in args.items()}
-    rendered: list[str] = []
-    for segment in invoke:
-        try:
-            rendered.append(segment.format_map(substitutions))
-        except KeyError as exc:
-            missing_key = str(exc).strip("'")
-            raise SkillsError(
-                f"Missing argument '{missing_key}' required by invoke command."
-            ) from exc
-    return rendered
-
-
-def _format_arg_value(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int | float):
-        return str(value)
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
-
-
-def _extract_description(doc_text: str, *, fallback: str) -> str:
-    lines = doc_text.splitlines()
-    if lines and lines[0].strip() == "---":
-        for idx in range(1, len(lines)):
-            if lines[idx].strip() != "---":
-                continue
-            frontmatter = "\n".join(lines[1:idx])
-            parsed = yaml.safe_load(frontmatter)
-            if isinstance(parsed, dict):
-                description = parsed.get("description")
-                if isinstance(description, str) and description.strip():
-                    return description.strip()
+    end_index: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end_index = idx
             break
+    if end_index is None:
+        raise SkillsError(f"Unterminated skill frontmatter in {path}")
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            line = line.lstrip("#").strip()
-        if line:
-            return line
-    return fallback
+    frontmatter_text = "\n".join(lines[1:end_index])
+    body = "\n".join(lines[end_index + 1 :])
+    if text.endswith("\n"):
+        body = f"{body}\n" if body else ""
+
+    try:
+        parsed = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError as exc:
+        raise SkillsError(f"Invalid YAML frontmatter in {path}: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise SkillsError(f"Skill frontmatter must be a YAML mapping in {path}")
+    return parsed, body
+
+
+def _required_non_empty_string(metadata: dict[str, Any], key: str, path: Path) -> str:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SkillsError(f"Skill frontmatter missing required '{key}' in {path}")
+    return value.strip()
 
 
 def _skill_file_manifest(skill_root: Path) -> list[str]:
     resolved_root = skill_root.resolve()
     manifest: list[str] = []
+
     for dirname in ("scripts", "references", "assets"):
         subdir = skill_root / dirname
         if not subdir.is_dir():
             continue
-        for path in sorted(subdir.rglob("*")):
-            if not path.is_file():
+
+        for entry in sorted(subdir.rglob("*")):
+            if not entry.is_file():
                 continue
-            resolved_path = path.resolve()
-            if resolved_root != resolved_path and resolved_root not in resolved_path.parents:
+            resolved = entry.resolve()
+            if not _is_within(resolved_root, resolved):
+                LOGGER.warning(
+                    "Skipping manifest file outside skill directory: %s",
+                    entry,
+                )
                 continue
-            manifest.append(resolved_path.relative_to(resolved_root).as_posix())
-    return manifest
+            manifest.append(resolved.relative_to(resolved_root).as_posix())
+
+    return sorted(manifest)
 
 
-def _truncate_output(text: str, *, chunk_size: int = 4000) -> str:
-    if len(text) <= chunk_size * 2:
-        return text
-
-    omitted_chars = len(text) - (chunk_size * 2)
-    return (
-        f"{text[:chunk_size]}\n"
-        f"...[truncated {omitted_chars} chars]...\n"
-        f"{text[-chunk_size:]}"
-    )
-
-
-def _apply_schema_defaults(schema: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = deepcopy(args)
-    if schema.get("type") != "object":
-        return result
-
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        return result
-
-    for key, prop_schema in properties.items():
-        if not isinstance(prop_schema, dict):
-            continue
-        if key not in result and "default" in prop_schema:
-            result[key] = deepcopy(prop_schema["default"])
-            continue
-
-        current = result.get(key)
-        if isinstance(current, dict):
-            result[key] = _apply_schema_defaults(prop_schema, current)
-    return result
+def _is_within(root: Path, path: Path) -> bool:
+    return path == root or root in path.parents
