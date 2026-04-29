@@ -140,7 +140,7 @@ LM Studio loopback gotcha:
   replan up to 3 times, then fail fast instead of looping indefinitely (may
   become configurable later).
 - Provider-agnostic LLM layer via LiteLLM (`anthropic`, `openai`, `lm_studio`, `ollama`, and others).
-- Pluggable skills loaded from `skills/<name>/` via `SKILL.md` + `schema.json`.
+- Pluggable skills loaded from `skills/<name>/` via `SKILL.md` frontmatter + optional bundled files.
 - Two execution modes:
   - `yolo`: direct host execution for trusted workflows.
   - `fire`: Firecracker microVM isolation.

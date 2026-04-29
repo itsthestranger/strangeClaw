@@ -474,7 +474,7 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
     scripted_llm = ScriptedLLM(
         responses=[
             LLMResponse(
-                text='{"goal":"g","steps":["read"],"referenced_skills":["shell"]}',
+                text='{"goal":"g","steps":["read"],"referenced_skills":[]}',
                 action=None,
                 usage=None,
             ),
@@ -517,8 +517,8 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
         and event.get("tool") == "__agent__.read_skill_file"
     ]
     assert read_events
-    assert read_events[0]["result"]["exit_code"] == 0
-    assert "shell" in read_events[0]["result"]["stdout"].lower()
+    assert read_events[0]["result"]["exit_code"] == 1
+    assert "unknown skill" in read_events[0]["result"]["stderr"].lower()
 
 
 def test_agent_replans_when_plan_references_unknown_skill() -> None:

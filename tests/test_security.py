@@ -48,10 +48,10 @@ def test_session_id_sanitization_rejects_invalid_characters() -> None:
         session.create("abc_def")
 
 
-def test_read_file_rejects_path_traversal() -> None:
+def test_read_file_unknown_skill_raises() -> None:
     skills = Skills(str(_skills_root()))
 
-    with pytest.raises(SkillsError, match="path traversal"):
+    with pytest.raises(SkillsError, match="Unknown skill"):
         skills.read_file("shell", "../outside.txt")
 
 
