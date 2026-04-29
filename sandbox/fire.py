@@ -159,7 +159,7 @@ class FirePrebootConfig:
     vsock_uds_path: Path
     log_path: Path
     network: dict[str, Any]
-    llm: dict[str, Any]
+    agent_config: dict[str, Any]
 
 
 class _HTTPResponseLike(Protocol):
@@ -915,7 +915,7 @@ def configure_microvm_preboot(
             "/mmds",
             {
                 "network": preboot.network,
-                "llm": preboot.llm,
+                "config": preboot.agent_config,
             },
         ),
         (
@@ -936,7 +936,8 @@ class FireSandbox:
         self,
         *,
         firecracker_config: FirecrackerConfig,
-        llm_config: Mapping[str, Any],
+        llm_config: Mapping[str, Any] | None = None,
+        agent_config: Mapping[str, Any] | None = None,
         tap_manager: TapManagerLike | None = None,
         iptables_manager: FirewallManagerLike | None = None,
         cid_manager: CidManagerLike | None = None,
@@ -950,8 +951,10 @@ class FireSandbox:
         install_exit_handlers: bool = True,
     ) -> None:
         self._firecracker_config = firecracker_config
-        self._llm_config = dict(llm_config)
-        _validate_llm_payload(self._llm_config)
+        self._agent_config_template = _coerce_agent_config_template(
+            llm_config=llm_config,
+            agent_config=agent_config,
+        )
 
         self._command_runner = command_runner or _default_command_runner
         self._tap_manager = tap_manager or TapDeviceManager(
@@ -1011,7 +1014,6 @@ class FireSandbox:
 
         session_id = sanitize_session_id(str(task.get("session_id", "")))
         self._session_id = session_id
-        llm_payload = self._resolve_llm_payload(task)
         task_event = dict(task)
         task_event.pop("llm", None)
         host_expose_ports = self._host_expose_ports()
@@ -1036,8 +1038,8 @@ class FireSandbox:
             self._guest_cid = self._cid_manager.allocate()
             self._launch_firecracker()
             self._wait_for_api_socket(timeout_seconds=_DEFAULT_API_SOCKET_WAIT_SECONDS)
-            fire_llm_payload = self._prepare_llm_payload_for_fire(llm_payload)
-            self._configure_microvm(llm_payload=fire_llm_payload)
+            fire_agent_config_payload = self._prepare_agent_config_for_fire()
+            self._configure_microvm(agent_config_payload=fire_agent_config_payload)
             self._vsock_conn = self._connect_vsock_with_retry(
                 timeout_seconds=self._firecracker_config.boot_timeout
             )
@@ -1154,25 +1156,18 @@ class FireSandbox:
         except Exception:
             return
 
-    def _resolve_llm_payload(self, task: Mapping[str, Any]) -> dict[str, Any]:
-        from_task = task.get("llm")
-        if isinstance(from_task, Mapping):
-            candidate = dict(from_task)
-            _validate_llm_payload(candidate)
-            return candidate
-        return dict(self._llm_config)
-
     def _host_expose_ports(self) -> tuple[int, ...]:
         if not self._firecracker_config.host_expose_enabled:
             return ()
         return self._firecracker_config.host_expose_ports
 
-    def _prepare_llm_payload_for_fire(self, llm_payload: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_agent_config_for_fire(self) -> dict[str, Any]:
         if self._allocation is None:
             raise RuntimeError("TAP allocation was not initialized.")
 
-        payload = dict(llm_payload)
-        api_base = _extract_llm_api_base(payload)
+        payload = _sanitize_agent_config_for_mmds(self._agent_config_template)
+        llm_payload = payload["llm"]
+        api_base = _extract_llm_api_base(llm_payload)
         if api_base is None or not _is_localhost_api_base(api_base):
             return payload
 
@@ -1187,15 +1182,15 @@ class FireSandbox:
             return payload
 
         rewritten = _rewrite_api_base_host(api_base, self._allocation.tap_ip)
-        payload["api_base"] = rewritten
+        llm_payload["api_base"] = rewritten
 
-        provider_settings = payload.get("provider_settings")
+        provider_settings = llm_payload.get("provider_settings")
         if provider_settings is None:
-            payload["provider_settings"] = {"api_base": rewritten}
+            llm_payload["provider_settings"] = {"api_base": rewritten}
         elif isinstance(provider_settings, Mapping):
             provider_copy = dict(provider_settings)
             provider_copy["api_base"] = rewritten
-            payload["provider_settings"] = provider_copy
+            llm_payload["provider_settings"] = provider_copy
         return payload
 
     def _prepare_runtime_paths(self, *, session_id: str) -> None:
@@ -1248,7 +1243,7 @@ class FireSandbox:
             f"Timed out waiting for Firecracker API socket: {self._api_socket_path}"
         )
 
-    def _configure_microvm(self, *, llm_payload: dict[str, Any]) -> None:
+    def _configure_microvm(self, *, agent_config_payload: dict[str, Any]) -> None:
         if self._api_socket_path is None:
             raise RuntimeError("API socket path was not initialized.")
         if self._rootfs_copy_path is None:
@@ -1276,7 +1271,7 @@ class FireSandbox:
                 "netmask": self._allocation.netmask,
                 "dns": list(_DEFAULT_FIRE_DNS),
             },
-            llm=llm_payload,
+            agent_config=agent_config_payload,
         )
         configure_microvm_preboot(
             api_client=api_client,
@@ -1655,7 +1650,7 @@ def _validate_preboot_config(preboot: FirePrebootConfig) -> None:
     if not str(preboot.log_path):
         raise FirecrackerConfigError("log_path must be non-empty.")
     _validate_network_payload(preboot.network)
-    _validate_llm_payload(preboot.llm)
+    _validate_agent_config_payload(preboot.agent_config)
 
 
 def _validate_network_payload(network: Mapping[str, Any]) -> None:
@@ -1697,6 +1692,168 @@ def _validate_llm_payload(llm: Mapping[str, Any]) -> None:
     provider_settings = llm.get("provider_settings")
     if provider_settings is not None and not isinstance(provider_settings, Mapping):
         raise FirecrackerConfigError("llm.provider_settings must be an object when provided.")
+
+
+def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
+    llm = payload.get("llm")
+    if not isinstance(llm, Mapping):
+        raise FirecrackerConfigError("config.llm must be an object.")
+    _validate_llm_payload(llm)
+
+    tools = payload.get("tools")
+    if tools is not None and not isinstance(tools, Mapping):
+        raise FirecrackerConfigError("config.tools must be an object when provided.")
+    web_search = payload.get("web_search")
+    if web_search is not None and not isinstance(web_search, Mapping):
+        raise FirecrackerConfigError("config.web_search must be an object when provided.")
+    web_fetch = payload.get("web_fetch")
+    if web_fetch is not None and not isinstance(web_fetch, Mapping):
+        raise FirecrackerConfigError("config.web_fetch must be an object when provided.")
+    skills = payload.get("skills")
+    if skills is not None and not isinstance(skills, Mapping):
+        raise FirecrackerConfigError("config.skills must be an object when provided.")
+    context = payload.get("context")
+    if context is not None and not isinstance(context, Mapping):
+        raise FirecrackerConfigError("config.context must be an object when provided.")
+
+    approval_mode = payload.get("approval_mode")
+    if approval_mode is not None and not isinstance(approval_mode, str):
+        raise FirecrackerConfigError("config.approval_mode must be a string when provided.")
+
+    max_iterations = payload.get("max_iterations")
+    if max_iterations is not None:
+        if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+            raise FirecrackerConfigError("config.max_iterations must be an integer when provided.")
+        if max_iterations <= 0:
+            raise FirecrackerConfigError("config.max_iterations must be greater than zero.")
+
+
+def _coerce_agent_config_template(
+    *,
+    llm_config: Mapping[str, Any] | None,
+    agent_config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if agent_config is not None:
+        candidate = _sanitize_agent_config_for_mmds(dict(agent_config))
+        _validate_agent_config_payload(candidate)
+        return candidate
+
+    if llm_config is not None:
+        llm_candidate = dict(llm_config)
+        _validate_llm_payload(llm_candidate)
+        return {
+            "llm": llm_candidate,
+            "tools": {
+                "shell": True,
+                "web_search": True,
+                "web_fetch": True,
+                "http_request": True,
+            },
+            "web_search": {
+                "endpoint": "https://api.search.brave.com/res/v1/web/search",
+                "format": "brave",
+                "api_key": "",
+                "max_results": 10,
+            },
+            "web_fetch": {"max_chars": 20000},
+            "skills": {"directory": "./skills", "max_file_chars": 20000},
+            "approval_mode": "review",
+            "max_iterations": 50,
+            "context": {
+                "token_budget": 4000,
+                "summary_threshold": 10,
+                "max_output_chars": 8000,
+            },
+        }
+
+    raise FirecrackerConfigError("FireSandbox requires either agent_config or llm_config.")
+
+
+def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]:
+    llm_raw = config.get("llm")
+    if not isinstance(llm_raw, Mapping):
+        raise FirecrackerConfigError("Config must contain llm mapping for Fire mode.")
+    llm: dict[str, Any] = dict(llm_raw)
+    _validate_llm_payload(llm)
+
+    tools_raw = config.get("tools")
+    if isinstance(tools_raw, Mapping):
+        tools = {
+            name: bool(tools_raw.get(name, True))
+            for name in ("shell", "web_search", "web_fetch", "http_request")
+        }
+    else:
+        tools = {
+            "shell": True,
+            "web_search": True,
+            "web_fetch": True,
+            "http_request": True,
+        }
+
+    web_search_raw = config.get("web_search")
+    web_search: dict[str, Any]
+    if isinstance(web_search_raw, Mapping):
+        web_search = dict(web_search_raw)
+    else:
+        web_search = {}
+    web_search.setdefault("endpoint", "https://api.search.brave.com/res/v1/web/search")
+    web_search.setdefault("format", "brave")
+    web_search.setdefault("api_key", "")
+    web_search.setdefault("max_results", 10)
+
+    web_fetch_raw = config.get("web_fetch")
+    web_fetch: dict[str, Any]
+    if isinstance(web_fetch_raw, Mapping):
+        web_fetch = dict(web_fetch_raw)
+    else:
+        web_fetch = {}
+    web_fetch.setdefault("max_chars", 20000)
+
+    skills_raw = config.get("skills")
+    skills: dict[str, Any]
+    if isinstance(skills_raw, Mapping):
+        skills = dict(skills_raw)
+    else:
+        skills = {}
+    skills.setdefault("directory", "./skills")
+    skills.setdefault("max_file_chars", 20000)
+
+    approval_mode = config.get("approval_mode", "review")
+    if not isinstance(approval_mode, str) or not approval_mode.strip():
+        approval_mode = "review"
+
+    max_iterations = 50
+    loop_raw = config.get("loop")
+    if isinstance(loop_raw, Mapping):
+        loop_max = loop_raw.get("max_iterations")
+        if isinstance(loop_max, int) and not isinstance(loop_max, bool) and loop_max > 0:
+            max_iterations = int(loop_max)
+    direct_max = config.get("max_iterations")
+    if isinstance(direct_max, int) and not isinstance(direct_max, bool) and direct_max > 0:
+        max_iterations = int(direct_max)
+
+    context_raw = config.get("context")
+    context: dict[str, Any]
+    if isinstance(context_raw, Mapping):
+        context = dict(context_raw)
+    else:
+        context = {}
+    context.setdefault("token_budget", 4000)
+    context.setdefault("summary_threshold", 10)
+    context.setdefault("max_output_chars", 8000)
+
+    payload = {
+        "llm": llm,
+        "tools": tools,
+        "web_search": web_search,
+        "web_fetch": web_fetch,
+        "skills": skills,
+        "approval_mode": approval_mode,
+        "max_iterations": max_iterations,
+        "context": context,
+    }
+    _validate_agent_config_payload(payload)
+    return payload
 
 
 def _tap_guest_ips_from_index(session_index: int) -> tuple[str, str]:

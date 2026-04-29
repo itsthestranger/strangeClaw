@@ -84,7 +84,7 @@ def _verify_network(*, session_prefix: str) -> int:
 def _verify_lifecycle(args: argparse.Namespace) -> int:
     config = load_config()
     fire_cfg = load_firecracker_config(config)
-    llm_cfg = dict(config["llm"])
+    agent_cfg = dict(config)
     session_id = f"{args.session_prefix}-life-{uuid.uuid4().hex[:8]}"
     task = {
         "type": "task",
@@ -95,7 +95,7 @@ def _verify_lifecycle(args: argparse.Namespace) -> int:
 
     sandbox = FireSandbox(
         firecracker_config=fire_cfg,
-        llm_config=llm_cfg,
+        agent_config=agent_cfg,
     )
 
     print(f"LIFECYCLE_START session_id={session_id}")

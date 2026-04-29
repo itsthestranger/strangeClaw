@@ -421,10 +421,10 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
     assert events[-1]["reply"] == "recovered"
 
 
-def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) -> None:
+def test_agent_uses_agent_config_file_when_task_llm_is_disallowed(tmp_path: Path) -> None:
     llm_from_file = {"model": "file/model", "api_key": "file-key"}
-    llm_path = tmp_path / "llm.json"
-    llm_path.write_text(json.dumps(llm_from_file), encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"llm": llm_from_file}), encoding="utf-8")
 
     captured: dict[str, Any] = {}
     scripted_llm = ScriptedLLM(
@@ -446,7 +446,7 @@ def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) 
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
-        llm_config_path=str(llm_path),
+        agent_config_path=str(config_path),
         allow_task_llm=False,
         llm_factory=llm_factory,
     )
@@ -467,7 +467,7 @@ def test_agent_uses_llm_config_file_when_task_llm_is_disallowed(tmp_path: Path) 
     assert events[-1]["success"] is True
     event_dump = json.dumps(events, ensure_ascii=True)
     assert "file-key" not in event_dump
-    assert "/run/strangeclaw/llm.json" not in event_dump
+    assert "/run/strangeclaw/config.json" not in event_dump
 
 
 def test_agent_stage3_read_skill_file_control_action() -> None:
@@ -511,7 +511,10 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
     assert not worker.is_alive()
 
     read_events = [
-        event for event in events if event.get("type") == "action" and event.get("tool") == "__agent__.read_skill_file"
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "__agent__.read_skill_file"
     ]
     assert read_events
     assert read_events[0]["result"]["exit_code"] == 0
@@ -560,7 +563,9 @@ def test_agent_replans_when_plan_references_unknown_skill() -> None:
     ]
     assert len(plan_events) == 2
     status_events = [
-        event for event in events if event.get("type") == "message" and event.get("role") == "status"
+        event
+        for event in events
+        if event.get("type") == "message" and event.get("role") == "status"
     ]
     assert any("Unknown referenced skill" in str(event.get("content")) for event in status_events)
 
@@ -607,8 +612,8 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
             "5000",
             "--skills-dir",
             str(tmp_path / "skills"),
-            "--llm-config-path",
-            str(tmp_path / "llm.json"),
+            "--agent-config-path",
+            str(tmp_path / "config.json"),
         ]
     )
 
@@ -619,4 +624,4 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     kwargs = captured["agent_kwargs"]
     assert kwargs["allow_task_llm"] is False
     assert kwargs["skills_dir"] == str(tmp_path / "skills")
-    assert kwargs["llm_config_path"] == str(tmp_path / "llm.json")
+    assert kwargs["agent_config_path"] == str(tmp_path / "config.json")

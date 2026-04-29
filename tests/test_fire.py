@@ -215,11 +215,30 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
             "netmask": "255.255.255.252",
             "dns": ["8.8.8.8", "1.1.1.1"],
         },
-        llm={
-            "model": "anthropic/claude-sonnet-4-20250514",
-            "api_key": "sk-test",
-            "max_tokens": 4096,
-            "temperature": 0.2,
+        agent_config={
+            "tools": {
+                "shell": True,
+                "web_search": True,
+                "web_fetch": True,
+                "http_request": True,
+            },
+            "web_search": {
+                "endpoint": "https://api.search.brave.com/res/v1/web/search",
+                "format": "brave",
+                "api_key": "",
+                "max_results": 10,
+            },
+            "web_fetch": {"max_chars": 20000},
+            "skills": {"directory": "./skills", "max_file_chars": 20000},
+            "approval_mode": "review",
+            "max_iterations": 50,
+            "context": {"token_budget": 4000, "summary_threshold": 10, "max_output_chars": 8000},
+            "llm": {
+                "model": "anthropic/claude-sonnet-4-20250514",
+                "api_key": "sk-test",
+                "max_tokens": 4096,
+                "temperature": 0.2,
+            },
         },
     )
 
@@ -249,7 +268,7 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
     assert calls[0][1]["boot_args"] == DEFAULT_BOOT_ARGS
     assert calls[3][1]["guest_mac"] == "06:00:AC:10:00:02"
     assert calls[5][1]["log_path"] == str(preboot.log_path)
-    assert calls[7][1] == {"network": preboot.network, "llm": preboot.llm}
+    assert calls[7][1] == {"network": preboot.network, "config": preboot.agent_config}
     assert calls[8][1] == {"action_type": "InstanceStart"}
 
 
@@ -270,11 +289,13 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
             "netmask": "255.255.255.252",
             "dns": ["8.8.8.8"],
         },
-        llm={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-test",
-            "max_tokens": 1024,
-            "temperature": 0.2,
+        agent_config={
+            "llm": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "sk-test",
+                "max_tokens": 1024,
+                "temperature": 0.2,
+            }
         },
     )
 
@@ -325,11 +346,13 @@ def test_configure_microvm_preboot_rejects_invalid_llm_max_tokens(tmp_path: Path
     config = _build_firecracker_config(tmp_path)
     preboot = _build_preboot_config(
         tmp_path,
-        llm={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-test",
-            "max_tokens": 0,
-            "temperature": 0.2,
+        agent_config={
+            "llm": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "sk-test",
+                "max_tokens": 0,
+                "temperature": 0.2,
+            }
         },
     )
 
@@ -719,12 +742,12 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=tap_manager,
         iptables_manager=iptables_manager,
         cid_manager=cid_manager,
@@ -787,12 +810,12 @@ def test_fire_sandbox_connect_retries_with_new_socket(tmp_path: Path) -> None:
     socket_factory = _FakeSocketFactory([first, second])
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=_FakeTapManager(_build_allocation()),
         iptables_manager=_FakeIptablesManager(),
         cid_manager=_FakeCidManager(cid=52),
@@ -823,12 +846,12 @@ def test_fire_sandbox_run_raises_boot_error_with_diagnostics(tmp_path: Path) -> 
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=tap_manager,
         iptables_manager=iptables_manager,
         cid_manager=cid_manager,
@@ -863,12 +886,12 @@ def test_fire_sandbox_boot_diagnostics_redacts_sensitive_log_content(tmp_path: P
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=tap_manager,
         iptables_manager=iptables_manager,
         cid_manager=cid_manager,
@@ -917,13 +940,13 @@ def test_fire_sandbox_rewrites_localhost_api_base_for_host_expose(
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "lm_studio/local-model",
-            "api_key": "",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "api_base": "http://localhost:11434/v1",
-        },
+        agent_config=_agent_config(
+            model="lm_studio/local-model",
+            api_key="",
+            max_tokens=1024,
+            temperature=0.2,
+            api_base="http://localhost:11434/v1",
+        ),
         tap_manager=tap_manager,
         iptables_manager=iptables_manager,
         cid_manager=cid_manager,
@@ -946,8 +969,11 @@ def test_fire_sandbox_rewrites_localhost_api_base_for_host_expose(
         )
 
     mmds_payload = api_factory.payload_for("/mmds")
-    assert mmds_payload["llm"]["api_base"] == "http://172.16.0.1:11434/v1"
-    assert mmds_payload["llm"]["provider_settings"]["api_base"] == "http://172.16.0.1:11434/v1"
+    assert mmds_payload["config"]["llm"]["api_base"] == "http://172.16.0.1:11434/v1"
+    assert (
+        mmds_payload["config"]["llm"]["provider_settings"]["api_base"]
+        == "http://172.16.0.1:11434/v1"
+    )
     assert iptables_manager.apply_ports == (11434,)
     assert "host_expose enabled for ports [11434]" in caplog.text
 
@@ -971,13 +997,13 @@ def test_fire_sandbox_warns_when_localhost_api_base_without_host_expose(
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "lm_studio/local-model",
-            "api_key": "",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "api_base": "http://127.0.0.1:11434/v1",
-        },
+        agent_config=_agent_config(
+            model="lm_studio/local-model",
+            api_key="",
+            max_tokens=1024,
+            temperature=0.2,
+            api_base="http://127.0.0.1:11434/v1",
+        ),
         tap_manager=tap_manager,
         iptables_manager=iptables_manager,
         cid_manager=cid_manager,
@@ -1000,7 +1026,7 @@ def test_fire_sandbox_warns_when_localhost_api_base_without_host_expose(
         )
 
     mmds_payload = api_factory.payload_for("/mmds")
-    assert mmds_payload["llm"]["api_base"] == "http://127.0.0.1:11434/v1"
+    assert mmds_payload["config"]["llm"]["api_base"] == "http://127.0.0.1:11434/v1"
     assert "host_expose is disabled" in caplog.text
     assert iptables_manager.apply_ports == ()
 
@@ -1014,12 +1040,12 @@ def test_fire_sandbox_stop_never_raises_and_is_idempotent(tmp_path: Path) -> Non
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=_RaisingTapManager(_build_allocation()),
         iptables_manager=_RaisingIptablesManager(),
         cid_manager=_RaisingCidManager(cid=52),
@@ -1071,12 +1097,12 @@ def test_fire_sandbox_stop_exports_redacted_log_artifact(
 
     sandbox = FireSandbox(
         firecracker_config=config,
-        llm_config={
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-host",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
         tap_manager=_RaisingTapManager(_build_allocation()),
         iptables_manager=_RaisingIptablesManager(),
         cid_manager=_RaisingCidManager(cid=52),
@@ -1158,15 +1184,52 @@ def _build_preboot_config(tmp_path: Path, **overrides: Any) -> FirePrebootConfig
             "netmask": "255.255.255.252",
             "dns": ["8.8.8.8", "1.1.1.1"],
         },
-        "llm": {
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-test",
-            "max_tokens": 1024,
-            "temperature": 0.2,
-        },
+        "agent_config": _agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-test",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
     }
     params.update(overrides)
     return FirePrebootConfig(**params)
+
+
+def _agent_config(
+    model: str,
+    api_key: str,
+    max_tokens: int,
+    temperature: float,
+    api_base: str | None = None,
+) -> dict[str, Any]:
+    llm: dict[str, Any] = {
+        "model": model,
+        "api_key": api_key,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if api_base is not None:
+        llm["api_base"] = api_base
+    return {
+        "llm": llm,
+        "tools": {
+            "shell": True,
+            "web_search": True,
+            "web_fetch": True,
+            "http_request": True,
+        },
+        "web_search": {
+            "endpoint": "https://api.search.brave.com/res/v1/web/search",
+            "format": "brave",
+            "api_key": "",
+            "max_results": 10,
+        },
+        "web_fetch": {"max_chars": 20000},
+        "skills": {"directory": "./skills", "max_file_chars": 20000},
+        "approval_mode": "review",
+        "max_iterations": 50,
+        "context": {"token_budget": 4000, "summary_threshold": 10, "max_output_chars": 8000},
+    }
 
 
 def _build_allocation() -> TapNetworkAllocation:

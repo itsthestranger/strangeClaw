@@ -26,7 +26,8 @@ EXECUTION_SYSTEM_PROMPT = (
     "Use a normal tool/args tool call to execute tools. "
     "Use activated_skills in the user payload for workflow guidance and references. "
     "For control decisions, use tool='__agent__.done', '__agent__.clarify', or '__agent__.replan'. "
-    "For stage-3 skill references, use tool='__agent__.read_skill_file' with args.skill and args.path. "
+    "For stage-3 skill references, use tool='__agent__.read_skill_file' "
+    "with args.skill and args.path. "
     "For done use args.reply. For clarify use args.question. "
     "For replan you may set args.feedback."
 )
@@ -83,7 +84,7 @@ class Agent:
         agent_config: dict[str, Any] | None = None,
         max_iterations: int = 50,
         output_dir: str = "/output",
-        llm_config_path: str = "/run/strangeclaw/llm.json",
+        agent_config_path: str = "/run/strangeclaw/config.json",
         token_budget: int = 4000,
         summary_threshold: int = 10,
         max_output_total_bytes: int = 10 * 1024 * 1024,
@@ -100,17 +101,36 @@ class Agent:
             raise AgentError("max_output_total_bytes must be greater than zero.")
 
         self._transport = transport
+        self._allow_task_llm = allow_task_llm
+        self._agent_config_path = Path(agent_config_path)
         self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
+        if self._agent_config is None and not self._allow_task_llm:
+            self._agent_config = _load_agent_config_file(self._agent_config_path)
+
+        if isinstance(self._agent_config, dict):
+            configured_skills_dir = _read_skills_directory(self._agent_config)
+            if configured_skills_dir is not None:
+                skills_dir = configured_skills_dir
+            max_iterations = _read_loop_max_iterations(self._agent_config, fallback=max_iterations)
+            token_budget = _read_context_int(
+                self._agent_config,
+                "token_budget",
+                fallback=token_budget,
+            )
+            summary_threshold = _read_context_int(
+                self._agent_config,
+                "summary_threshold",
+                fallback=summary_threshold,
+            )
+
         skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._tools = Tools(self._agent_config or {})
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
-        self._llm_config_path = Path(llm_config_path)
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
         self._max_output_total_bytes = max_output_total_bytes
-        self._allow_task_llm = allow_task_llm
         self._llm_factory = llm_factory or LLMClient.from_config
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
@@ -231,16 +251,19 @@ class Agent:
         if self._allow_task_llm and isinstance(llm_from_task, dict):
             return llm_from_task
 
-        if not self._llm_config_path.is_file():
+        if not self._agent_config_path.is_file():
             raise AgentError(
-                "Task did not contain llm config and MMDS LLM file was not found: "
-                f"{self._llm_config_path}"
+                "Task did not contain llm config and MMDS config file was not found: "
+                f"{self._agent_config_path}"
             )
-        raw = self._llm_config_path.read_text(encoding="utf-8")
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise AgentError(f"LLM config in {self._llm_config_path} must be a JSON object.")
-        return parsed
+        parsed = _load_agent_config_file(self._agent_config_path)
+        llm_mapping = parsed.get("llm")
+        if not isinstance(llm_mapping, dict):
+            raise AgentError(
+                "Agent config is missing required llm mapping: "
+                f"{self._agent_config_path}"
+            )
+        return dict(llm_mapping)
 
     def _planning_phase(self, *, goal: str, approval_mode: str) -> Any:
         feedback: str | None = None
@@ -299,7 +322,8 @@ class Agent:
             attempts += 1
             if attempts > 3:
                 raise AgentError(
-                    "Failed to produce a valid plan after 3 replan attempts due to unknown referenced_skills."
+                    "Failed to produce a valid plan after 3 replan attempts "
+                    "due to unknown referenced_skills."
                 )
             activated: dict[str, dict[str, Any]] = {}
             refs = current_plan.get("referenced_skills", [])
@@ -755,6 +779,74 @@ def _read_skills_max_file_chars(agent_config: dict[str, Any] | None) -> int:
     return value
 
 
+def _read_skills_directory(agent_config: dict[str, Any]) -> str | None:
+    skills_cfg = agent_config.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return None
+    raw = skills_cfg.get("directory")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    return value
+
+
+def _read_loop_max_iterations(agent_config: dict[str, Any], *, fallback: int) -> int:
+    loop_cfg = agent_config.get("loop")
+    if isinstance(loop_cfg, dict):
+        raw = loop_cfg.get("max_iterations")
+    else:
+        raw = agent_config.get("max_iterations")
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value <= 0:
+        return fallback
+    return value
+
+
+def _read_context_int(agent_config: dict[str, Any], key: str, *, fallback: int) -> int:
+    context_cfg = agent_config.get("context")
+    if not isinstance(context_cfg, dict):
+        return fallback
+    raw = context_cfg.get(key)
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value <= 0:
+        return fallback
+    return value
+
+
+def _load_agent_config_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise AgentError(f"Agent config file was not found: {path}")
+    raw = path.read_text(encoding="utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise AgentError(f"Agent config in {path} must be a JSON object.")
+    if "llm" in parsed:
+        llm = parsed.get("llm")
+        if not isinstance(llm, dict):
+            raise AgentError(f"Agent config in {path} must contain llm as an object.")
+        return parsed
+    if _looks_like_llm_config(parsed):
+        return {"llm": parsed}
+    raise AgentError(f"Agent config in {path} must contain an llm object.")
+
+
+def _looks_like_llm_config(payload: dict[str, Any]) -> bool:
+    required = {"model", "api_key"}
+    return required.issubset(payload.keys())
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m agent.agent")
     parser.add_argument("--vsock-port", type=int, default=None, help="Guest vsock listen port.")
@@ -763,7 +855,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--token-budget", type=int, default=4000)
     parser.add_argument("--summary-threshold", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="/output")
-    parser.add_argument("--llm-config-path", type=str, default="/run/strangeclaw/llm.json")
+    parser.add_argument("--agent-config-path", type=str, default="/run/strangeclaw/config.json")
+    parser.add_argument(
+        "--llm-config-path",
+        type=str,
+        default=None,
+        help="Deprecated alias for --agent-config-path.",
+    )
     return parser.parse_args(argv)
 
 
@@ -772,6 +870,9 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     if args.vsock_port is None:
         raise ValueError("Missing required --vsock-port for guest execution.")
+    config_path = args.agent_config_path
+    if isinstance(args.llm_config_path, str) and args.llm_config_path.strip():
+        config_path = args.llm_config_path
 
     transport = VsockTransport(guest_port=int(args.vsock_port))
     try:
@@ -780,7 +881,7 @@ def main(argv: list[str] | None = None) -> None:
             skills_dir=str(args.skills_dir),
             max_iterations=int(args.max_iterations),
             output_dir=str(args.output_dir),
-            llm_config_path=str(args.llm_config_path),
+            agent_config_path=str(config_path),
             token_budget=int(args.token_budget),
             summary_threshold=int(args.summary_threshold),
             allow_task_llm=False,

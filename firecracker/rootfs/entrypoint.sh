@@ -3,7 +3,7 @@
 # - validates vsock device
 # - fetches MMDS V2 token + metadata
 # - applies guest network config
-# - writes LLM config for agent runtime
+# - writes full agent config for runtime
 # - starts agent on vsock port 5000
 
 set -eu
@@ -15,7 +15,7 @@ MMDS_RETRY_INTERVAL_SECONDS="${MMDS_RETRY_INTERVAL_SECONDS:-0.5}"
 MMDS_TOKEN_TTL_SECONDS="${MMDS_TOKEN_TTL_SECONDS:-300}"
 
 RUN_DIR="/run/strangeclaw"
-LLM_CONFIG_PATH="${RUN_DIR}/llm.json"
+AGENT_CONFIG_PATH="${RUN_DIR}/config.json"
 METADATA_TMP_PATH="${RUN_DIR}/mmds.json.tmp"
 METADATA_PATH="${RUN_DIR}/mmds.json"
 NET_IP_PATH="${RUN_DIR}/network.ip"
@@ -85,7 +85,7 @@ fetch_and_parse_mmds() {
     return 1
   fi
 
-  python3 - "${METADATA_TMP_PATH}" "${LLM_CONFIG_PATH}" "${NET_IP_PATH}" \
+  python3 - "${METADATA_TMP_PATH}" "${AGENT_CONFIG_PATH}" "${NET_IP_PATH}" \
     "${NET_PREFIX_PATH}" "${NET_GATEWAY_PATH}" "${RESOLV_PATH}" <<'PY'
 import ipaddress
 import json
@@ -93,7 +93,7 @@ import os
 import stat
 import sys
 
-metadata_path, llm_path, ip_path, prefix_path, gateway_path, resolv_path = sys.argv[1:7]
+metadata_path, config_path, ip_path, prefix_path, gateway_path, resolv_path = sys.argv[1:7]
 
 try:
     with open(metadata_path, "r", encoding="utf-8") as handle:
@@ -105,8 +105,8 @@ if not isinstance(payload, dict):
     sys.exit(1)
 
 network = payload.get("network")
-llm = payload.get("llm")
-if not isinstance(network, dict) or not isinstance(llm, dict):
+agent_config = payload.get("config")
+if not isinstance(network, dict) or not isinstance(agent_config, dict):
     sys.exit(1)
 
 ip_value = network.get("ip")
@@ -130,11 +130,11 @@ try:
 except Exception:
     sys.exit(1)
 
-os.makedirs(os.path.dirname(llm_path), mode=0o700, exist_ok=True)
+os.makedirs(os.path.dirname(config_path), mode=0o700, exist_ok=True)
 
-fd = os.open(llm_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(llm, handle, ensure_ascii=True, separators=(",", ":"))
+    json.dump(agent_config, handle, ensure_ascii=True, separators=(",", ":"))
     handle.write("\n")
 
 for path, value in (
@@ -154,7 +154,7 @@ for path in (ip_path, prefix_path, gateway_path, resolv_path):
 PY
 }
 
-log "Fetching MMDS metadata (network + llm config)"
+log "Fetching MMDS metadata (network + agent config)"
 if ! retry_until "${MMDS_TIMEOUT_SECONDS}" "${MMDS_RETRY_INTERVAL_SECONDS}" fetch_and_parse_mmds; then
   fatal "Timed out fetching/parsing MMDS metadata after ${MMDS_TIMEOUT_SECONDS}s"
 fi

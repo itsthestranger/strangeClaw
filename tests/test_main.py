@@ -297,7 +297,7 @@ def test_main_wires_fire_mode_sandbox_factory(monkeypatch: pytest.MonkeyPatch) -
     adapter = created["adapter"]
     sandbox = coordinator.sandbox_factory()
     assert sandbox.kwargs["firecracker_config"] == {"fire": "cfg"}
-    assert sandbox.kwargs["llm_config"] == {"model": "x", "api_key": "k"}
+    assert sandbox.kwargs["agent_config"]["llm"] == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator
     assert adapter.run_called is True
 

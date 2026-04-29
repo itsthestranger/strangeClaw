@@ -35,8 +35,10 @@ def _build_sandbox_factory(config: dict[str, Any]) -> Callable[[], Any]:
         return lambda: _build_yolo_sandbox(config)
     if mode == "fire":
         fire_cfg = load_firecracker_config(config)
-        llm_cfg = dict(config["llm"])
-        return lambda: FireSandbox(firecracker_config=fire_cfg, llm_config=dict(llm_cfg))
+        return lambda: FireSandbox(
+            firecracker_config=fire_cfg,
+            agent_config=dict(config),
+        )
     raise ValueError(f"Unsupported mode: {mode}")
 
 
