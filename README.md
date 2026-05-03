@@ -191,6 +191,16 @@ Behavior:
 - `format: searxng` sends `q=<query>&format=json`.
 - Results are normalized into `{title, url, snippet}` for the model.
 
+## Skills Config Defaults
+
+If `skills` is omitted in `config.yaml`, strangeclaw defaults to:
+
+```yaml
+skills:
+  directory: ./skills
+  max_file_chars: 20000
+```
+
 ## Telegram Setup
 
 1. Create a bot with `@BotFather` and copy the token.

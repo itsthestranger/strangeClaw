@@ -69,6 +69,8 @@ session_journal:
   max_bytes: 1048576           # hard cap per session journal file (bytes)
 
 skills:
+  # Optional section. If omitted, defaults to:
+  # {directory: ./skills, max_file_chars: 20000}
   directory: ./skills
   max_file_chars: 20000         # read_file truncation limit (~5k tokens)
 

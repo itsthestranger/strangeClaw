@@ -119,11 +119,43 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
         "max_results": 10,
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
-    assert loaded["skills"]["max_file_chars"] == 20000
+    assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
     assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
+
+
+def test_load_config_defaults_skills_section_when_missing(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    del config["skills"]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
+
+
+def test_load_config_defaults_skills_directory_when_missing(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["skills"] = {"max_file_chars": 12345}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 12345}
+
+
+def test_load_config_rejects_invalid_skills_directory(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["skills"]["directory"] = "   "
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"skills\.directory"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
@@ -254,6 +286,20 @@ def test_load_config_rejects_invalid_skills_max_file_chars(tmp_path: Path) -> No
 
     with pytest.raises(ConfigError, match=r"skills\.max_file_chars"):
         load_config(config_path)
+
+
+def test_fire_sanitized_skills_match_loaded_config_defaults(tmp_path: Path) -> None:
+    from sandbox.fire import _sanitize_agent_config_for_mmds
+
+    config = _base_config(api_key="plain-key")
+    del config["skills"]
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+    fire_payload = _sanitize_agent_config_for_mmds(loaded)
+
+    assert fire_payload["skills"] == loaded["skills"]
 
 
 def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:

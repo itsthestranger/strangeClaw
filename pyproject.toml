@@ -48,5 +48,5 @@ no_implicit_optional = true
 check_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["requests", "requests.*"]
+module = ["requests"]
 ignore_missing_imports = true

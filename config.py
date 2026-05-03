@@ -27,7 +27,6 @@ REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("context", "summary_threshold"),
     ("context", "max_output_chars"),
     ("loop", "max_iterations"),
-    ("skills", "directory"),
     ("firecracker", "binary"),
     ("firecracker", "kernel"),
     ("firecracker", "rootfs"),
@@ -255,8 +254,16 @@ def _validate_web_fetch_optional_fields(config: dict[str, Any]) -> None:
 
 def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
     skills = config.get("skills")
+    if skills is None:
+        config["skills"] = {"directory": "./skills", "max_file_chars": 20000}
+        skills = config["skills"]
     if not isinstance(skills, dict):
         raise ConfigError("Config field skills must be a mapping.")
+
+    directory_raw = skills.get("directory", "./skills")
+    if not isinstance(directory_raw, str) or not directory_raw.strip():
+        raise ConfigError("Config field skills.directory must be a non-empty string.")
+    skills["directory"] = directory_raw.strip()
 
     max_file_chars_raw = skills.get("max_file_chars", 20000)
     if isinstance(max_file_chars_raw, bool):
