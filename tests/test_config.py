@@ -120,6 +120,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
+    assert loaded["integrations"] == {}
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -275,6 +276,59 @@ def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"web_fetch\.max_chars"):
+        load_config(config_path)
+
+
+def test_load_config_normalizes_generic_integrations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NOTION_TOKEN", "notion-secret")
+    monkeypatch.setenv("JIRA_TOKEN", "jira-secret")
+    config = _base_config(api_key="plain-key")
+    config["integrations"] = {
+        "notion": {
+            "token": "${NOTION_TOKEN}",
+            "auth": {"type": "bearer"},
+            "default_headers": {"Notion-Version": "2026-03-11"},
+        },
+        "jira": {
+            "token": "${JIRA_TOKEN}",
+            "auth": {"type": "header", "header": "X-API-Key"},
+            "default_headers": {"Accept": "application/json"},
+        },
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["integrations"] == {
+        "notion": {
+            "token": "notion-secret",
+            "auth": {"type": "bearer"},
+            "default_headers": {"Notion-Version": "2026-03-11"},
+        },
+        "jira": {
+            "token": "jira-secret",
+            "auth": {"type": "header", "header": "X-API-Key", "prefix": ""},
+            "default_headers": {"Accept": "application/json"},
+        },
+    }
+
+
+def test_load_config_rejects_invalid_integration_config(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["integrations"] = {"bad provider": {"token": "x"}}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match="integrations keys"):
+        load_config(config_path)
+
+    config["integrations"] = {"jira": {"token": "x", "auth": {"type": "header"}}}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"integrations\.jira\.auth\.header"):
         load_config(config_path)
 
 

@@ -11,6 +11,7 @@ import requests
 import trafilatura
 from requests import Response
 
+from agent.http_auth import HttpAuthResolver
 from agent.llm import ToolCall
 
 _OUTPUT_CHUNK_SIZE = 4000
@@ -40,6 +41,7 @@ class Tools:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = dict(config)
+        self._http_auth = HttpAuthResolver.from_config(config)
         raw_tools = config.get("tools")
         if isinstance(raw_tools, dict):
             enabled: set[str] = {
@@ -200,8 +202,21 @@ class Tools:
             },
         }
 
-    @staticmethod
-    def _http_request_schema() -> dict[str, Any]:
+    def _http_request_schema(self) -> dict[str, Any]:
+        integration_schema: dict[str, Any] = {
+            "type": ["string", "null"],
+            "description": (
+                "Optional configured integration name. Use null or omit for anonymous requests."
+            ),
+        }
+        available_integrations = self._http_auth.available_names()
+        if available_integrations:
+            integration_schema["enum"] = [*available_integrations, None]
+            integration_schema["description"] = (
+                "Optional configured integration name. Available values: "
+                f"{', '.join(available_integrations)}. Use null or omit for anonymous requests."
+            )
+
         return {
             "name": "http_request",
             "description": "Make structured HTTP requests and return status, headers, and body.",
@@ -210,6 +225,7 @@ class Tools:
                 "properties": {
                     "method": {"type": "string"},
                     "url": {"type": "string"},
+                    "integration": integration_schema,
                     "headers": {"type": "object"},
                     "body": {"type": ["string", "null"]},
                 },
@@ -468,6 +484,20 @@ class Tools:
                     stderr="http_request.headers must contain only string keys and values.",
                 )
             normalized_headers[key] = value
+
+        integration_raw = args.get("integration")
+        if integration_raw is not None and not isinstance(integration_raw, str):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="http_request.integration must be a string or null.",
+            )
+        normalized_headers, auth_error = self._http_auth.apply(
+            integration_name=integration_raw,
+            headers=normalized_headers,
+        )
+        if auth_error is not None:
+            return ToolResult(exit_code=1, stdout="", stderr=auth_error)
         normalized_headers.setdefault("User-Agent", _DEFAULT_HTTP_REQUEST_USER_AGENT)
 
         body = args.get("body")

@@ -396,6 +396,143 @@ def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
     assert payload["truncated"] is False
 
 
+def test_tools_http_request_applies_generic_bearer_integration(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
+        captured.update(kwargs)
+        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
+
+    monkeypatch.setattr("agent.tools.requests.request", fake_request)
+    tools = Tools(
+        config={
+            "integrations": {
+                "notion": {
+                    "token": "notion-secret",
+                    "auth": {"type": "bearer"},
+                    "default_headers": {"Notion-Version": "2026-03-11"},
+                }
+            }
+        }
+    )
+
+    schema = next(item for item in tools.schema() if item["name"] == "http_request")
+    assert schema["parameters"]["properties"]["integration"]["enum"] == ["notion", None]
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={
+                "method": "GET",
+                "url": "https://api.notion.com/v1/data_sources/source-id",
+                "integration": "notion",
+                "headers": {},
+            },
+        )
+    )
+
+    assert result.exit_code == 0
+    assert captured["headers"]["Authorization"] == "Bearer notion-secret"
+    assert captured["headers"]["Notion-Version"] == "2026-03-11"
+    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
+
+
+def test_tools_http_request_applies_generic_header_integration(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
+        captured.update(kwargs)
+        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
+
+    monkeypatch.setattr("agent.tools.requests.request", fake_request)
+    tools = Tools(
+        config={
+            "integrations": {
+                "jira": {
+                    "token": "jira-secret",
+                    "auth": {"type": "header", "header": "X-API-Key", "prefix": "Token "},
+                    "default_headers": {"Accept": "application/json"},
+                }
+            }
+        }
+    )
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={
+                "method": "GET",
+                "url": "https://jira.example.com/rest/api/3/issue/ABC-1",
+                "integration": "jira",
+                "headers": {},
+            },
+        )
+    )
+
+    assert result.exit_code == 0
+    assert captured["headers"]["X-API-Key"] == "Token jira-secret"
+    assert captured["headers"]["Accept"] == "application/json"
+
+
+def test_tools_http_request_rejects_integration_header_override() -> None:
+    tools = Tools(
+        config={
+            "integrations": {
+                "github": {
+                    "token": "github-secret",
+                    "auth": {"type": "bearer"},
+                    "default_headers": {"Accept": "application/vnd.github+json"},
+                }
+            }
+        }
+    )
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={
+                "method": "GET",
+                "url": "https://api.github.com/repos/o/r",
+                "integration": "github",
+                "headers": {"Authorization": "Bearer attacker"},
+            },
+        )
+    )
+
+    assert result.exit_code == 1
+    assert "must not include 'Authorization'" in result.stderr
+
+
+def test_tools_http_request_rejects_unknown_or_unconfigured_integration() -> None:
+    tools = Tools(config={"integrations": {"github": {"token": "", "auth": {"type": "bearer"}}}})
+
+    unknown = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={
+                "method": "GET",
+                "url": "https://api.github.com/repos/o/r",
+                "integration": "jira",
+            },
+        )
+    )
+    assert unknown.exit_code == 1
+    assert "integration 'jira' is not configured" in unknown.stderr
+
+    missing_token = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={
+                "method": "GET",
+                "url": "https://api.github.com/repos/o/r",
+                "integration": "github",
+            },
+        )
+    )
+    assert missing_token.exit_code == 1
+    assert "has no token configured" in missing_token.stderr
+
+
 def test_tools_http_request_invalid_method_rejected() -> None:
     tools = Tools(config={})
 
