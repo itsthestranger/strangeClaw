@@ -15,7 +15,7 @@ import pytest
 
 import agent.agent as agent_module
 from agent.agent import Agent
-from agent.llm import LLMResponse, ToolCall
+from agent.llm import LLMClient, LLMResponse, ToolCall
 from agent.transport import InProcessTransport
 
 
@@ -721,6 +721,224 @@ def test_agent_replans_when_plan_references_unknown_skill() -> None:
         if event.get("type") == "message" and event.get("role") == "status"
     ]
     assert any("Unknown referenced skill" in str(event.get("content")) for event in status_events)
+
+
+def test_agent_native_read_skill_file_success_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        if "tools" not in kwargs:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"goal":"g","steps":["read"],'
+                            '"referenced_skills":["demo"]}'
+                        }
+                    }
+                ]
+            }
+        tool_defs = kwargs.get("tools", [])
+        tool_names = {
+            item.get("function", {}).get("name")
+            for item in tool_defs
+            if isinstance(item, dict)
+        }
+        if "agent_done" not in tool_names or "agent_read_skill_file" not in tool_names:
+            return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
+        if len([call for call in calls if "tools" in call]) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "agent_read_skill_file",
+                                        "arguments": (
+                                            '{"skill":"demo",'
+                                            '"path":"references/notes.md"}'
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "agent_done",
+                                    "arguments": '{"reply":"done"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(skills_root),
+        llm_factory=lambda config: LLMClient.from_config(
+            {
+                **config,
+                "structured_output": "native",
+                "native_probe": False,
+                "native_tool_choice": "required",
+            }
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_actions
+    assert read_actions[0]["result"]["exit_code"] == 0
+    assert "skill-reference-content" in read_actions[0]["result"]["stdout"]
+
+
+@pytest.mark.parametrize(
+    ("plan_payload", "control_arguments", "expected_error_fragment"),
+    [
+        (
+            '{"goal":"g","steps":["read"],"referenced_skills":["demo"]}',
+            '{"skill":"demo"}',
+            "requires args.skill and args.path",
+        ),
+        (
+            '{"goal":"g","steps":["read"],"referenced_skills":[]}',
+            '{"skill":"demo","path":"references/notes.md"}',
+            "not activated",
+        ),
+    ],
+)
+def test_agent_native_read_skill_file_failure_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plan_payload: str,
+    control_arguments: str,
+    expected_error_fragment: str,
+) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        if "tools" not in kwargs:
+            return {"choices": [{"message": {"content": plan_payload}}]}
+        if len([call for call in calls if "tools" in call]) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "agent_read_skill_file",
+                                        "arguments": control_arguments,
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "agent_done",
+                                    "arguments": '{"reply":"done"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(skills_root),
+        llm_factory=lambda config: LLMClient.from_config(
+            {
+                **config,
+                "structured_output": "native",
+                "native_probe": False,
+                "native_tool_choice": "required",
+            }
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_actions
+    assert read_actions[0]["result"]["exit_code"] == 1
+    assert expected_error_fragment in str(read_actions[0]["result"]["stderr"])
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
 
 
 def test_agent_main_requires_vsock_port() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -50,6 +51,37 @@ EXECUTION_SURFACE_SCHEMA = [
             "type": "object",
             "properties": {"reply": {"type": "string"}},
             "required": ["reply"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_clarify",
+        "description": "Ask user clarification.",
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_replan",
+        "description": "Request a replan.",
+        "parameters": {
+            "type": "object",
+            "properties": {"feedback": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_read_skill_file",
+        "description": "Read file from activated skill.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["skill", "path"],
             "additionalProperties": False,
         },
     },
@@ -268,6 +300,76 @@ def test_native_structured_output_list_schemas_emit_provider_safe_function_names
         isinstance(name, str) and safe_name_pattern.fullmatch(name) and "." not in name
         for name in function_names
     )
+
+
+@pytest.mark.parametrize(
+    ("control_tool", "control_args"),
+    [
+        ("agent_done", {"reply": "done"}),
+        ("agent_clarify", {"question": "Which environment?"}),
+        ("agent_replan", {"feedback": "Need revised steps"}),
+        ("agent_read_skill_file", {"skill": "demo", "path": "references/notes.md"}),
+    ],
+)
+def test_native_control_decisions_require_control_tools_in_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    control_tool: str,
+    control_args: dict[str, Any],
+) -> None:
+    captured_calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured_calls.append(kwargs)
+        tool_defs = kwargs.get("tools", [])
+        available_names = [
+            item.get("function", {}).get("name")
+            for item in tool_defs
+            if isinstance(item, dict)
+        ]
+        if control_tool in available_names:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": control_tool,
+                                        "arguments": json.dumps(control_args),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+    result_with_control = client.complete(
+        messages=[{"role": "user", "content": "execute one control step"}],
+        action_schema=EXECUTION_SURFACE_SCHEMA,
+    )
+    assert result_with_control.action is not None
+    assert result_with_control.action.tool == control_tool
+    assert result_with_control.action.args == control_args
+
+    # This guards against regressions where control decisions disappear from the schema.
+    result_without_control = client.complete(
+        messages=[{"role": "user", "content": "execute one control step"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+    assert result_without_control.action is None
 
 
 def test_native_structured_output_can_use_string_tool_choice(
