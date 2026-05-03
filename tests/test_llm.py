@@ -434,7 +434,10 @@ def test_native_probe_can_fallback_to_prompt_when_native_is_unavailable(
     assert "tool_choice" in calls[1]
     assert "tool_choice" not in calls[2]
     assert calls[2]["messages"][0]["role"] == "system"
-    assert "return ONLY a JSON object matching this schema" in calls[2]["messages"][0]["content"]
+    instruction = calls[2]["messages"][0]["content"]
+    assert "Return exactly one structured action" in instruction
+    assert "Do not answer in free-form prose" in instruction
+    assert "respond normally" not in instruction
 
 
 def test_native_probe_falls_back_to_prompt_when_probe_returns_no_native_action(
@@ -515,8 +518,133 @@ def test_prompt_structured_output_parses_tool_call(monkeypatch: pytest.MonkeyPat
     assert result.action.args == {"method": "GET"}
     assert result.action.reason == "Need data"
     assert captured["messages"][0]["role"] == "system"
-    assert "return ONLY a JSON object matching this schema" in captured["messages"][0]["content"]
+    instruction = captured["messages"][0]["content"]
+    assert "Return exactly one structured action" in instruction
+    assert "Do not answer in free-form prose" in instruction
+    assert "respond normally" not in instruction
     assert "tools" not in captured
+
+
+def test_native_structured_output_enforces_required_tool_choice_when_configured_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_tool_call",
+                                    "arguments": '{"tool":"shell","args":{"command":"pwd"}}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="auto",
+        native_probe=False,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use a tool"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert captured["tool_choice"] == "required"
+
+
+def test_prompt_structured_output_rejects_freeform_prose_with_embedded_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_completion(**_: Any) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            'I will do it now.\n{"tool":"shell","args":{"command":"pwd"}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="ollama/llama3.1",
+        api_key="",
+        structured_output="prompt",
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Fetch data"}],
+        action_schema=ACTION_SCHEMA,
+    )
+
+    assert result.action is None
+
+
+def test_native_structured_output_rejects_multiple_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_completion(**_: Any) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": '{"command":"pwd"}',
+                                },
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": '{"command":"ls"}',
+                                },
+                            },
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Use one tool"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+
+    assert result.action is None
 
 
 def test_prompt_structured_output_rejects_legacy_skill_action_shape(

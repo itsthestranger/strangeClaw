@@ -145,6 +145,7 @@ class LLMClient:
                     completion_kwargs["messages"] = _inject_prompt_action_schema(
                         messages,
                         action_schema,
+                        require_action=True,
                     )
                 else:
                     response_action_mode = "native"
@@ -159,6 +160,7 @@ class LLMClient:
                 completion_kwargs["messages"] = _inject_prompt_action_schema(
                     messages,
                     action_schema,
+                    require_action=True,
                 )
 
         response = litellm.completion(**completion_kwargs)
@@ -173,13 +175,14 @@ class LLMClient:
         return LLMResponse(text=text, action=action, usage=usage)
 
     def _resolve_native_tool_choice_mode(self) -> str | None:
+        configured_mode = _required_action_tool_choice_mode(self.native_tool_choice)
         if not self.native_probe:
-            return self.native_tool_choice
+            return configured_mode
         if self._native_probe_ran:
             return self._native_tool_choice_resolved
 
         self._native_probe_ran = True
-        modes_to_try = _native_tool_choice_probe_order(self.native_tool_choice)
+        modes_to_try = _native_tool_choice_probe_order(configured_mode)
         last_client_error: Exception | None = None
 
         for mode in modes_to_try:
@@ -354,6 +357,8 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
     message = _get_value(first_choice, "message")
     tool_calls = _get_value(message, "tool_calls")
     if isinstance(tool_calls, list) and tool_calls:
+        if len(tool_calls) != 1:
+            return None
         first_call = tool_calls[0]
         function_block = _get_value(first_call, "function")
         function_name = _get_value(function_block, "name")
@@ -368,61 +373,63 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
 
     content = _get_value(message, "content")
     if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "tool_use":
-                continue
-            payload = _action_from_dict(_get_value(item, "input"))
-            if payload is None:
-                name = item.get("name")
-                input_payload = _get_value(item, "input")
-                if isinstance(name, str) and name and isinstance(input_payload, dict):
-                    payload = ToolCall(tool=name, args=input_payload, reason=None)
-            if payload is not None:
-                return payload
+        tool_use_items = [
+            item
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "tool_use"
+        ]
+        if len(tool_use_items) != 1:
+            return None
+        item = tool_use_items[0]
+        payload = _action_from_dict(_get_value(item, "input"))
+        if payload is None:
+            name = item.get("name")
+            input_payload = _get_value(item, "input")
+            if isinstance(name, str) and name and isinstance(input_payload, dict):
+                payload = ToolCall(tool=name, args=input_payload, reason=None)
+        if payload is not None:
+            return payload
     return None
 
 
 def _inject_prompt_action_schema(
     messages: list[dict[str, Any]],
     action_schema: dict[str, Any] | list[dict[str, Any]],
+    *,
+    require_action: bool = True,
 ) -> list[dict[str, Any]]:
     schema_text = json.dumps(action_schema, separators=(",", ":"), ensure_ascii=True)
-    if isinstance(action_schema, list):
-        instruction = (
-            "When selecting a tool, return ONLY a JSON object with keys "
-            "tool (string) and args (object) where tool is one of the listed names "
-            "and args matches that tool's parameters. Tool definitions: "
-            f"{schema_text}. If no tool is needed, respond normally."
-        )
-    else:
+    if not require_action:
         instruction = (
             "When selecting a tool, return ONLY a JSON object matching this schema: "
             f"{schema_text}. If no tool is needed, respond normally."
+        )
+    elif isinstance(action_schema, list):
+        instruction = (
+            "Return exactly one structured action as ONLY a JSON object with keys "
+            "tool (string) and args (object) where tool is one of the listed names "
+            "and args matches that tool's parameters. Tool definitions: "
+            f"{schema_text}. Do not answer in free-form prose."
+        )
+    else:
+        instruction = (
+            "Return exactly one structured action as ONLY a JSON object matching this schema: "
+            f"{schema_text}. Do not answer in free-form prose."
         )
     return [{"role": "system", "content": instruction}, *messages]
 
 
 def _extract_prompt_tool_call(text: str) -> ToolCall | None:
-    payload = _extract_first_json_object(text)
-    if payload is None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
         return None
     return _action_from_dict(payload)
-
-
-def _extract_first_json_object(text: str) -> dict[str, Any] | None:
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
 
 
 def _parse_action_payload(raw_args: Any) -> ToolCall | None:
@@ -462,6 +469,12 @@ def _action_from_dict(payload: Any) -> ToolCall | None:
     if reason is not None and not isinstance(reason, str):
         reason = None
     return ToolCall(tool=tool, args=args, reason=reason)
+
+
+def _required_action_tool_choice_mode(configured_mode: str) -> str:
+    if configured_mode in {"required", "forced_function"}:
+        return configured_mode
+    return "required"
 
 
 def _extract_usage(response: Any) -> dict[str, int] | None:
