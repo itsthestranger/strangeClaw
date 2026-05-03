@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shlex
 import threading
 from collections.abc import Callable
@@ -34,7 +35,7 @@ class ScriptedLLM:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         self.calls.append({"messages": messages, "action_schema": action_schema})
         if not self._responses:
@@ -125,7 +126,7 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done",
+                action=ToolCall(tool="agent_done",
                     args={"reply": "Completed successfully."},
                 ),
                 usage=None,
@@ -176,7 +177,7 @@ def test_agent_plan_rejection_replans_in_review_mode() -> None:
             LLMResponse(text='{"steps":["updated plan"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done",
+                action=ToolCall(tool="agent_done",
                     args={"reply": "Done after replan."},
                 ),
                 usage=None,
@@ -287,6 +288,15 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     assert payload["recent_history"] == [{"type": "action", "idx": 3}]
     assert payload["enabled_tools"] == ["http_request", "shell", "web_fetch", "web_search"]
     assert isinstance(payload["tool_schemas"], list)
+    tool_names = [entry.get("name") for entry in payload["tool_schemas"] if isinstance(entry, dict)]
+    safe_name_pattern = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+    assert "agent_done" in tool_names
+    assert "agent_clarify" in tool_names
+    assert "agent_replan" in tool_names
+    assert "agent_read_skill_file" in tool_names
+    assert all(
+        isinstance(name, str) and safe_name_pattern.fullmatch(name) for name in tool_names
+    )
     assert payload["activated_skills"] == {}
     assert payload["output_instruction"] == "Place any files for the user in /output/."
 
@@ -301,7 +311,7 @@ def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> 
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -349,7 +359,7 @@ def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
             LLMResponse(text="summarized previous observations", action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done",
+                action=ToolCall(tool="agent_done",
                     args={"reply": "done with summary"},
                 ),
                 usage=None,
@@ -386,7 +396,7 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
             LLMResponse(text="not json", action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "recovered"}),
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
                 usage=None,
             ),
         ]
@@ -411,7 +421,7 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
     error_actions = [
         event
         for event in events
-        if event["type"] == "action" and event["tool"] == "__agent__.decision_error"
+        if event["type"] == "action" and event["tool"] == "agent_decision_error"
     ]
     assert error_actions
     assert error_actions[0]["result"]["exit_code"] == 1
@@ -432,7 +442,7 @@ def test_agent_uses_agent_config_file_when_task_llm_is_disallowed(tmp_path: Path
             LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -481,14 +491,14 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
             LLMResponse(
                 text="",
                 action=ToolCall(
-                    tool="__agent__.read_skill_file",
+                    tool="agent_read_skill_file",
                     args={"skill": "shell", "path": "SKILL.md"},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -514,7 +524,7 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
         event
         for event in events
         if event.get("type") == "action"
-        and event.get("tool") == "__agent__.read_skill_file"
+        and event.get("tool") == "agent_read_skill_file"
     ]
     assert read_events
     assert read_events[0]["result"]["exit_code"] == 1
@@ -536,7 +546,7 @@ def test_agent_replans_when_plan_references_unknown_skill() -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "ok"}),
+                action=ToolCall(tool="agent_done", args={"reply": "ok"}),
                 usage=None,
             ),
         ]

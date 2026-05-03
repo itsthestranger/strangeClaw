@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -29,6 +30,29 @@ TOOLS_SCHEMA = [
             "additionalProperties": False,
         },
     }
+]
+
+EXECUTION_SURFACE_SCHEMA = [
+    {
+        "name": "shell",
+        "description": "Run shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_done",
+        "description": "Finish execution.",
+        "parameters": {
+            "type": "object",
+            "properties": {"reply": {"type": "string"}},
+            "required": ["reply"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -189,6 +213,61 @@ def test_native_structured_output_parses_direct_tool_function_name(
     assert result.action.args == {"command": "pwd"}
     assert captured["tool_choice"] == "required"
     assert captured["tools"][0]["function"]["name"] == "shell"
+
+
+def test_native_structured_output_list_schemas_emit_provider_safe_function_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "agent_done",
+                                    "arguments": '{"reply":"done"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "Finish"}],
+        action_schema=EXECUTION_SURFACE_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert result.action.tool == "agent_done"
+    tool_defs = captured.get("tools", [])
+    function_names = [
+        item.get("function", {}).get("name")
+        for item in tool_defs
+        if isinstance(item, dict)
+    ]
+    safe_name_pattern = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+    assert all(
+        isinstance(name, str) and safe_name_pattern.fullmatch(name) and "." not in name
+        for name in function_names
+    )
 
 
 def test_native_structured_output_can_use_string_tool_choice(

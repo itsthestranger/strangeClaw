@@ -18,7 +18,7 @@ class ScriptedLLM:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         del messages
         del action_schema
@@ -51,7 +51,7 @@ def test_yolo_sandbox_runs_agent_and_exchanges_events() -> None:
             LLMResponse(
                 text="",
                 action=ToolCall(
-                    tool="__agent__.done",
+                    tool="agent_done",
                     args={"reply": "hello"},
                 ),
                 usage=None,

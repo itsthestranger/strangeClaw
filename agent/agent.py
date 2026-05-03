@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -25,8 +26,8 @@ EXECUTION_SYSTEM_PROMPT = (
     "On each turn, inspect goal/plan/history and choose exactly one structured decision. "
     "Use a normal tool/args tool call to execute tools. "
     "Use activated_skills in the user payload for workflow guidance and references. "
-    "For control decisions, use tool='__agent__.done', '__agent__.clarify', or '__agent__.replan'. "
-    "For stage-3 skill references, use tool='__agent__.read_skill_file' "
+    "For control decisions, use tool='agent_done', 'agent_clarify', or 'agent_replan'. "
+    "For stage-3 skill references, use tool='agent_read_skill_file' "
     "with args.skill and args.path. "
     "For done use args.reply. For clarify use args.question. "
     "For replan you may set args.feedback."
@@ -47,6 +48,58 @@ EXECUTION_ACTION_SCHEMA: dict[str, Any] = {
     "required": ["tool", "args"],
     "additionalProperties": False,
 }
+
+_CONTROL_TOOL_DONE = "agent_done"
+_CONTROL_TOOL_CLARIFY = "agent_clarify"
+_CONTROL_TOOL_REPLAN = "agent_replan"
+_CONTROL_TOOL_READ_SKILL_FILE = "agent_read_skill_file"
+_CONTROL_TOOL_DECISION_ERROR = "agent_decision_error"
+_PROVIDER_SAFE_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+_CONTROL_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": _CONTROL_TOOL_DONE,
+        "description": "Finish execution and return the final user-facing reply.",
+        "parameters": {
+            "type": "object",
+            "properties": {"reply": {"type": "string"}},
+            "required": ["reply"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": _CONTROL_TOOL_CLARIFY,
+        "description": "Ask the user a clarification question before continuing.",
+        "parameters": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": _CONTROL_TOOL_REPLAN,
+        "description": "Request a fresh plan before continuing execution.",
+        "parameters": {
+            "type": "object",
+            "properties": {"feedback": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": _CONTROL_TOOL_READ_SKILL_FILE,
+        "description": "Read a bundled file from an activated skill by relative path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["skill", "path"],
+            "additionalProperties": False,
+        },
+    },
+]
+_CONTROL_TOOL_NAMES = {schema["name"] for schema in _CONTROL_TOOL_SCHEMAS}
 
 
 class AgentError(RuntimeError):
@@ -126,6 +179,9 @@ class Agent:
         skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._tools = Tools(self._agent_config or {})
+        self._execution_action_surface = _build_execution_action_surface(
+            self._tools.schema()
+        )
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
         self._token_budget = token_budget
@@ -368,7 +424,7 @@ class Agent:
         )
         response: LLMResponse = llm.complete(
             messages,
-            action_schema=self._tools.schema(),
+            action_schema=self._execution_action_surface,
         )
         if response.action is not None:
             return response.action
@@ -409,7 +465,7 @@ class Agent:
         )
         action_event = {
             "type": "action",
-            "tool": "__agent__.decision_error",
+            "tool": _CONTROL_TOOL_DECISION_ERROR,
             "args": {},
             "result": asdict(error_result),
         }
@@ -425,11 +481,10 @@ class Agent:
         current_plan: Any,
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if decision.tool.startswith("__agent__."):
-            control_action = decision.tool.split(".", 1)[1]
+        if decision.tool in _CONTROL_TOOL_NAMES:
             return self._handle_control_decision(
                 decision=decision,
-                control_action=control_action,
+                control_tool=decision.tool,
                 goal=goal,
                 approval_mode=approval_mode,
                 current_plan=current_plan,
@@ -456,13 +511,13 @@ class Agent:
         self,
         *,
         decision: ToolCall,
-        control_action: str,
+        control_tool: str,
         goal: str,
         approval_mode: str,
         current_plan: Any,
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if control_action == "done":
+        if control_tool == _CONTROL_TOOL_DONE:
             reply = _string_arg(decision.args, "reply", fallback="Task completed.")
             self._send(
                 self._build_done_event(
@@ -475,7 +530,7 @@ class Agent:
             )
             return {"done": True, "plan": current_plan, "observation": None}
 
-        if control_action == "clarify":
+        if control_tool == _CONTROL_TOOL_CLARIFY:
             question = _string_arg(
                 decision.args,
                 "question",
@@ -493,7 +548,7 @@ class Agent:
                 },
             }
 
-        if control_action == "replan":
+        if control_tool == _CONTROL_TOOL_REPLAN:
             feedback = _string_arg(decision.args, "feedback", fallback="")
             new_plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
             observation: dict[str, Any] | None = None
@@ -506,7 +561,7 @@ class Agent:
                 "replanned": True,
             }
 
-        if control_action == "read_skill_file":
+        if control_tool == _CONTROL_TOOL_READ_SKILL_FILE:
             skill_name = _string_arg(decision.args, "skill", fallback="")
             relative_path = _string_arg(decision.args, "path", fallback="")
             read_result: ToolResult
@@ -528,7 +583,7 @@ class Agent:
                     )
             action_event = {
                 "type": "action",
-                "tool": "__agent__.read_skill_file",
+                "tool": _CONTROL_TOOL_READ_SKILL_FILE,
                 "args": {"skill": skill_name, "path": relative_path},
                 "result": asdict(read_result),
             }
@@ -540,8 +595,8 @@ class Agent:
             "plan": current_plan,
             "observation": {
                 "type": "control_error",
-                "action": control_action,
-                "reason": "unsupported __agent__ action",
+                "action": control_tool,
+                "reason": "unsupported control tool",
             },
         }
 
@@ -672,7 +727,7 @@ class Agent:
                 "goal": goal,
                 "plan": plan,
                 "enabled_tools": self._tools.list_enabled(),
-                "tool_schemas": self._tools.schema(),
+                "tool_schemas": self._execution_action_surface,
                 "activated_skills": activated_skills,
                 "history_summary": summary,
                 "recent_history": recent_history,
@@ -759,6 +814,41 @@ def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
     if isinstance(value, str) and value:
         return value
     return fallback
+
+
+def _build_execution_action_surface(
+    capability_tool_schemas: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    surface: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for schema in [*capability_tool_schemas, *_CONTROL_TOOL_SCHEMAS]:
+        name_raw = schema.get("name")
+        params = schema.get("parameters")
+        if not isinstance(name_raw, str) or not name_raw.strip():
+            raise AgentError("Execution action schema entry is missing a non-empty name.")
+        name = name_raw.strip()
+        if not _PROVIDER_SAFE_TOOL_NAME_RE.fullmatch(name):
+            raise AgentError(
+                f"Execution action schema name '{name}' is not provider-safe."
+            )
+        if name in seen_names:
+            raise AgentError(f"Duplicate execution action schema name: {name}")
+        if not isinstance(params, dict):
+            raise AgentError(
+                f"Execution action schema '{name}' is missing object parameters."
+            )
+        description = schema.get("description")
+        if not isinstance(description, str) or not description.strip():
+            description = f"Run {name}."
+        surface.append(
+            {
+                "name": name,
+                "description": description,
+                "parameters": params,
+            }
+        )
+        seen_names.add(name)
+    return surface
 
 
 def _read_skills_max_file_chars(agent_config: dict[str, Any] | None) -> int:

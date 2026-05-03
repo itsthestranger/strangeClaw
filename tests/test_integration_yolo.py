@@ -21,7 +21,7 @@ class ScriptedLLM:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         self.calls.append({"messages": messages, "action_schema": action_schema})
         if not self._responses:
@@ -87,7 +87,7 @@ def test_yolo_integration_success_path() -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "Done."}),
+                action=ToolCall(tool="agent_done", args={"reply": "Done."}),
                 usage=None,
             ),
         ]
@@ -117,7 +117,7 @@ def test_yolo_integration_plan_rejection_and_replan() -> None:
             LLMResponse(text='{"steps":["replanned"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -151,14 +151,14 @@ def test_yolo_integration_clarification_round_trip() -> None:
             LLMResponse(text='{"steps":["clarify"]}', action=None, usage=None),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.clarify",
+                action=ToolCall(tool="agent_clarify",
                     args={"question": "Which environment?"},
                 ),
                 usage=None,
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "clarified"}),
+                action=ToolCall(tool="agent_done", args={"reply": "clarified"}),
                 usage=None,
             ),
         ]
@@ -194,7 +194,7 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "done"}),
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
                 usage=None,
             ),
         ]
@@ -253,7 +253,7 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         responses=[
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "resumed"}),
+                action=ToolCall(tool="agent_done", args={"reply": "resumed"}),
                 usage=None,
             )
         ]
@@ -276,4 +276,12 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         sandbox.stop()
 
     assert all(not (event["type"] == "message" and event.get("role") == "plan") for event in events)
-    assert llm.calls[0]["action_schema"] == Tools({}).schema()
+    action_schema = llm.calls[0]["action_schema"]
+    assert isinstance(action_schema, list)
+    tool_names = [entry.get("name") for entry in action_schema if isinstance(entry, dict)]
+    assert all(isinstance(name, str) and "." not in name for name in tool_names)
+    expected_names = set(Tools({}).list_enabled())
+    expected_names.update(
+        {"agent_done", "agent_clarify", "agent_replan", "agent_read_skill_file"}
+    )
+    assert set(tool_names) == expected_names

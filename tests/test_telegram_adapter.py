@@ -101,7 +101,7 @@ class ScriptedLLM:
     def complete(
         self,
         messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | None = None,
+        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         del messages
         del action_schema
@@ -355,7 +355,7 @@ def test_telegram_integration_task_plan_approve_execute_done(
             ),
             LLMResponse(
                 text="",
-                action=ToolCall(tool="__agent__.done", args={"reply": "complete"}),
+                action=ToolCall(tool="agent_done", args={"reply": "complete"}),
                 usage=None,
             ),
         ]
