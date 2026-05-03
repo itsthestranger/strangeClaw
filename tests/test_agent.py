@@ -431,6 +431,77 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
     assert events[-1]["reply"] == "recovered"
 
 
+@pytest.mark.parametrize(
+    ("bad_tool", "bad_args", "error_fragment"),
+    [
+        ("agent_done", {}, "requires args.reply"),
+        ("agent_clarify", {"question": 123}, "args.question must be a string"),
+        ("agent_replan", {"feedback": 123}, "args.feedback must be a string"),
+        ("agent_read_skill_file", {"skill": "shell"}, "requires args.skill and args.path"),
+    ],
+)
+def test_agent_malformed_control_call_emits_action_error_and_recovers(
+    bad_tool: str,
+    bad_args: dict[str, Any],
+    error_fragment: str,
+) -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["attempt malformed control"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool=bad_tool, args=bad_args),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == bad_tool
+        and event.get("result", {}).get("exit_code") == 1
+    ]
+    assert error_actions
+    assert error_fragment in str(error_actions[0]["result"]["stderr"])
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+    assert events[-1]["reply"] == "recovered"
+
+    # The malformed-control action error must be observed for model self-correction.
+    third_call_payload = json.loads(scripted_llm.calls[2]["messages"][1]["content"])
+    recent_history = third_call_payload["recent_history"]
+    assert any(
+        isinstance(item, dict)
+        and item.get("type") == "action"
+        and item.get("tool") == bad_tool
+        and item.get("result", {}).get("exit_code") == 1
+        for item in recent_history
+    )
+
+
 def test_agent_uses_agent_config_file_when_task_llm_is_disallowed(tmp_path: Path) -> None:
     llm_from_file = {"model": "file/model", "api_key": "file-key"}
     config_path = tmp_path / "config.json"

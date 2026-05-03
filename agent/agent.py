@@ -518,7 +518,15 @@ class Agent:
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if control_tool == _CONTROL_TOOL_DONE:
-            reply = _string_arg(decision.args, "reply", fallback="Task completed.")
+            reply_raw = decision.args.get("reply")
+            if not isinstance(reply_raw, str) or not reply_raw.strip():
+                error_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args=decision.args,
+                    message="agent_done requires args.reply as a non-empty string.",
+                )
+                return {"done": False, "plan": current_plan, "observation": error_event}
+            reply = reply_raw
             self._send(
                 self._build_done_event(
                     goal=goal,
@@ -531,11 +539,18 @@ class Agent:
             return {"done": True, "plan": current_plan, "observation": None}
 
         if control_tool == _CONTROL_TOOL_CLARIFY:
-            question = _string_arg(
-                decision.args,
-                "question",
-                fallback="Please clarify what you want next.",
-            )
+            question_raw = decision.args.get("question")
+            if question_raw is None:
+                question = "Please clarify what you want next."
+            elif isinstance(question_raw, str):
+                question = question_raw or "Please clarify what you want next."
+            else:
+                error_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args=decision.args,
+                    message="agent_clarify args.question must be a string when provided.",
+                )
+                return {"done": False, "plan": current_plan, "observation": error_event}
             self._send({"type": "message", "role": "clarification", "content": question})
             user_reply = self._wait_for_user_reply()
             return {
@@ -549,7 +564,18 @@ class Agent:
             }
 
         if control_tool == _CONTROL_TOOL_REPLAN:
-            feedback = _string_arg(decision.args, "feedback", fallback="")
+            feedback_raw = decision.args.get("feedback")
+            if feedback_raw is None:
+                feedback = ""
+            elif isinstance(feedback_raw, str):
+                feedback = feedback_raw
+            else:
+                error_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args=decision.args,
+                    message="agent_replan args.feedback must be a string when provided.",
+                )
+                return {"done": False, "plan": current_plan, "observation": error_event}
             new_plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
             observation: dict[str, Any] | None = None
             if feedback:
@@ -562,25 +588,35 @@ class Agent:
             }
 
         if control_tool == _CONTROL_TOOL_READ_SKILL_FILE:
-            skill_name = _string_arg(decision.args, "skill", fallback="")
-            relative_path = _string_arg(decision.args, "path", fallback="")
+            skill_raw = decision.args.get("skill")
+            path_raw = decision.args.get("path")
+            if (
+                not isinstance(skill_raw, str)
+                or not skill_raw
+                or not isinstance(path_raw, str)
+                or not path_raw
+            ):
+                error_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args=decision.args,
+                    message=(
+                        "agent_read_skill_file requires args.skill and args.path "
+                        "as non-empty strings."
+                    ),
+                )
+                return {"done": False, "plan": current_plan, "observation": error_event}
+            skill_name = skill_raw
+            relative_path = path_raw
             read_result: ToolResult
-            if not skill_name or not relative_path:
+            try:
+                content = self._skills.read_file(skill_name, relative_path)
+                read_result = ToolResult(exit_code=0, stdout=content, stderr="")
+            except SkillsError as exc:
                 read_result = ToolResult(
                     exit_code=1,
                     stdout="",
-                    stderr="read_skill_file requires args.skill and args.path.",
+                    stderr=f"Skill file read error: {exc}",
                 )
-            else:
-                try:
-                    content = self._skills.read_file(skill_name, relative_path)
-                    read_result = ToolResult(exit_code=0, stdout=content, stderr="")
-                except SkillsError as exc:
-                    read_result = ToolResult(
-                        exit_code=1,
-                        stdout="",
-                        stderr=f"Skill file read error: {exc}",
-                    )
             action_event = {
                 "type": "action",
                 "tool": _CONTROL_TOOL_READ_SKILL_FILE,
@@ -590,18 +626,31 @@ class Agent:
             self._send(action_event)
             return {"done": False, "plan": current_plan, "observation": action_event}
 
-        return {
-            "done": False,
-            "plan": current_plan,
-            "observation": {
-                "type": "control_error",
-                "action": control_tool,
-                "reason": "unsupported control tool",
-            },
-        }
+        error_event = self._emit_control_action_error(
+            tool=control_tool,
+            args=decision.args,
+            message="Unsupported control tool.",
+        )
+        return {"done": False, "plan": current_plan, "observation": error_event}
 
     def _execute_tool(self, decision: ToolCall) -> ToolResult:
         return self._tools.execute(decision)
+
+    def _emit_control_action_error(
+        self,
+        *,
+        tool: str,
+        args: dict[str, Any],
+        message: str,
+    ) -> dict[str, Any]:
+        action_event = {
+            "type": "action",
+            "tool": tool,
+            "args": dict(args),
+            "result": asdict(ToolResult(exit_code=1, stdout="", stderr=message)),
+        }
+        self._send(action_event)
+        return action_event
 
     def _wait_for_user_reply(self) -> dict[str, Any]:
         while True:
@@ -807,13 +856,6 @@ def _parse_text_fallback_action(text: str) -> ToolCall | None:
     if reason is not None and not isinstance(reason, str):
         reason = None
     return ToolCall(tool=tool, args=args, reason=reason)
-
-
-def _string_arg(args: dict[str, Any], key: str, fallback: str) -> str:
-    value = args.get(key)
-    if isinstance(value, str) and value:
-        return value
-    return fallback
 
 
 def _build_execution_action_surface(
