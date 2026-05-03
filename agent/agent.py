@@ -33,6 +33,16 @@ EXECUTION_SYSTEM_PROMPT = (
     "For replan you may set args.feedback."
 )
 
+# Execution-loop invariants:
+# 1. The model issues exactly one structured decision per turn.
+# 2. The runtime never chooses decisions for the model.
+# 3. The runtime only validates, executes, and feeds observations back.
+# 4. Control decisions are model-issued tools: agent_done, agent_clarify,
+#    agent_replan, and agent_read_skill_file.
+# 5. Free-form prose is not a valid execution-loop decision.
+# Hard safety exits (iteration limits, stop events, sandbox/transport failures)
+# remain runtime-owned and are not model decisions.
+
 SUMMARY_SYSTEM_PROMPT = (
     "Summarize agent execution history into concise bullet-style text that preserves "
     "decisions, tool outcomes, and unresolved questions."
@@ -215,6 +225,8 @@ class Agent:
             plan=plan,
         )
 
+        # Strict Inspect -> Choose -> Act -> Observe -> Repeat loop.
+        # Exactly one model-issued structured decision is required per turn.
         for _ in range(self._max_iterations):
             decision = self._choose_next_decision(
                 goal=goal,
@@ -429,10 +441,9 @@ class Agent:
         )
         if response.action is not None:
             return response.action
-        fallback = _parse_text_fallback_action(response.text)
-        if fallback is not None:
-            return fallback
-        raise AgentError("LLM response did not contain an executable action decision.")
+        raise AgentError(
+            "LLM response did not contain exactly one structured execution decision."
+        )
 
     def _choose_next_decision(
         self,
@@ -856,20 +867,6 @@ def _first_json_object_or_array(text: str) -> dict[str, Any] | list[Any] | None:
         if isinstance(parsed, dict | list):
             return parsed
     return None
-
-
-def _parse_text_fallback_action(text: str) -> ToolCall | None:
-    payload = _first_json_object_or_array(text)
-    if not isinstance(payload, dict):
-        return None
-    tool = payload.get("tool")
-    args = payload.get("args")
-    reason = payload.get("reason")
-    if not isinstance(tool, str) or not isinstance(args, dict):
-        return None
-    if reason is not None and not isinstance(reason, str):
-        reason = None
-    return ToolCall(tool=tool, args=args, reason=reason)
 
 
 def _build_execution_action_surface(

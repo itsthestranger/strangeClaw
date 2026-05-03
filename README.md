@@ -157,9 +157,21 @@ High-level runtime shape:
 ```text
 Host (main/coordinator/adapters)
   -> Sandbox (Yolo or Fire)
-    -> Agent loop (plan -> act -> observe -> iterate)
+    -> Agent loop (plan -> inspect -> choose -> act -> observe -> repeat)
       -> Skills + LLM calls inside sandbox
 ```
+
+## Agentic Loop Contract
+
+- Every execution turn must return exactly one structured decision (`tool` + `args`).
+- During execution, free-form assistant prose is not a valid decision.
+- Model-issued control decisions are:
+  - `agent_done` (finish with `args.reply`)
+  - `agent_clarify` (ask user input)
+  - `agent_replan` (request a new plan)
+  - `agent_read_skill_file` (stage-3 read from an activated skill only)
+- The runtime does not choose actions for the model; it only validates, executes, and feeds observations back into history.
+- Runtime-owned safety exits still exist (iteration guard, stop/shutdown, sandbox/runtime failures).
 
 ## Web Search Endpoint Override
 

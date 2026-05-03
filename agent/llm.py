@@ -145,7 +145,6 @@ class LLMClient:
                     completion_kwargs["messages"] = _inject_prompt_action_schema(
                         messages,
                         action_schema,
-                        require_action=True,
                     )
                 else:
                     response_action_mode = "native"
@@ -160,7 +159,6 @@ class LLMClient:
                 completion_kwargs["messages"] = _inject_prompt_action_schema(
                     messages,
                     action_schema,
-                    require_action=True,
                 )
 
         response = litellm.completion(**completion_kwargs)
@@ -395,16 +393,9 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
 def _inject_prompt_action_schema(
     messages: list[dict[str, Any]],
     action_schema: dict[str, Any] | list[dict[str, Any]],
-    *,
-    require_action: bool = True,
 ) -> list[dict[str, Any]]:
     schema_text = json.dumps(action_schema, separators=(",", ":"), ensure_ascii=True)
-    if not require_action:
-        instruction = (
-            "When selecting a tool, return ONLY a JSON object matching this schema: "
-            f"{schema_text}. If no tool is needed, respond normally."
-        )
-    elif isinstance(action_schema, list):
+    if isinstance(action_schema, list):
         instruction = (
             "Return exactly one structured action as ONLY a JSON object with keys "
             "tool (string) and args (object) where tool is one of the listed names "
