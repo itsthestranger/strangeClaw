@@ -37,6 +37,23 @@ def _skills_root() -> Path:
     return Path(__file__).resolve().parents[1] / "skills"
 
 
+def _build_temp_skill(skills_root: Path, *, name: str = "demo") -> None:
+    skill_dir = skills_root / name
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        (
+            "---\n"
+            f"name: {name}\n"
+            "description: Demo skill for integration tests\n"
+            "---\n\n"
+            "Use this skill in integration tests.\n"
+        ),
+        encoding="utf-8",
+    )
+    (references_dir / "notes.md").write_text("skill-reference-content\n", encoding="utf-8")
+
+
 def _agent_config() -> dict[str, Any]:
     return {"llm": {"model": "fake/model", "api_key": "fake-key"}}
 
@@ -285,3 +302,94 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
         {"agent_done", "agent_clarify", "agent_replan", "agent_read_skill_file"}
     )
     assert set(tool_names) == expected_names
+
+
+def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    llm = ScriptedLLM(
+        responses=[
+            LLMResponse(
+                text='{"goal":"integration task","steps":["inspect"],"referenced_skills":[]}',
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="agent_replan",
+                    args={"feedback": "Need skill-backed plan"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text=(
+                    '{"goal":"integration task","steps":["read reference","finish"],'
+                    '"referenced_skills":["demo"]}'
+                ),
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="agent_read_skill_file",
+                    args={"skill": "demo", "path": "references/notes.md"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="shell", args={"command": "printf integrated"}),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "autonomous done"}),
+                usage=None,
+            ),
+        ]
+    )
+    captured_llm_config: dict[str, Any] = {}
+
+    def llm_factory(config: dict[str, Any]) -> ScriptedLLM:
+        captured_llm_config.update(config)
+        return llm
+
+    sandbox = YoloSandbox(
+        skills_dir=str(skills_root),
+        llm_factory=llm_factory,
+        agent_config=_agent_config(),
+    )
+    task = _task(approval_mode="auto")
+    task["llm"] = {"model": "inline/model", "api_key": "inline-key"}
+    sandbox.run(task)
+    try:
+        events = _collect_until_done(sandbox)
+    finally:
+        sandbox.stop()
+
+    # Yolo must use construction-time config and ignore task-inline llm config.
+    assert captured_llm_config == _agent_config()["llm"]
+
+    plan_events = [
+        event for event in events if event["type"] == "message" and event.get("role") == "plan"
+    ]
+    assert len(plan_events) == 2
+    assert plan_events[1]["content"]["referenced_skills"] == ["demo"]
+
+    read_actions = [
+        event
+        for event in events
+        if event["type"] == "action" and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_actions
+    assert read_actions[0]["result"]["exit_code"] == 0
+    assert "skill-reference-content" in read_actions[0]["result"]["stdout"]
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    assert done_event["success"] is True
+    assert done_event["reply"] == "autonomous done"

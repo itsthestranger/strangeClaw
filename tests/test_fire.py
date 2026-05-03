@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+from agent.protocol import encode_event
 from sandbox.fire import (
     DEFAULT_BOOT_ARGS,
     FirecrackerAPIClient,
@@ -798,6 +799,154 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
     assert iptables_manager.cleanup_ports == ()
     assert tap_manager.destroyed == ["fc123456789abc"]
     assert cid_manager.released == [52]
+
+
+def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+
+    event_stream = [
+        {"type": "agent_ready"},
+        {
+            "type": "message",
+            "role": "plan",
+            "content": {
+                "goal": "integration task",
+                "steps": ["inspect"],
+                "referenced_skills": [],
+            },
+        },
+        {
+            "type": "message",
+            "role": "plan",
+            "content": {
+                "goal": "integration task",
+                "steps": ["read reference", "finish"],
+                "referenced_skills": ["demo"],
+            },
+        },
+        {
+            "type": "action",
+            "tool": "agent_read_skill_file",
+            "args": {"skill": "demo", "path": "references/notes.md"},
+            "result": {"exit_code": 0, "stdout": "skill-reference-content\n", "stderr": ""},
+        },
+        {
+            "type": "action",
+            "tool": "shell",
+            "args": {"command": "printf integrated"},
+            "result": {"exit_code": 0, "stdout": "integrated", "stderr": ""},
+        },
+        {
+            "type": "done",
+            "success": True,
+            "reply": "autonomous done",
+            "state": {
+                "goal": "integration task",
+                "plan": {"steps": ["read reference", "finish"], "referenced_skills": ["demo"]},
+                "history": [],
+                "summary": "",
+            },
+            "files": [
+                {
+                    "path": "artifact.txt",
+                    "content_b64": "aW50ZWdyYXRlZA==",
+                    "size_bytes": 10,
+                }
+            ],
+        },
+    ]
+    stream_chunk = (
+        b"OK 100\n" + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+    )
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[stream_chunk])]
+    )
+
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    task = {
+        "type": "task",
+        "text": "integration task",
+        "session_id": "sess-c33g-fire",
+        "approval_mode": "auto",
+        "llm": {
+            "model": "inline/model",
+            "api_key": "sk-inline",
+            "max_tokens": 2048,
+            "temperature": 0.7,
+        },
+    }
+    sandbox.run(task)
+    events: list[dict[str, Any]] = []
+    while True:
+        event = sandbox.receive(timeout_seconds=1.0)
+        assert event is not None
+        events.append(event)
+        if event.get("type") == "done":
+            break
+
+    # Capture preboot payload assertions before stop() issues CtrlAltDel API calls.
+    mmds_payload = api_factory.payload_for("/mmds")
+
+    try:
+        # Fire mode must use MMDS-delivered config and must not forward task-inline llm.
+        sent_payloads = socket_factory.sockets[0].sent
+        assert sent_payloads[0] == b"CONNECT 5000\n"
+        assert b'"type":"task"' in sent_payloads[1]
+        assert b'"approval_mode":"auto"' in sent_payloads[1]
+        assert b'"llm"' not in sent_payloads[1]
+        assert mmds_payload["config"]["llm"]["api_key"] == "sk-host"
+        assert mmds_payload["config"]["llm"]["model"] == "openai/gpt-4.1-mini"
+        assert mmds_payload["config"]["skills"]["max_file_chars"] == 20000
+
+        # Deterministic autonomous loop stream includes replan, skill-file read, and done.
+        plan_events = [
+            event
+            for event in events
+            if event.get("type") == "message" and event.get("role") == "plan"
+        ]
+        assert len(plan_events) == 2
+        read_actions = [
+            event
+            for event in events
+            if event.get("type") == "action"
+            and event.get("tool") == "agent_read_skill_file"
+        ]
+        assert read_actions
+        assert read_actions[0]["result"]["exit_code"] == 0
+
+        done_event = events[-1]
+        assert done_event["type"] == "done"
+        assert done_event["success"] is True
+        assert done_event["reply"] == "autonomous done"
+        assert done_event["files"]
+        assert done_event["files"][0]["path"] == "artifact.txt"
+        assert not done_event["files"][0]["path"].startswith("/")
+    finally:
+        sandbox.stop()
 
 
 def test_fire_sandbox_connect_retries_with_new_socket(tmp_path: Path) -> None:
