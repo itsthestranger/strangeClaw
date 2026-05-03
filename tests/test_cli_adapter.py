@@ -72,6 +72,7 @@ def test_run_handles_plan_approval_and_done(
             {
                 "type": "action",
                 "tool": "shell",
+                "args": {"command": "echo ok"},
                 "result": {"exit_code": 0, "stdout": "", "stderr": ""},
             },
             {"type": "done", "success": True, "reply": "All good.", "state": {}, "files": []},
