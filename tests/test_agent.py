@@ -941,6 +941,272 @@ def test_agent_native_read_skill_file_failure_paths(
     assert events[-1]["success"] is True
 
 
+def test_agent_prompt_read_skill_file_success_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    execution_turn = 0
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        nonlocal execution_turn
+        messages = kwargs.get("messages")
+        first_content = ""
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            content = messages[0].get("content")
+            if isinstance(content, str):
+                first_content = content
+        if first_content.startswith("Return exactly one structured action"):
+            execution_turn += 1
+            if execution_turn == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"tool":"agent_read_skill_file","args":{"skill":"demo",'
+                                    '"path":"references/notes.md"}}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"tool":"agent_done","args":{"reply":"done"}}'
+                        }
+                    }
+                ]
+            }
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"goal":"g","steps":["read"],"referenced_skills":["demo"]}'
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(skills_root),
+        llm_factory=lambda config: LLMClient.from_config(
+            {
+                **config,
+                "structured_output": "prompt",
+            }
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_actions
+    assert read_actions[0]["result"]["exit_code"] == 0
+    assert "skill-reference-content" in read_actions[0]["result"]["stdout"]
+
+
+@pytest.mark.parametrize(
+    ("plan_payload", "control_payload", "expected_error_fragment"),
+    [
+        (
+            '{"goal":"g","steps":["read"],"referenced_skills":["demo"]}',
+            '{"tool":"agent_read_skill_file","args":{"skill":"demo"}}',
+            "requires args.skill and args.path",
+        ),
+        (
+            '{"goal":"g","steps":["read"],"referenced_skills":[]}',
+            (
+                '{"tool":"agent_read_skill_file","args":{"skill":"demo",'
+                '"path":"references/notes.md"}}'
+            ),
+            "not activated",
+        ),
+    ],
+)
+def test_agent_prompt_read_skill_file_failure_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plan_payload: str,
+    control_payload: str,
+    expected_error_fragment: str,
+) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    execution_turn = 0
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        nonlocal execution_turn
+        messages = kwargs.get("messages")
+        first_content = ""
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            content = messages[0].get("content")
+            if isinstance(content, str):
+                first_content = content
+        if first_content.startswith("Return exactly one structured action"):
+            execution_turn += 1
+            if execution_turn == 1:
+                return {"choices": [{"message": {"content": control_payload}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"tool":"agent_done","args":{"reply":"done"}}'
+                        }
+                    }
+                ]
+            }
+        return {"choices": [{"message": {"content": plan_payload}}]}
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(skills_root),
+        llm_factory=lambda config: LLMClient.from_config(
+            {
+                **config,
+                "structured_output": "prompt",
+            }
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_actions
+    assert read_actions[0]["result"]["exit_code"] == 1
+    assert expected_error_fragment in str(read_actions[0]["result"]["stderr"])
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+
+
+def test_agent_prompt_recovers_after_decision_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    execution_turn = 0
+    execution_payloads: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        nonlocal execution_turn
+        messages = kwargs.get("messages")
+        first_content = ""
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            content = messages[0].get("content")
+            if isinstance(content, str):
+                first_content = content
+        if first_content.startswith("Return exactly one structured action"):
+            execution_turn += 1
+            if isinstance(messages, list) and messages and isinstance(messages[-1], dict):
+                user_payload = messages[-1].get("content")
+                if isinstance(user_payload, str):
+                    execution_payloads.append(json.loads(user_payload))
+            if execution_turn == 1:
+                return {"choices": [{"message": {"content": "I will proceed now."}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"tool":"agent_done","args":{"reply":"recovered"}}'
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"goal":"g","steps":["attempt"],"referenced_skills":[]}'
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda config: LLMClient.from_config(
+            {
+                **config,
+                "structured_output": "prompt",
+            }
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_decision_error"
+    ]
+    assert error_actions
+    assert error_actions[0]["result"]["exit_code"] == 1
+    assert "Decision parse error" in str(error_actions[0]["result"]["stderr"])
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+    assert events[-1]["reply"] == "recovered"
+
+    assert len(execution_payloads) == 2
+    second_turn_history = execution_payloads[1]["recent_history"]
+    assert any(
+        isinstance(item, dict)
+        and item.get("type") == "action"
+        and item.get("tool") == "agent_decision_error"
+        and item.get("result", {}).get("exit_code") == 1
+        for item in second_turn_history
+    )
+
+
 def test_agent_main_requires_vsock_port() -> None:
     with pytest.raises(ValueError, match="--vsock-port"):
         agent_module.main([])

@@ -372,6 +372,72 @@ def test_native_control_decisions_require_control_tools_in_schema(
     assert result_without_control.action is None
 
 
+@pytest.mark.parametrize(
+    ("control_tool", "control_args"),
+    [
+        ("agent_done", {"reply": "done"}),
+        ("agent_clarify", {"question": "Which environment?"}),
+        ("agent_replan", {"feedback": "Need revised steps"}),
+        ("agent_read_skill_file", {"skill": "demo", "path": "references/notes.md"}),
+    ],
+)
+def test_prompt_control_decisions_require_control_tools_in_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    control_tool: str,
+    control_args: dict[str, Any],
+) -> None:
+    captured_calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        captured_calls.append(kwargs)
+        messages = kwargs.get("messages")
+        instruction = ""
+        if isinstance(messages, list) and messages:
+            first_message = messages[0]
+            if isinstance(first_message, dict):
+                first_content = first_message.get("content")
+                if isinstance(first_content, str):
+                    instruction = first_content
+        if control_tool in instruction:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"tool": control_tool, "args": control_args},
+                                separators=(",", ":"),
+                            )
+                        }
+                    }
+                ]
+            }
+        return {"choices": [{"message": {"content": "no structured action"}}]}
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    client = LLMClient(
+        model="ollama/llama3.1",
+        api_key="",
+        structured_output="prompt",
+    )
+
+    result_with_control = client.complete(
+        messages=[{"role": "user", "content": "execute one control step"}],
+        action_schema=EXECUTION_SURFACE_SCHEMA,
+    )
+    assert result_with_control.action is not None
+    assert result_with_control.action.tool == control_tool
+    assert result_with_control.action.args == control_args
+    first_instruction = captured_calls[0]["messages"][0]["content"]
+    assert control_tool in first_instruction
+
+    # This guards against regressions where control decisions disappear from the schema.
+    result_without_control = client.complete(
+        messages=[{"role": "user", "content": "execute one control step"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+    assert result_without_control.action is None
+
+
 def test_native_structured_output_can_use_string_tool_choice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
