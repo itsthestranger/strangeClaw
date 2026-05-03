@@ -16,12 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "skill": {"type": "string"},
-        "action": {"type": "string"},
+        "tool": {"type": "string"},
         "args": {"type": "object"},
         "reason": {"type": "string"},
     },
-    "required": ["skill", "action", "args"],
+    "required": ["tool", "args"],
 }
 MISSING_ENV_RE = re.compile(
     r"Missing environment variable '([^']+)' required by config field '([^']+)'\."
@@ -142,8 +141,7 @@ def main() -> int:
         print(
             json.dumps(
                 {
-                    "skill": response.action.skill,
-                    "action": response.action.action,
+                    "tool": response.action.tool,
                     "args": response.action.args,
                     "reason": response.action.reason,
                 },

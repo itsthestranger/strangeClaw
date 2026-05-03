@@ -173,23 +173,23 @@ Host (main/coordinator/adapters)
 - The runtime does not choose actions for the model; it only validates, executes, and feeds observations back into history.
 - Runtime-owned safety exits still exist (iteration guard, stop/shutdown, sandbox/runtime failures).
 
-## Web Search Endpoint Override
+## Web Search Configuration
 
-`web-search` uses DuckDuckGo by default. Override with:
+`web_search` is configured via `config.yaml` (not environment-variable override).
+Set:
 
-```bash
-export SC_WEB_SEARCH_ENDPOINT="https://your-endpoint.example/search"
+```yaml
+web_search:
+  endpoint: "https://api.search.brave.com/res/v1/web/search"
+  format: "brave"      # or "searxng"
+  api_key: ""          # required for brave
+  max_results: 10
 ```
 
 Behavior:
-- Applies only to `web-search` `search` action.
-- If value contains `{query}`, strangeclaw substitutes URL-encoded query text.
-- If value starts with `file://` or `data:`, it is used as-is.
-- Otherwise, strangeclaw appends standard query params (`q`, `format`,
-  `no_redirect`, `no_html`, `skip_disambig`).
-
-Expected endpoint response: JSON object with optional `AbstractText`,
-`AbstractURL`, and `RelatedTopics` entries.
+- `format: brave` sends `q=<query>` and uses `X-Subscription-Token`.
+- `format: searxng` sends `q=<query>&format=json`.
+- Results are normalized into `{title, url, snippet}` for the model.
 
 ## Telegram Setup
 

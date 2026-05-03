@@ -71,7 +71,7 @@ def test_run_handles_plan_approval_and_done(
             {"type": "message", "role": "plan", "content": {"steps": ["one", "two"]}},
             {
                 "type": "action",
-                "tool": "shell.run",
+                "tool": "shell",
                 "result": {"exit_code": 0, "stdout": "", "stderr": ""},
             },
             {"type": "done", "success": True, "reply": "All good.", "state": {}, "files": []},
@@ -93,7 +93,7 @@ def test_run_handles_plan_approval_and_done(
 
     output = capsys.readouterr().out
     assert "Plan:" in output
-    assert "Action: shell.run (exit=0)" in output
+    assert "Action: shell (exit=0)" in output
     assert "Success: All good." in output
 
 
