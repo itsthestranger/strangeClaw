@@ -8,14 +8,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+import trafilatura
 from requests import Response
 
 from agent.llm import ToolCall
-
-try:
-    import trafilatura
-except ImportError:  # pragma: no cover - handled at runtime
-    trafilatura = None
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
@@ -376,15 +372,6 @@ class Tools:
 
             title: str | None = None
             if content_type == "text/html":
-                if trafilatura is None:
-                    error_payload = _wrap_external_data(
-                        {
-                            "success": False,
-                            "url": target_url,
-                            "error": "trafilatura dependency is required for HTML extraction.",
-                        }
-                    )
-                    return ToolResult(exit_code=1, stdout=error_payload, stderr="")
                 html = raw_body.decode("utf-8", errors="replace")
                 extracted = trafilatura.extract(
                     html,
@@ -410,9 +397,10 @@ class Tools:
             original_length = len(text)
             truncated_text, was_truncated = _truncate_text(text, limit=max_chars)
             if size_limited:
-                truncated_text = (
-                    f"{truncated_text}\n\n[... response body capped at {_WEB_FETCH_MAX_BYTES} bytes ...]"
+                truncated_notice = (
+                    f"\n\n[... response body capped at {_WEB_FETCH_MAX_BYTES} bytes ...]"
                 )
+                truncated_text = f"{truncated_text}{truncated_notice}"
                 was_truncated = True
 
             payload = _wrap_external_data(
@@ -443,7 +431,11 @@ class Tools:
     def _execute_http_request(self, args: dict[str, Any]) -> ToolResult:
         method_raw = args.get("method")
         if not isinstance(method_raw, str) or not method_raw.strip():
-            return ToolResult(exit_code=1, stdout="", stderr="http_request.method must be a string.")
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="http_request.method must be a string.",
+            )
         method = method_raw.strip().upper()
         if method not in _HTTP_REQUEST_ALLOWED_METHODS:
             allowed = ", ".join(sorted(_HTTP_REQUEST_ALLOWED_METHODS))
@@ -559,7 +551,11 @@ def _normalize_brave_results(payload: dict[str, Any], *, max_results: int) -> li
     return normalized
 
 
-def _normalize_searxng_results(payload: dict[str, Any], *, max_results: int) -> list[dict[str, str]]:
+def _normalize_searxng_results(
+    payload: dict[str, Any],
+    *,
+    max_results: int,
+) -> list[dict[str, str]]:
     raw_results = payload.get("results")
     if not isinstance(raw_results, list):
         return []

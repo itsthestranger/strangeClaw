@@ -157,7 +157,8 @@ def test_read_file_returns_content_and_truncates(tmp_path: Path) -> None:
     content_path.write_text("abcdef", encoding="utf-8")
 
     skills = Skills(str(tmp_path), max_file_chars=4)
-    assert skills.read_file("reader", "references/data.txt") == "abcd\n\n[... truncated, original 6 chars ...]"
+    expected = "abcd\n\n[... truncated, original 6 chars ...]"
+    assert skills.read_file("reader", "references/data.txt") == expected
 
 
 def test_read_file_rejects_traversal_absolute_and_missing_paths(tmp_path: Path) -> None:

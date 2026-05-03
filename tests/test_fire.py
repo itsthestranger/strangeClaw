@@ -810,7 +810,7 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
     api_factory = _FakeApiFactory()
     process_factory = _FakePopenFactory()
 
-    event_stream = [
+    event_stream: list[dict[str, Any]] = [
         {"type": "agent_ready"},
         {
             "type": "message",

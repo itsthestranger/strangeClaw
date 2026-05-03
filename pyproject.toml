@@ -33,6 +33,7 @@ packages = ["agent", "adapters", "sandbox"]
 target-version = "py311"
 line-length = 100
 src = ["."]
+extend-exclude = [".tmp"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -45,3 +46,7 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 no_implicit_optional = true
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["requests", "requests.*"]
+ignore_missing_imports = true

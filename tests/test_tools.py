@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from typing import Any
 
 import requests
 
+from agent.llm import ToolCall
 from agent.tools import Tools
-
-
-@dataclass(slots=True)
-class _Call:
-    tool: str
-    args: dict[str, object]
 
 
 class _FakeResponse:
@@ -89,7 +83,7 @@ class _FakeTrafilatura:
 def test_tools_shell_execute_success() -> None:
     tools = Tools(config={})
 
-    result = tools.execute(_Call(tool="shell", args={"command": "printf 'hello'"}))
+    result = tools.execute(ToolCall(tool="shell", args={"command": "printf 'hello'"}))
 
     assert result.exit_code == 0
     assert result.stdout == "hello"
@@ -108,7 +102,7 @@ def test_tools_schema_excludes_disabled_shell() -> None:
 def test_tools_execute_rejects_disabled_tool() -> None:
     tools = Tools(config={"tools": {"shell": False}})
 
-    result = tools.execute(_Call(tool="shell", args={"command": "echo should-not-run"}))
+    result = tools.execute(ToolCall(tool="shell", args={"command": "echo should-not-run"}))
 
     assert result.exit_code == 1
     assert result.stdout == ""
@@ -119,7 +113,7 @@ def test_tools_shell_output_truncates_long_text() -> None:
     tools = Tools(config={})
     command = "python - <<'PY'\nprint('a' * 9005)\nPY"
 
-    result = tools.execute(_Call(tool="shell", args={"command": command}))
+    result = tools.execute(ToolCall(tool="shell", args={"command": command}))
 
     assert result.exit_code == 0
     assert "...[truncated" in result.stdout
@@ -163,7 +157,7 @@ def test_tools_web_search_normalizes_brave(monkeypatch: Any) -> None:
         }
     )
 
-    result = tools.execute(_Call(tool="web_search", args={"query": "llm"}))
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "llm"}))
 
     assert result.exit_code == 0
     assert result.stderr == ""
@@ -209,7 +203,7 @@ def test_tools_web_search_normalizes_searxng(monkeypatch: Any) -> None:
         }
     )
 
-    result = tools.execute(_Call(tool="web_search", args={"query": "solid state batteries"}))
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "solid state batteries"}))
 
     assert result.exit_code == 0
     assert _unwrap_data(result.stdout)["results"] == [
@@ -229,7 +223,7 @@ def test_tools_web_search_brave_requires_api_key() -> None:
         }
     )
 
-    result = tools.execute(_Call(tool="web_search", args={"query": "test"}))
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "test"}))
 
     assert result.exit_code == 1
     assert result.stderr == "web_search.api_key is required when web_search.format is brave."
@@ -250,7 +244,7 @@ def test_tools_web_fetch_html_uses_trafilatura(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.trafilatura", _FakeTrafilatura())
     tools = Tools(config={"web_fetch": {"max_chars": 20000}})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://example.com"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 0
     payload = _unwrap_data(result.stdout)
@@ -275,7 +269,7 @@ def test_tools_web_fetch_json_returns_body(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.requests.get", fake_get)
     tools = Tools(config={})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://api.example.com/data"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://api.example.com/data"}))
 
     assert result.exit_code == 0
     payload = _unwrap_data(result.stdout)
@@ -295,7 +289,7 @@ def test_tools_web_fetch_pdf_returns_metadata_hint(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.requests.get", fake_get)
     tools = Tools(config={})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://example.com/doc.pdf"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/doc.pdf"}))
 
     assert result.exit_code == 0
     payload = _unwrap_data(result.stdout)
@@ -315,7 +309,7 @@ def test_tools_web_fetch_truncates_at_max_chars(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.requests.get", fake_get)
     tools = Tools(config={"web_fetch": {"max_chars": 10}})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://example.com/text"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/text"}))
 
     assert result.exit_code == 0
     payload = _unwrap_data(result.stdout)
@@ -333,7 +327,7 @@ def test_tools_web_fetch_handles_request_error(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.requests.get", fake_get)
     tools = Tools(config={})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://example.com"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 1
     payload = _unwrap_data(result.stdout)
@@ -355,7 +349,7 @@ def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
     monkeypatch.setattr("agent.tools.requests.get", fake_get)
     tools = Tools(config={"web_fetch": {"max_chars": 6000000}})
 
-    result = tools.execute(_Call(tool="web_fetch", args={"url": "https://example.com/huge"}))
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/huge"}))
 
     assert result.exit_code == 0
     payload = _unwrap_data(result.stdout)
@@ -378,7 +372,7 @@ def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
     tools = Tools(config={})
 
     result = tools.execute(
-        _Call(
+        ToolCall(
             tool="http_request",
             args={
                 "method": "post",
@@ -406,7 +400,7 @@ def test_tools_http_request_invalid_method_rejected() -> None:
     tools = Tools(config={})
 
     result = tools.execute(
-        _Call(
+        ToolCall(
             tool="http_request",
             args={"method": "OPTIONS", "url": "https://api.example.com"},
         )
@@ -425,7 +419,7 @@ def test_tools_http_request_request_error(monkeypatch: Any) -> None:
     tools = Tools(config={})
 
     result = tools.execute(
-        _Call(
+        ToolCall(
             tool="http_request",
             args={"method": "GET", "url": "https://api.example.com"},
         )

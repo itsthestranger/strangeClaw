@@ -943,6 +943,8 @@ def _read_loop_max_iterations(agent_config: dict[str, Any], *, fallback: int) ->
         raw = agent_config.get("max_iterations")
     if isinstance(raw, bool):
         return fallback
+    if raw is None:
+        return fallback
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -958,6 +960,8 @@ def _read_context_int(agent_config: dict[str, Any], key: str, *, fallback: int) 
         return fallback
     raw = context_cfg.get(key)
     if isinstance(raw, bool):
+        return fallback
+    if raw is None:
         return fallback
     try:
         value = int(raw)
