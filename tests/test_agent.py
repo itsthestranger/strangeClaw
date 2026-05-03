@@ -53,6 +53,23 @@ def _skills_root() -> Path:
     return Path(__file__).resolve().parents[1] / "skills"
 
 
+def _build_temp_skill(skills_root: Path, *, name: str = "demo") -> None:
+    skill_dir = skills_root / name
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        (
+            "---\n"
+            f"name: {name}\n"
+            "description: Demo skill for tests\n"
+            "---\n\n"
+            "Use this skill in tests.\n"
+        ),
+        encoding="utf-8",
+    )
+    (references_dir / "notes.md").write_text("skill-reference-content\n", encoding="utf-8")
+
+
 def _task_event(approval_mode: str = "auto") -> dict[str, Any]:
     return {
         "type": "task",
@@ -599,7 +616,62 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
     ]
     assert read_events
     assert read_events[0]["result"]["exit_code"] == 1
-    assert "unknown skill" in read_events[0]["result"]["stderr"].lower()
+    assert "not activated" in read_events[0]["result"]["stderr"].lower()
+
+
+def test_agent_stage3_read_skill_file_allows_activated_skill(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _build_temp_skill(skills_root, name="demo")
+
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(
+                text='{"goal":"g","steps":["read"],"referenced_skills":["demo"]}',
+                action=None,
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="agent_read_skill_file",
+                    args={"skill": "demo", "path": "references/notes.md"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(skills_root),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    read_events = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_read_skill_file"
+    ]
+    assert read_events
+    assert read_events[0]["result"]["exit_code"] == 0
+    assert "skill-reference-content" in read_events[0]["result"]["stdout"]
 
 
 def test_agent_replans_when_plan_references_unknown_skill() -> None:

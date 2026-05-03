@@ -230,6 +230,7 @@ class Agent:
                 goal=goal,
                 approval_mode=approval_mode,
                 current_plan=plan,
+                activated_skills=activated_skills,
                 history=history,
             )
             plan = outcome["plan"]
@@ -479,6 +480,7 @@ class Agent:
         goal: str,
         approval_mode: str,
         current_plan: Any,
+        activated_skills: dict[str, dict[str, Any]],
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if decision.tool in _CONTROL_TOOL_NAMES:
@@ -488,6 +490,7 @@ class Agent:
                 goal=goal,
                 approval_mode=approval_mode,
                 current_plan=current_plan,
+                activated_skills=activated_skills,
                 history=history,
             )
 
@@ -515,6 +518,7 @@ class Agent:
         goal: str,
         approval_mode: str,
         current_plan: Any,
+        activated_skills: dict[str, dict[str, Any]],
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if control_tool == _CONTROL_TOOL_DONE:
@@ -607,6 +611,16 @@ class Agent:
                 return {"done": False, "plan": current_plan, "observation": error_event}
             skill_name = skill_raw
             relative_path = path_raw
+            if skill_name not in activated_skills:
+                denied_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args={"skill": skill_name, "path": relative_path},
+                    message=(
+                        f"Skill file read denied: skill '{skill_name}' is not activated "
+                        "for this plan."
+                    ),
+                )
+                return {"done": False, "plan": current_plan, "observation": denied_event}
             read_result: ToolResult
             try:
                 content = self._skills.read_file(skill_name, relative_path)
