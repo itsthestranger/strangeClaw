@@ -191,6 +191,32 @@ Behavior:
 - `format: searxng` sends `q=<query>&format=json`.
 - Results are normalized into `{title, url, snippet}` for the model.
 
+SearXNG local setup note:
+- I run SearXNG from Docker using the official container installation guide:
+  https://docs.searxng.org/admin/installation-docker.html
+- The standard Compose setup exposes SearXNG on `http://localhost:8080`.
+  Configure strangeclaw like this:
+  ```yaml
+  web_search:
+    endpoint: "http://localhost:8080/search"
+    format: "searxng"
+    api_key: ""
+    max_results: 10
+  ```
+- In SearXNG's `settings.yml`, allow JSON output or requests with
+  `format=json` will be rejected. The relevant setting is:
+  ```yaml
+  search:
+    formats:
+      - html
+      - json
+  ```
+
+Future direction:
+- A host-side request broker is planned and currently in work. Once complete,
+  HTTP/search/API requests and credential injection will move behind a host-side
+  policy layer so secrets do not need to be sent into the agent sandbox.
+
 ## Skills Config Defaults
 
 If `skills` is omitted in `config.yaml`, strangeclaw defaults to:
