@@ -12,6 +12,7 @@ Use this skill when a task requires interacting with the GitHub REST API: creati
 
 ## Authentication
 Use the `http_request` tool with `integration: "github"` when the GitHub token is configured under `integrations.github.token`. Do not ask the user to paste raw GitHub tokens into the task. If the integration is not available or a call reports that it is not configured, ask the user to configure `integrations.github.token`.
+If multiple GitHub integrations are configured under different names, ask which integration name to use before making write calls.
 
 The `http_request` tool injects the `Authorization`, `Accept`, and `X-GitHub-Api-Version` headers from config when `integration: "github"` is used. Do not include an `Authorization` header yourself. Use base URL `https://api.github.com`.
 

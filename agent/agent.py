@@ -773,10 +773,29 @@ class Agent:
             "",
             "Available skills:",
             json.dumps(self._skills.index(), ensure_ascii=True, indent=2),
-            "",
-            "Return JSON with keys: goal (string), steps (array of strings), "
-            "referenced_skills (array of skill names, may be empty).",
         ]
+        broker_context = _request_broker_prompt_context(self._agent_config)
+        if broker_context is not None:
+            prompt_lines.extend(
+                [
+                    "",
+                    "Request broker integration metadata (safe, no tokens):",
+                    json.dumps(
+                        broker_context["integration_metadata"],
+                        ensure_ascii=True,
+                        indent=2,
+                    ),
+                    "",
+                    broker_context["planning_instruction"],
+                ]
+            )
+        prompt_lines.extend(
+            [
+                "",
+                "Return JSON with keys: goal (string), steps (array of strings), "
+                "referenced_skills (array of skill names, may be empty).",
+            ]
+        )
         if feedback:
             prompt_lines.extend(["", f"User feedback for re-plan:\n{feedback}"])
         return [
@@ -807,6 +826,14 @@ class Agent:
                 "recent_history": recent_history,
                 "output_instruction": "Place any files for the user in /output/.",
             }
+            broker_context = _request_broker_prompt_context(self._agent_config)
+            if broker_context is not None:
+                user_payload["request_broker"] = {
+                    "enabled": True,
+                    "brokered_tools": ["http_request", "web_search", "web_fetch"],
+                    "integration_metadata": broker_context["integration_metadata"],
+                    "instruction": broker_context["execution_instruction"],
+                }
             messages = [
                 {"role": "system", "content": EXECUTION_SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
@@ -902,6 +929,79 @@ def _build_execution_action_surface(
         )
         seen_names.add(name)
     return surface
+
+
+def _request_broker_prompt_context(
+    agent_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(agent_config, dict):
+        return None
+    broker_raw = agent_config.get("request_broker")
+    if not isinstance(broker_raw, dict):
+        return None
+
+    enabled = broker_raw.get("enabled", True)
+    expose = broker_raw.get("expose_integration_metadata", True)
+    if not isinstance(enabled, bool) or not isinstance(expose, bool):
+        return None
+    if not enabled or not expose:
+        return None
+
+    metadata_raw = broker_raw.get("integration_metadata", [])
+    if not isinstance(metadata_raw, list):
+        metadata_raw = []
+    metadata: list[dict[str, Any]] = []
+    for item in metadata_raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        metadata.append(
+            {
+                "name": name.strip(),
+                "type": _coerce_text(item.get("type"), fallback="bearer"),
+                "allowed_hosts": _coerce_text_list(item.get("allowed_hosts")),
+                "allowed_methods": _coerce_text_list(item.get("allowed_methods")),
+                "allowed_paths": _coerce_text_list(item.get("allowed_paths")),
+            }
+        )
+
+    base_instruction = (
+        "Use integration names in http_request.integration for credentialed API calls. "
+        "Do not ask for raw tokens and do not ask the user to paste credentials into task text."
+    )
+    if metadata:
+        planning_instruction = (
+            f"{base_instruction} Choose integrations by allowed hosts/methods/paths."
+        )
+    else:
+        planning_instruction = (
+            f"{base_instruction} No named integrations are configured; ask the user to configure "
+            "a named integration in host secrets."
+        )
+
+    return {
+        "integration_metadata": metadata,
+        "planning_instruction": planning_instruction,
+        "execution_instruction": planning_instruction,
+    }
+
+
+def _coerce_text(value: Any, *, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _coerce_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+    return result
 
 
 def _read_skills_max_file_chars(agent_config: dict[str, Any] | None) -> int:

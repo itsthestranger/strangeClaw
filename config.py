@@ -135,6 +135,7 @@ def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_web_fetch_optional_fields(config)
     _validate_skills_optional_fields(config)
     _validate_integrations_optional_fields(config)
+    _validate_request_broker_optional_fields(config)
     _validate_firecracker_optional_fields(config)
     _validate_session_journal_optional_fields(config)
 
@@ -285,6 +286,93 @@ def _validate_integrations_optional_fields(config: dict[str, Any]) -> None:
         config["integrations"] = validate_integrations_config(config.get("integrations"))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+
+
+def _validate_request_broker_optional_fields(config: dict[str, Any]) -> None:
+    broker_section = config.get("request_broker")
+    if broker_section is None:
+        config["request_broker"] = {
+            "enabled": True,
+            "expose_integration_metadata": True,
+            "integration_metadata": [],
+        }
+        return
+    if not isinstance(broker_section, dict):
+        raise ConfigError("Config field request_broker must be a mapping.")
+
+    enabled = broker_section.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("Config field request_broker.enabled must be a boolean.")
+
+    expose = broker_section.get("expose_integration_metadata", True)
+    if not isinstance(expose, bool):
+        raise ConfigError(
+            "Config field request_broker.expose_integration_metadata must be a boolean."
+        )
+
+    raw_metadata = broker_section.get("integration_metadata", [])
+    if raw_metadata is None:
+        raw_metadata = []
+    if not isinstance(raw_metadata, list):
+        raise ConfigError(
+            "Config field request_broker.integration_metadata must be a list when provided."
+        )
+
+    normalized_metadata: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_metadata):
+        if not isinstance(item, dict):
+            raise ConfigError(
+                "Config field request_broker.integration_metadata must contain mappings "
+                f"(invalid at index {index})."
+            )
+        normalized_metadata.append(
+            {
+                "name": _require_metadata_string(
+                    item.get("name"),
+                    field=f"request_broker.integration_metadata[{index}].name",
+                ),
+                "type": _require_metadata_string(
+                    item.get("type", "bearer"),
+                    field=f"request_broker.integration_metadata[{index}].type",
+                ),
+                "allowed_hosts": _require_metadata_string_list(
+                    item.get("allowed_hosts", []),
+                    field=f"request_broker.integration_metadata[{index}].allowed_hosts",
+                ),
+                "allowed_methods": _require_metadata_string_list(
+                    item.get("allowed_methods", []),
+                    field=f"request_broker.integration_metadata[{index}].allowed_methods",
+                ),
+                "allowed_paths": _require_metadata_string_list(
+                    item.get("allowed_paths", []),
+                    field=f"request_broker.integration_metadata[{index}].allowed_paths",
+                ),
+            }
+        )
+
+    broker_section["enabled"] = enabled
+    broker_section["expose_integration_metadata"] = expose
+    broker_section["integration_metadata"] = normalized_metadata
+
+
+def _require_metadata_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Config field {field} must be a non-empty string.")
+    return value.strip()
+
+
+def _require_metadata_string_list(value: Any, *, field: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ConfigError(f"Config field {field} must be a list of strings.")
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"Config field {field} must contain non-empty strings "
+                f"(invalid at index {index})."
+            )
+        normalized.append(item.strip())
+    return normalized
 
 
 def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:

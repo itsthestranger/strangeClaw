@@ -85,6 +85,13 @@ integrations:
   #   default_headers:
   #     Accept: "application/json"
 
+request_broker:
+  enabled: true
+  expose_integration_metadata: true
+  # Runtime-populated from host secrets registry safe metadata.
+  # Do not place raw tokens here.
+  integration_metadata: []
+
 context:
   token_budget: 4000
   summary_threshold: 10

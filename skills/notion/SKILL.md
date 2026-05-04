@@ -12,6 +12,7 @@ Use this skill when a task requires interacting with Notion through its REST API
 
 ## Authentication
 Use the `http_request` tool with `integration: "notion"` when the Notion token is configured under `integrations.notion.token`. Do not ask the user to paste raw Notion tokens into the task. If the integration is not available or a call reports that it is not configured, ask the user to configure `integrations.notion.token`.
+If multiple Notion integrations are configured under different names, ask which integration name to use before making write calls.
 
 The `http_request` tool injects the `Authorization` header and the configured `Notion-Version` header when `integration: "notion"` is used. Do not include an `Authorization` header yourself. Use base URL `https://api.notion.com`.
 

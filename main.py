@@ -10,6 +10,7 @@ from typing import Any
 
 from adapters.cli import CLIAdapter
 from adapters.telegram import TelegramAdapter, TelegramLimits
+from broker.credentials import CredentialConfigError, load_host_credentials
 from config import load_config
 from coordinator import Coordinator
 from sandbox.fire import FireSandbox, load_firecracker_config
@@ -125,6 +126,34 @@ def _fire_lifecycle_status_messages_enabled(config: dict[str, Any]) -> bool:
     return value
 
 
+def _apply_request_broker_metadata(config: dict[str, Any]) -> None:
+    broker_cfg = config.get("request_broker")
+    if not isinstance(broker_cfg, dict):
+        config["request_broker"] = {
+            "enabled": True,
+            "expose_integration_metadata": True,
+            "integration_metadata": [],
+        }
+        broker_cfg = config["request_broker"]
+
+    enabled = bool(broker_cfg.get("enabled", True))
+    expose = bool(broker_cfg.get("expose_integration_metadata", True))
+    broker_cfg["enabled"] = enabled
+    broker_cfg["expose_integration_metadata"] = expose
+
+    if not enabled or not expose:
+        broker_cfg["integration_metadata"] = []
+        return
+
+    try:
+        registry = load_host_credentials()
+    except CredentialConfigError:
+        broker_cfg["integration_metadata"] = []
+        return
+
+    broker_cfg["integration_metadata"] = registry.safe_metadata()
+
+
 def _build_adapter(
     *,
     adapter_name: str,
@@ -186,6 +215,7 @@ def main(argv: list[str] | None = None) -> None:
     """Run the strangeclaw application."""
     args = _parse_args(argv)
     config = load_config()
+    _apply_request_broker_metadata(config)
     if config["mode"] == "fire" and args.resume:
         raise ValueError(
             "Cannot resume Fire mode sessions — VM filesystem is ephemeral. "

@@ -1693,6 +1693,25 @@ def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
     context = payload.get("context")
     if context is not None and not isinstance(context, Mapping):
         raise FirecrackerConfigError("config.context must be an object when provided.")
+    request_broker = payload.get("request_broker")
+    if request_broker is not None and not isinstance(request_broker, Mapping):
+        raise FirecrackerConfigError("config.request_broker must be an object when provided.")
+    if isinstance(request_broker, Mapping):
+        enabled = request_broker.get("enabled")
+        expose = request_broker.get("expose_integration_metadata")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise FirecrackerConfigError(
+                "config.request_broker.enabled must be a boolean when provided."
+            )
+        if expose is not None and not isinstance(expose, bool):
+            raise FirecrackerConfigError(
+                "config.request_broker.expose_integration_metadata must be a boolean when provided."
+            )
+        metadata = request_broker.get("integration_metadata")
+        if metadata is not None and not isinstance(metadata, list):
+            raise FirecrackerConfigError(
+                "config.request_broker.integration_metadata must be a list when provided."
+            )
 
     approval_mode = payload.get("approval_mode")
     if approval_mode is not None and not isinstance(approval_mode, str):
@@ -1735,6 +1754,11 @@ def _coerce_agent_config_template(
             },
             "web_fetch": {"max_chars": 20000},
             "skills": {"directory": "./skills", "max_file_chars": 20000},
+            "request_broker": {
+                "enabled": True,
+                "expose_integration_metadata": True,
+                "integration_metadata": [],
+            },
             "approval_mode": "review",
             "max_iterations": 50,
             "context": {
@@ -1796,6 +1820,27 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
     skills.setdefault("directory", "./skills")
     skills.setdefault("max_file_chars", 20000)
 
+    request_broker_raw = config.get("request_broker")
+    request_broker: dict[str, Any]
+    if isinstance(request_broker_raw, Mapping):
+        request_broker = {
+            "enabled": bool(request_broker_raw.get("enabled", True)),
+            "expose_integration_metadata": bool(
+                request_broker_raw.get("expose_integration_metadata", True)
+            ),
+            "integration_metadata": _sanitize_integration_metadata(
+                request_broker_raw.get("integration_metadata")
+            ),
+        }
+    else:
+        request_broker = {
+            "enabled": True,
+            "expose_integration_metadata": True,
+            "integration_metadata": [],
+        }
+    if not request_broker["expose_integration_metadata"]:
+        request_broker["integration_metadata"] = []
+
     approval_mode = config.get("approval_mode", "review")
     if not isinstance(approval_mode, str) or not approval_mode.strip():
         approval_mode = "review"
@@ -1826,12 +1871,51 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         "web_search": web_search,
         "web_fetch": web_fetch,
         "skills": skills,
+        "request_broker": request_broker,
         "approval_mode": approval_mode,
         "max_iterations": max_iterations,
         "context": context,
     }
     _validate_agent_config_payload(payload)
     return payload
+
+
+def _sanitize_integration_metadata(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    metadata: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        metadata.append(
+            {
+                "name": name.strip(),
+                "type": _coerce_metadata_text(item.get("type"), fallback="bearer"),
+                "allowed_hosts": _coerce_metadata_text_list(item.get("allowed_hosts")),
+                "allowed_methods": _coerce_metadata_text_list(item.get("allowed_methods")),
+                "allowed_paths": _coerce_metadata_text_list(item.get("allowed_paths")),
+            }
+        )
+    return metadata
+
+
+def _coerce_metadata_text(value: Any, *, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _coerce_metadata_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            normalized.append(item.strip())
+    return normalized
 
 
 def _tap_guest_ips_from_index(session_index: int) -> tuple[str, str]:

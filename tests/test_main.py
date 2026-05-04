@@ -201,6 +201,60 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     assert adapter.run_called is True
 
 
+def test_main_injects_safe_request_broker_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: dict[str, Any] = {}
+    cfg = _config()
+    cfg["request_broker"] = {"enabled": True, "expose_integration_metadata": True}
+
+    class _Registry:
+        def safe_metadata(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": "notion",
+                    "type": "bearer",
+                    "allowed_hosts": ["api.notion.com"],
+                    "allowed_methods": ["GET", "POST"],
+                    "allowed_paths": ["/v1/pages"],
+                }
+            ]
+
+    monkeypatch.setattr(main, "load_config", lambda: cfg)
+    monkeypatch.setattr(main, "load_host_credentials", lambda: _Registry())
+    monkeypatch.setattr(main, "Coordinator", lambda **kwargs: FakeCoordinator(**kwargs))
+    monkeypatch.setattr(main, "YoloSandbox", lambda **kwargs: FakeSandbox(**kwargs))
+
+    def fake_adapter_factory(
+        *, coordinator: Any, approval_mode: str, llm_config: dict[str, Any], **kwargs: Any
+    ) -> FakeAdapter:
+        adapter = FakeAdapter(
+            coordinator=coordinator,
+            approval_mode=approval_mode,
+            llm_config=llm_config,
+            **kwargs,
+        )
+        created["adapter"] = adapter
+        created["coordinator"] = coordinator
+        return adapter
+
+    monkeypatch.setattr(main, "CLIAdapter", fake_adapter_factory)
+
+    main.main([])
+
+    sandbox = created["coordinator"].sandbox_factory()
+    request_broker = sandbox.kwargs["agent_config"]["request_broker"]
+    assert request_broker["enabled"] is True
+    assert request_broker["expose_integration_metadata"] is True
+    assert request_broker["integration_metadata"] == [
+        {
+            "name": "notion",
+            "type": "bearer",
+            "allowed_hosts": ["api.notion.com"],
+            "allowed_methods": ["GET", "POST"],
+            "allowed_paths": ["/v1/pages"],
+        }
+    ]
+
+
 def test_main_stops_sandbox_on_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict[str, Any] = {}
 

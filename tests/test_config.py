@@ -121,6 +121,11 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["web_fetch"] == {"max_chars": 20000}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
     assert loaded["integrations"] == {}
+    assert loaded["request_broker"] == {
+        "enabled": True,
+        "expose_integration_metadata": True,
+        "integration_metadata": [],
+    }
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -342,6 +347,58 @@ def test_load_config_rejects_invalid_skills_max_file_chars(tmp_path: Path) -> No
         load_config(config_path)
 
 
+def test_load_config_validates_request_broker_optional_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["request_broker"] = {
+        "enabled": True,
+        "expose_integration_metadata": True,
+        "integration_metadata": [
+            {
+                "name": "notion",
+                "type": "bearer",
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["GET", "POST"],
+                "allowed_paths": ["/v1/pages"],
+            }
+        ],
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["request_broker"]["enabled"] is True
+    assert loaded["request_broker"]["expose_integration_metadata"] is True
+    assert loaded["request_broker"]["integration_metadata"] == [
+        {
+            "name": "notion",
+            "type": "bearer",
+            "allowed_hosts": ["api.notion.com"],
+            "allowed_methods": ["GET", "POST"],
+            "allowed_paths": ["/v1/pages"],
+        }
+    ]
+
+
+def test_load_config_rejects_invalid_request_broker_fields(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["request_broker"] = {"enabled": "yes"}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"request_broker\.enabled"):
+        load_config(config_path)
+
+    config["request_broker"] = {
+        "enabled": True,
+        "expose_integration_metadata": True,
+        "integration_metadata": [{"name": "", "allowed_hosts": []}],
+    }
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"integration_metadata\[0\]\.name"):
+        load_config(config_path)
+
+
 def test_fire_sanitized_skills_match_loaded_config_defaults(tmp_path: Path) -> None:
     from sandbox.fire import _sanitize_agent_config_for_mmds
 
@@ -354,6 +411,46 @@ def test_fire_sanitized_skills_match_loaded_config_defaults(tmp_path: Path) -> N
     fire_payload = _sanitize_agent_config_for_mmds(loaded)
 
     assert fire_payload["skills"] == loaded["skills"]
+
+
+def test_fire_sanitized_request_broker_contains_metadata_only(tmp_path: Path) -> None:
+    from sandbox.fire import _sanitize_agent_config_for_mmds
+
+    config = _base_config(api_key="plain-key")
+    config["request_broker"] = {
+        "enabled": True,
+        "expose_integration_metadata": True,
+        "integration_metadata": [
+            {
+                "name": "notion",
+                "type": "bearer",
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["GET", "POST"],
+                "allowed_paths": ["/v1/pages"],
+                "token": "must-not-pass-through",
+            }
+        ],
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+    fire_payload = _sanitize_agent_config_for_mmds(loaded)
+
+    assert fire_payload["request_broker"] == {
+        "enabled": True,
+        "expose_integration_metadata": True,
+        "integration_metadata": [
+            {
+                "name": "notion",
+                "type": "bearer",
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["GET", "POST"],
+                "allowed_paths": ["/v1/pages"],
+            }
+        ],
+    }
+    assert "must-not-pass-through" not in repr(fire_payload)
 
 
 def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:

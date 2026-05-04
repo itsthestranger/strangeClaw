@@ -318,6 +318,114 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     assert payload["output_instruction"] == "Place any files for the user in /output/."
 
 
+def test_request_broker_metadata_is_exposed_in_planning_and_execution_prompts() -> None:
+    scripted_llm = ScriptedLLM(responses=[])
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        agent_config={
+            "llm": {
+                "model": "fake/model",
+                "api_key": "fake-key",
+                "max_tokens": 2048,
+                "temperature": 0.2,
+            },
+            "request_broker": {
+                "enabled": True,
+                "expose_integration_metadata": True,
+                "integration_metadata": [
+                    {
+                        "name": "notion",
+                        "type": "bearer",
+                        "allowed_hosts": ["api.notion.com"],
+                        "allowed_methods": ["GET", "POST"],
+                        "allowed_paths": ["/v1/pages"],
+                        "token": "must-not-appear",
+                    }
+                ],
+            },
+        },
+    )
+    agent._llm = scripted_llm
+
+    planning_messages = agent.build_planning_prompt(goal="create notion page")
+    planning_content = planning_messages[1]["content"]
+    assert "api.notion.com" in planning_content
+    assert "Request broker integration metadata" in planning_content
+    assert "must-not-appear" not in planning_content
+
+    execution_messages = agent.build_execution_prompt(
+        goal="create notion page",
+        plan={"steps": ["create page"], "referenced_skills": ["notion"]},
+        history=[],
+        activated_skills={},
+    )
+    payload = json.loads(execution_messages[1]["content"])
+    request_broker = payload.get("request_broker")
+    assert isinstance(request_broker, dict)
+    assert request_broker["brokered_tools"] == ["http_request", "web_search", "web_fetch"]
+    assert request_broker["integration_metadata"] == [
+        {
+            "name": "notion",
+            "type": "bearer",
+            "allowed_hosts": ["api.notion.com"],
+            "allowed_methods": ["GET", "POST"],
+            "allowed_paths": ["/v1/pages"],
+        }
+    ]
+    assert "must-not-appear" not in execution_messages[1]["content"]
+
+
+def test_request_broker_metadata_can_be_hidden_from_prompts() -> None:
+    scripted_llm = ScriptedLLM(responses=[])
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        agent_config={
+            "llm": {
+                "model": "fake/model",
+                "api_key": "fake-key",
+                "max_tokens": 2048,
+                "temperature": 0.2,
+            },
+            "request_broker": {
+                "enabled": True,
+                "expose_integration_metadata": False,
+                "integration_metadata": [
+                    {
+                        "name": "notion",
+                        "type": "bearer",
+                        "allowed_hosts": ["api.notion.com"],
+                        "allowed_methods": ["GET"],
+                        "allowed_paths": ["/v1/pages"],
+                    }
+                ],
+            },
+        },
+    )
+    agent._llm = scripted_llm
+
+    planning_messages = agent.build_planning_prompt(goal="create notion page")
+    planning_content = planning_messages[1]["content"]
+    assert "api.notion.com" not in planning_content
+    assert "request broker integration metadata" not in planning_content.lower()
+
+    execution_messages = agent.build_execution_prompt(
+        goal="create notion page",
+        plan={"steps": ["create page"], "referenced_skills": ["notion"]},
+        history=[],
+        activated_skills={},
+    )
+    payload = json.loads(execution_messages[1]["content"])
+    assert "request_broker" not in payload
+
+
 def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
