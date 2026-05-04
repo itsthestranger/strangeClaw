@@ -160,7 +160,11 @@ def test_coordinator_writes_redacted_bounded_session_journal(
             {
                 "type": "message",
                 "role": "status",
-                "content": {"api_key": secret, "Authorization": "Bearer x"},
+                "content": {
+                    "api_key": secret,
+                    "Authorization": "Bearer x",
+                    "body": f"provider echoed {secret}",
+                },
             },
             {
                 "type": "done",

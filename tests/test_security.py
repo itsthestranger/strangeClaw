@@ -69,6 +69,7 @@ def test_api_key_not_persisted_to_session_state(
             "goal": "x",
             "llm": {"api_key": secret, "model": "fake"},
             "history": [{"step": 1, "api_key": secret}],
+            "error": f"provider returned {secret}",
         },
         "files": [],
     }
@@ -84,3 +85,4 @@ def test_api_key_not_persisted_to_session_state(
     assert secret not in content
     loaded = json.loads(content)
     assert loaded["llm"]["api_key"] == "[REDACTED]"
+    assert loaded["error"] == "provider returned [REDACTED]"

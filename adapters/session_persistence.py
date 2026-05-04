@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import session
+from broker.redaction import redact_sensitive
 
 
 def persist_done_event(*, session_id: str, done_event: dict[str, Any]) -> dict[str, Any] | None:
@@ -117,23 +118,3 @@ def _safe_output_path(outputs_dir: Path, rel_path: str) -> Path:
         raise ValueError(f"Invalid output file path: {rel_path}")
     return candidate
 
-
-def redact_sensitive(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            key_lower = key.lower()
-            if (
-                key_lower == "api_key"
-                or "authorization" in key_lower
-                or key_lower.endswith("token")
-                or key_lower == "token"
-                or key_lower.endswith("_secret")
-            ):
-                redacted[key] = "[REDACTED]"
-            else:
-                redacted[key] = redact_sensitive(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_sensitive(item) for item in value]
-    return value

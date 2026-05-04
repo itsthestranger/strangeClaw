@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.protocol import decode_event, encode_event
+from broker.redaction import redact_text
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -45,26 +46,6 @@ _CID_RETRY_ATTEMPTS = 10
 _DEFAULT_CID_LOCK_PATH = Path("~/.strangeclaw/firecracker_cids.json").expanduser()
 _LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1"}
 _DEFAULT_LOG_EXPORT_MAX_BYTES = 32 * 1024
-_LOG_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r"(?i)\b(authorization)\b(\s*[:=]\s*)(bearer\s+[^\s,;]+)"),
-        r"\1\2[REDACTED]",
-    ),
-    (
-        re.compile(
-            r"(?i)\b(api[_-]?key|authorization|token|secret|password)\b(\s*[:=]\s*)([^\s,;]+)"
-        ),
-        r"\1\2[REDACTED]",
-    ),
-    (
-        re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+"),
-        r"\1 [REDACTED]",
-    ),
-    (
-        re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"),
-        "[REDACTED]",
-    ),
-)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -1461,10 +1442,7 @@ class FireSandbox:
         artifact_path.write_text(redacted_text + "\n", encoding="utf-8")
 
     def _redact_log_text(self, text: str) -> str:
-        redacted = text
-        for pattern, replacement in _LOG_REDACT_PATTERNS:
-            redacted = pattern.sub(replacement, redacted)
-        return redacted
+        return redact_text(text)
 
     def _register_exit_handlers(self) -> None:
         if self._atexit_registered:
