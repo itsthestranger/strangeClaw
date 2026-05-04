@@ -47,41 +47,33 @@ def test_repository_skills_are_discoverable() -> None:
     assert "Synthesis Format" in skill_md
 
 
-def test_repository_notion_skill_manifest_and_reference() -> None:
+def test_repository_notion_skill_is_self_contained() -> None:
     skills = Skills(str(_skills_root()))
     doc = skills.get_doc("notion")
 
-    assert doc["files"] == ["references/notion.md"]
+    assert doc["files"] == []
     skill_md = doc["skill_md"]
     assert "`http_request`" in skill_md
-    assert "`agent_read_skill_file`" in skill_md
     assert 'integration: "notion"' in skill_md
     assert "integrations.notion.token" in skill_md
-
-    notion = skills.read_file("notion", "references/notion.md")
-    assert "https://api.notion.com" in notion
-    assert "POST /v1/data_sources/{data_source_id}/query" in notion
-    assert "Notion-Version" in notion
-    assert '"integration": "notion"' in notion
+    assert "https://api.notion.com" in skill_md
+    assert "POST /v1/data_sources/{data_source_id}/query" in skill_md
+    assert "Notion-Version" in skill_md
 
 
-def test_repository_github_skill_manifest_and_reference() -> None:
+def test_repository_github_skill_is_self_contained() -> None:
     skills = Skills(str(_skills_root()))
     doc = skills.get_doc("github")
 
-    assert doc["files"] == ["references/github.md"]
+    assert doc["files"] == []
     skill_md = doc["skill_md"]
     assert "`http_request`" in skill_md
-    assert "`agent_read_skill_file`" in skill_md
     assert 'integration: "github"' in skill_md
     assert "integrations.github.token" in skill_md
-
-    github = skills.read_file("github", "references/github.md")
-    assert "https://api.github.com" in github
-    assert "POST /repos/{owner}/{repo}/issues" in github
-    assert "GET /repos/{owner}/{repo}/pulls" in github
-    assert "GET /repos/{owner}/{repo}/contents/{path}" in github
-    assert '"integration": "github"' in github
+    assert "https://api.github.com" in skill_md
+    assert "POST /repos/{owner}/{repo}/issues" in skill_md
+    assert "GET /repos/{owner}/{repo}/pulls" in skill_md
+    assert "GET /repos/{owner}/{repo}/contents/{path}" in skill_md
 
 
 def test_unknown_skill_lookup_raises() -> None:
