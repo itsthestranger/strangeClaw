@@ -49,6 +49,7 @@ class _NormalizedRequest:
     integration: str | None
     headers: dict[str, str]
     body: str | None
+    response_body_max_chars: int | None
 
 
 class RequestBroker:
@@ -146,6 +147,7 @@ class RequestBroker:
                 return self._success_response(
                     response=response,
                     integration=normalized.integration,
+                    response_body_max_chars=normalized.response_body_max_chars,
                 )
 
             redirect_count += 1
@@ -248,6 +250,29 @@ class RequestBroker:
                 "Request body must be a string or null.",
             )
 
+        response_body_max_chars_raw = request.get("response_body_max_chars")
+        response_body_max_chars: int | None
+        if response_body_max_chars_raw is None:
+            response_body_max_chars = None
+        elif isinstance(response_body_max_chars_raw, bool):
+            return None, self._error(
+                "invalid_request",
+                "response_body_max_chars must be a positive integer when provided.",
+            )
+        else:
+            try:
+                response_body_max_chars = int(response_body_max_chars_raw)
+            except (TypeError, ValueError):
+                return None, self._error(
+                    "invalid_request",
+                    "response_body_max_chars must be a positive integer when provided.",
+                )
+            if response_body_max_chars <= 0:
+                return None, self._error(
+                    "invalid_request",
+                    "response_body_max_chars must be a positive integer when provided.",
+                )
+
         return (
             _NormalizedRequest(
                 method=method,
@@ -255,6 +280,7 @@ class RequestBroker:
                 integration=integration,
                 headers=headers,
                 body=body,
+                response_body_max_chars=response_body_max_chars,
             ),
             None,
         )
@@ -416,15 +442,17 @@ class RequestBroker:
         *,
         response: Response,
         integration: str | None,
+        response_body_max_chars: int | None,
     ) -> dict[str, Any]:
         headers = _headers_to_dict(getattr(response, "headers", {}))
 
         response_text = getattr(response, "text", "")
         if not isinstance(response_text, str):
             response_text = str(response_text)
+        text_limit = response_body_max_chars or self._config.max_response_body_chars
         truncated_body, truncated = _truncate_text(
             response_text,
-            limit=self._config.max_response_body_chars,
+            limit=text_limit,
         )
 
         payload = {

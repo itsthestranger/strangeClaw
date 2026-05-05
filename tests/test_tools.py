@@ -28,28 +28,17 @@ class _FakeResponse:
         return self._payload
 
 
-class _FakeStreamingResponse:
+class _FakeBrokerHTTPResponse:
     def __init__(
         self,
         *,
         status_code: int = 200,
         headers: dict[str, str] | None = None,
-        body: bytes = b"",
+        text: str = "",
     ) -> None:
         self.status_code = status_code
         self.headers = headers or {}
-        self._body = body
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"http {self.status_code}")
-
-    def iter_content(self, chunk_size: int = 8192) -> Any:
-        del chunk_size
-        yield self._body
-
-    def close(self) -> None:
-        return
+        self.text = text
 
 
 class _FakeMetadata:
@@ -231,23 +220,33 @@ def test_tools_web_search_brave_requires_api_key() -> None:
 
 
 def test_tools_web_fetch_html_uses_trafilatura(monkeypatch: Any) -> None:
-    html = b"<html><head><title>Example</title></head><body><p>Hello</p></body></html>"
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        assert url == "https://example.com"
-        assert kwargs["stream"] is True
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/html; charset=utf-8"},
-            body=html,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
+    html = "<html><head><title>Example</title></head><body><p>Hello</p></body></html>"
     monkeypatch.setattr("agent.tools.trafilatura", _FakeTrafilatura())
-    tools = Tools(config={"web_fetch": {"max_chars": 20000}})
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "text/html; charset=utf-8"},
+            "body": html,
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={"web_fetch": {"max_chars": 20000}}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 0
+    assert broker.requests == [
+        {
+            "method": "GET",
+            "url": "https://example.com",
+            "integration": None,
+            "headers": {"User-Agent": "strangeclaw/0.1 (+fetch)"},
+            "body": None,
+            "response_body_max_chars": 5242880,
+        }
+    ]
     payload = _unwrap_data(result.stdout)
     assert payload["success"] is True
     assert payload["content_type"] == "text/html"
@@ -257,18 +256,18 @@ def test_tools_web_fetch_html_uses_trafilatura(monkeypatch: Any) -> None:
 
 
 def test_tools_web_fetch_json_returns_body(monkeypatch: Any) -> None:
-    body = b'{"ok":true}'
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://api.example.com/data"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "application/json"},
-            body=body,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={})
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": '{"ok":true}',
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://api.example.com/data"}))
 
@@ -279,16 +278,18 @@ def test_tools_web_fetch_json_returns_body(monkeypatch: Any) -> None:
 
 
 def test_tools_web_fetch_pdf_returns_metadata_hint(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/doc.pdf"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "application/pdf"},
-            body=b"%PDF-1.4",
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={})
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/pdf"},
+            "body": "%PDF-1.4",
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/doc.pdf"}))
 
@@ -299,16 +300,18 @@ def test_tools_web_fetch_pdf_returns_metadata_hint(monkeypatch: Any) -> None:
 
 
 def test_tools_web_fetch_truncates_at_max_chars(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/text"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/plain"},
-            body=b"abcdefghijklmnopqrstuvwxyz",
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={"web_fetch": {"max_chars": 10}})
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "text/plain"},
+            "body": "abcdefghijklmnopqrstuvwxyz",
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={"web_fetch": {"max_chars": 10}}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/text"}))
 
@@ -320,35 +323,40 @@ def test_tools_web_fetch_truncates_at_max_chars(monkeypatch: Any) -> None:
 
 
 def test_tools_web_fetch_handles_request_error(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> Any:
-        del url
-        del kwargs
-        raise requests.Timeout("boom")
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={})
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": False,
+            "error_code": "request_failed",
+            "message": "HTTP request failed: boom",
+            "integration": None,
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 1
     payload = _unwrap_data(result.stdout)
     assert payload["success"] is False
+    assert payload["error_code"] == "request_failed"
     assert "web_fetch request failed" in str(payload["error"])
 
 
 def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
-    body = b"a" * (6 * 1024 * 1024)
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/huge"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/plain"},
-            body=body,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={"web_fetch": {"max_chars": 6000000}})
+    del monkeypatch
+    body = "a" * (5 * 1024 * 1024)
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "text/plain"},
+            "body": body,
+            "truncated": True,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={"web_fetch": {"max_chars": 6000000}}, request_broker_client=broker)
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/huge"}))
 
@@ -356,6 +364,87 @@ def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
     payload = _unwrap_data(result.stdout)
     assert payload["truncated"] is True
     assert "response body capped at 5242880 bytes" in str(payload["text"])
+
+
+def test_tools_web_fetch_rejects_private_target_before_network(
+    monkeypatch: Any,
+) -> None:
+    def fail_request(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("network request should be blocked by broker policy")
+
+    monkeypatch.setattr("broker.request_broker.requests.request", fail_request)
+    broker_client = InProcessRequestBrokerClient(
+        RequestBroker(HostCredentialRegistry(credentials={}))
+    )
+    tools = Tools(config={}, request_broker_client=broker_client)
+
+    result = tools.execute(
+        ToolCall(tool="web_fetch", args={"url": "http://127.0.0.1:8000/private"})
+    )
+
+    assert result.exit_code == 1
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is False
+    assert payload["error_code"] == "policy_denied"
+
+
+def test_tools_web_fetch_redirect_policy_is_enforced(
+    monkeypatch: Any,
+) -> None:
+    call_count = 0
+
+    def fake_request(**kwargs: Any) -> _FakeBrokerHTTPResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _FakeBrokerHTTPResponse(
+                status_code=302,
+                headers={"Location": "http://127.0.0.1/internal"},
+                text="",
+            )
+        raise AssertionError(f"unexpected second request: {kwargs}")
+
+    monkeypatch.setattr("broker.request_broker.requests.request", fake_request)
+    broker_client = InProcessRequestBrokerClient(
+        RequestBroker(HostCredentialRegistry(credentials={}))
+    )
+    tools = Tools(config={}, request_broker_client=broker_client)
+
+    result = tools.execute(
+        ToolCall(tool="web_fetch", args={"url": "https://example.com/start"})
+    )
+
+    assert result.exit_code == 1
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is False
+    assert payload["error_code"] == "policy_denied"
+    assert "Redirect denied by policy" in payload["error"]
+
+
+def test_tools_web_fetch_does_not_use_direct_requests_path(monkeypatch: Any) -> None:
+    def fail_direct_get(*args: Any, **kwargs: Any) -> Any:
+        del args
+        del kwargs
+        raise AssertionError("tools web_fetch must not call requests.get directly")
+
+    monkeypatch.setattr("agent.tools.requests.get", fail_direct_get)
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "text/plain"},
+            "body": "ok",
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
+
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
+
+    assert result.exit_code == 0
+    assert len(broker.requests) == 1
 
 
 def test_tools_http_request_uses_broker_client_and_captures_response() -> None:

@@ -9,7 +9,6 @@ from typing import Any
 
 import requests
 import trafilatura
-from requests import Response
 
 from agent.llm import ToolCall
 from agent.request_broker_client import (
@@ -370,86 +369,119 @@ class Tools:
                 stderr="web_fetch.max_chars must be a positive integer.",
             )
 
-        response: Response | Any | None = None
-        try:
-            response = requests.get(
-                target_url,
-                headers={"User-Agent": _DEFAULT_WEB_FETCH_USER_AGENT},
-                timeout=(10.0, 30.0),
-                stream=True,
-            )
-            status_code = int(getattr(response, "status_code", 0))
-            response.raise_for_status()
-            raw_body, size_limited = _read_limited_bytes(response, byte_limit=_WEB_FETCH_MAX_BYTES)
-            raw_content_type = ""
-            headers = getattr(response, "headers", {})
-            if isinstance(headers, dict):
-                header_value = headers.get("Content-Type", "")
-                if isinstance(header_value, str):
-                    raw_content_type = header_value
-            elif headers is not None:
-                header_value = getattr(headers, "get", lambda *_: "")("Content-Type", "")
-                if isinstance(header_value, str):
-                    raw_content_type = header_value
-            content_type = _normalize_content_type(raw_content_type)
-
-            title: str | None = None
-            if content_type == "text/html":
-                html = raw_body.decode("utf-8", errors="replace")
-                extracted = trafilatura.extract(
-                    html,
-                    include_links=True,
-                    include_tables=True,
-                )
-                metadata = trafilatura.extract_metadata(html)
-                maybe_title = getattr(metadata, "title", None) if metadata is not None else None
-                if isinstance(maybe_title, str) and maybe_title.strip():
-                    title = maybe_title.strip()
-                text = extracted if isinstance(extracted, str) and extracted.strip() else html
-            elif content_type in {"text/plain", "application/json", "text/xml", "application/xml"}:
-                text = raw_body.decode("utf-8", errors="replace")
-            elif content_type == "application/pdf":
-                text = (
-                    f"PDF document, {len(raw_body)} bytes. "
-                    "Use shell tool with pdftotext to extract content."
-                )
-            else:
-                display_type = content_type or "application/octet-stream"
-                text = f"Binary content ({display_type}), {len(raw_body)} bytes. No text extracted."
-
-            original_length = len(text)
-            truncated_text, was_truncated = _truncate_text(text, limit=max_chars)
-            if size_limited:
-                truncated_notice = (
-                    f"\n\n[... response body capped at {_WEB_FETCH_MAX_BYTES} bytes ...]"
-                )
-                truncated_text = f"{truncated_text}{truncated_notice}"
-                was_truncated = True
-
-            payload = _wrap_external_data(
-                {
-                    "success": True,
-                    "url": target_url,
-                    "status_code": status_code,
-                    "content_type": content_type,
-                    "title": title,
-                    "text": truncated_text,
-                    "truncated": was_truncated,
-                    "original_length": original_length,
-                }
-            )
-            return ToolResult(exit_code=0, stdout=payload, stderr="")
-        except requests.RequestException as exc:
+        broker_response = self._request_broker.execute(
+            {
+                "method": "GET",
+                "url": target_url,
+                "integration": None,
+                "headers": {"User-Agent": _DEFAULT_WEB_FETCH_USER_AGENT},
+                "body": None,
+                "response_body_max_chars": _WEB_FETCH_MAX_BYTES,
+            }
+        )
+        if not isinstance(broker_response, dict):
             error_payload = _wrap_external_data(
                 {
                     "success": False,
                     "url": target_url,
-                    "error": f"web_fetch request failed: {exc}",
+                    "error": "web_fetch request failed: request_broker returned invalid payload.",
                 }
             )
             return ToolResult(exit_code=1, stdout=error_payload, stderr="")
-        finally:
-            _safe_close_response(response)
+
+        if broker_response.get("success") is not True:
+            message = broker_response.get("message")
+            if isinstance(message, str) and message.strip():
+                error_text = f"web_fetch request failed: {message.strip()}"
+            else:
+                error_text = "web_fetch request failed: request_broker rejected or failed request."
+            error_payload_obj: dict[str, Any] = {
+                "success": False,
+                "url": target_url,
+                "error": error_text,
+            }
+            error_code = broker_response.get("error_code")
+            if isinstance(error_code, str) and error_code.strip():
+                error_payload_obj["error_code"] = error_code.strip()
+            return ToolResult(
+                exit_code=1,
+                stdout=_wrap_external_data(error_payload_obj),
+                stderr="",
+            )
+
+        status_code_raw = broker_response.get("status_code", 0)
+        status_code: int
+        try:
+            status_code = int(status_code_raw)
+        except (TypeError, ValueError):
+            status_code = 0
+
+        raw_content_type = ""
+        headers = broker_response.get("headers", {})
+        if isinstance(headers, dict):
+            header_value = headers.get("Content-Type", "")
+            if isinstance(header_value, str):
+                raw_content_type = header_value
+        content_type = _normalize_content_type(raw_content_type)
+
+        response_body_raw = broker_response.get("body", "")
+        if not isinstance(response_body_raw, str):
+            response_body_raw = str(response_body_raw)
+        raw_body = response_body_raw.encode("utf-8", errors="replace")
+        body_capped = False
+        if len(raw_body) > _WEB_FETCH_MAX_BYTES:
+            raw_body = raw_body[:_WEB_FETCH_MAX_BYTES]
+            body_capped = True
+        if broker_response.get("truncated") is True:
+            body_capped = True
+        response_body = raw_body.decode("utf-8", errors="replace")
+
+        title: str | None = None
+        if content_type == "text/html":
+            html = response_body
+            extracted = trafilatura.extract(
+                html,
+                include_links=True,
+                include_tables=True,
+            )
+            metadata = trafilatura.extract_metadata(html)
+            maybe_title = getattr(metadata, "title", None) if metadata is not None else None
+            if isinstance(maybe_title, str) and maybe_title.strip():
+                title = maybe_title.strip()
+            text = extracted if isinstance(extracted, str) and extracted.strip() else html
+        elif content_type in {"text/plain", "application/json", "text/xml", "application/xml"}:
+            text = response_body
+        elif content_type == "application/pdf":
+            text = (
+                f"PDF document, {len(raw_body)} bytes. "
+                "Use shell tool with pdftotext to extract content."
+            )
+        else:
+            display_type = content_type or "application/octet-stream"
+            text = f"Binary content ({display_type}), {len(raw_body)} bytes. No text extracted."
+
+        original_length = len(text)
+        truncated_text, was_truncated = _truncate_text(text, limit=max_chars)
+        if body_capped:
+            truncated_notice = (
+                f"\n\n[... response body capped at {_WEB_FETCH_MAX_BYTES} bytes ...]"
+            )
+            truncated_text = f"{truncated_text}{truncated_notice}"
+            was_truncated = True
+
+        payload = _wrap_external_data(
+            {
+                "success": True,
+                "url": target_url,
+                "status_code": status_code,
+                "content_type": content_type,
+                "title": title,
+                "text": truncated_text,
+                "truncated": was_truncated,
+                "original_length": original_length,
+            }
+        )
+        return ToolResult(exit_code=0, stdout=payload, stderr="")
 
     def _execute_http_request(self, args: dict[str, Any]) -> ToolResult:
         method_raw = args.get("method")
@@ -626,22 +658,6 @@ def _request_broker_integration_names(config: dict[str, Any]) -> list[str]:
     return sorted(names)
 
 
-def _read_limited_bytes(response: Response | Any, *, byte_limit: int) -> tuple[bytes, bool]:
-    collected = bytearray()
-    limited = False
-    for chunk in response.iter_content(chunk_size=8192):
-        if not chunk:
-            continue
-        if len(collected) + len(chunk) > byte_limit:
-            keep = byte_limit - len(collected)
-            if keep > 0:
-                collected.extend(chunk[:keep])
-            limited = True
-            break
-        collected.extend(chunk)
-    return bytes(collected), limited
-
-
 def _normalize_content_type(raw: str) -> str:
     lowered = raw.lower().strip()
     if ";" in lowered:
@@ -654,15 +670,4 @@ def _truncate_text(text: str, *, limit: int) -> tuple[str, bool]:
         return text, False
     notice = f"\n\n[... truncated, original {len(text)} chars ...]"
     return text[:limit] + notice, True
-
-
-def _safe_close_response(response: Response | Any | None) -> None:
-    if response is None:
-        return
-    close = getattr(response, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            return
 

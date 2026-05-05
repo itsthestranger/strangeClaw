@@ -324,6 +324,32 @@ def test_response_body_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
     assert str(result["body"]).startswith("abcdefghij")
 
 
+def test_per_request_response_body_limit_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request(**kwargs: Any) -> _FakeResponse:
+        del kwargs
+        return _FakeResponse(status_code=200, text="abcdefghijklmnopqrstuvwxyz")
+
+    monkeypatch.setattr("broker.request_broker.requests.request", fake_request)
+    broker = RequestBroker(
+        HostCredentialRegistry(credentials={}),
+        config=RequestBrokerConfig(max_response_body_chars=10),
+    )
+
+    result = broker.execute(
+        {
+            "method": "GET",
+            "url": "https://example.com/large",
+            "headers": {},
+            "body": None,
+            "response_body_max_chars": 20,
+        }
+    )
+
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert str(result["body"]).startswith("abcdefghijklmnopqrst")
+
+
 def test_redirect_policy_for_anonymous_blocks_private_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
