@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import requests
 
 from agent.llm import ToolCall
+from agent.request_broker_client import InProcessRequestBrokerClient
 from agent.tools import Tools
+from broker.credentials import HostCredential, HostCredentialRegistry
+from broker.request_broker import RequestBroker
 
 
 class _FakeResponse:
@@ -48,19 +52,6 @@ class _FakeStreamingResponse:
         return
 
 
-class _FakeHTTPResponse:
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-        text: str = "",
-    ) -> None:
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-
-
 class _FakeMetadata:
     def __init__(self, title: str | None) -> None:
         self.title = title
@@ -78,6 +69,16 @@ class _FakeTrafilatura:
     def extract_metadata(html: str) -> _FakeMetadata:
         assert "<title>Example</title>" in html
         return _FakeMetadata("Example")
+
+
+class _FakeBrokerClient:
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = dict(response)
+        self.requests: list[dict[str, Any]] = []
+
+    def execute(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        self.requests.append(dict(request))
+        return dict(self.response)
 
 
 def test_tools_shell_execute_success() -> None:
@@ -357,19 +358,18 @@ def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
     assert "response body capped at 5242880 bytes" in str(payload["text"])
 
 
-def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(
-            status_code=201,
-            headers={"Content-Type": "application/json"},
-            text='{"ok":true}',
-        )
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(config={})
+def test_tools_http_request_uses_broker_client_and_captures_response() -> None:
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 201,
+            "headers": {"Content-Type": "application/json"},
+            "body": '{"ok":true}',
+            "truncated": False,
+            "integration": "notion",
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
 
     result = tools.execute(
         ToolCall(
@@ -377,115 +377,84 @@ def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
             args={
                 "method": "post",
                 "url": "https://api.example.com/items",
-                "headers": {"Authorization": "Bearer token"},
+                "headers": {"Content-Type": "application/json"},
+                "integration": "notion",
                 "body": '{"name":"x"}',
             },
         )
     )
 
     assert result.exit_code == 0
-    assert captured["method"] == "POST"
-    assert captured["url"] == "https://api.example.com/items"
-    assert captured["data"] == '{"name":"x"}'
-    assert captured["headers"]["Authorization"] == "Bearer token"
-    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
+    assert broker.requests == [
+        {
+            "method": "POST",
+            "url": "https://api.example.com/items",
+            "integration": "notion",
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "strangeclaw/0.1 (+http)",
+            },
+            "body": '{"name":"x"}',
+        }
+    ]
     payload = _unwrap_data(result.stdout)
     assert payload["success"] is True
     assert payload["status_code"] == 201
     assert payload["body"] == '{"ok":true}'
     assert payload["truncated"] is False
+    assert payload["integration"] == "notion"
 
 
-def test_tools_http_request_applies_generic_bearer_integration(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
+def test_tools_http_request_schema_uses_request_broker_metadata() -> None:
     tools = Tools(
         config={
-            "integrations": {
-                "notion": {
-                    "token": "notion-secret",
-                    "auth": {"type": "bearer"},
-                    "default_headers": {"Notion-Version": "2026-03-11"},
-                }
+            "request_broker": {
+                "integration_metadata": [
+                    {"name": "notion"},
+                    {"name": "github"},
+                    {"name": "notion"},
+                ]
             }
-        }
+        },
+        request_broker_client=_FakeBrokerClient(
+            {
+                "success": True,
+                "status_code": 200,
+                "headers": {},
+                "body": "",
+                "truncated": False,
+                "integration": None,
+            }
+        ),
     )
 
     schema = next(item for item in tools.schema() if item["name"] == "http_request")
-    assert schema["parameters"]["properties"]["integration"]["enum"] == ["notion", None]
-
-    result = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.notion.com/v1/data_sources/source-id",
-                "integration": "notion",
-                "headers": {},
-            },
-        )
-    )
-
-    assert result.exit_code == 0
-    assert captured["headers"]["Authorization"] == "Bearer notion-secret"
-    assert captured["headers"]["Notion-Version"] == "2026-03-11"
-    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
+    assert schema["parameters"]["properties"]["integration"]["enum"] == ["github", "notion", None]
 
 
-def test_tools_http_request_applies_generic_header_integration(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
+def test_tools_http_request_rejects_protected_header_override_before_network(
+    monkeypatch: Any,
+) -> None:
+    def fail_request(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("network request should be blocked by broker policy")
 
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(
-        config={
-            "integrations": {
-                "jira": {
-                    "token": "jira-secret",
-                    "auth": {"type": "header", "header": "X-API-Key", "prefix": "Token "},
-                    "default_headers": {"Accept": "application/json"},
-                }
-            }
+    monkeypatch.setattr("broker.request_broker.requests.request", fail_request)
+    registry = HostCredentialRegistry(
+        credentials={
+            "github": HostCredential(
+                name="github",
+                credential_type="bearer",
+                token="github-secret",
+                allowed_hosts=("api.github.com",),
+                allowed_methods=("GET",),
+                allowed_paths=("/repos/*",),
+                default_headers={"Accept": "application/vnd.github+json"},
+            )
         }
     )
-
-    result = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://jira.example.com/rest/api/3/issue/ABC-1",
-                "integration": "jira",
-                "headers": {},
-            },
-        )
-    )
-
-    assert result.exit_code == 0
-    assert captured["headers"]["X-API-Key"] == "Token jira-secret"
-    assert captured["headers"]["Accept"] == "application/json"
-
-
-def test_tools_http_request_rejects_integration_header_override() -> None:
-    tools = Tools(
-        config={
-            "integrations": {
-                "github": {
-                    "token": "github-secret",
-                    "auth": {"type": "bearer"},
-                    "default_headers": {"Accept": "application/vnd.github+json"},
-                }
-            }
-        }
-    )
+    broker_client = InProcessRequestBrokerClient(RequestBroker(registry))
+    tools = Tools(config={}, request_broker_client=broker_client)
 
     result = tools.execute(
         ToolCall(
@@ -500,13 +469,19 @@ def test_tools_http_request_rejects_integration_header_override() -> None:
     )
 
     assert result.exit_code == 1
-    assert "must not include 'Authorization'" in result.stderr
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is False
+    assert payload["error_code"] == "policy_denied"
+    assert "protected header" in payload["message"]
 
 
-def test_tools_http_request_rejects_unknown_or_unconfigured_integration() -> None:
-    tools = Tools(config={"integrations": {"github": {"token": "", "auth": {"type": "bearer"}}}})
+def test_tools_http_request_rejects_unknown_integration() -> None:
+    broker_client = InProcessRequestBrokerClient(
+        RequestBroker(HostCredentialRegistry(credentials={}))
+    )
+    tools = Tools(config={}, request_broker_client=broker_client)
 
-    unknown = tools.execute(
+    result = tools.execute(
         ToolCall(
             tool="http_request",
             args={
@@ -516,21 +491,12 @@ def test_tools_http_request_rejects_unknown_or_unconfigured_integration() -> Non
             },
         )
     )
-    assert unknown.exit_code == 1
-    assert "integration 'jira' is not configured" in unknown.stderr
 
-    missing_token = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.github.com/repos/o/r",
-                "integration": "github",
-            },
-        )
-    )
-    assert missing_token.exit_code == 1
-    assert "has no token configured" in missing_token.stderr
+    assert result.exit_code == 1
+    payload = _unwrap_data(result.stdout)
+    assert payload["success"] is False
+    assert payload["error_code"] == "policy_denied"
+    assert "Integration 'jira' is not configured" in payload["message"]
 
 
 def test_tools_http_request_invalid_method_rejected() -> None:
@@ -548,12 +514,15 @@ def test_tools_http_request_invalid_method_rejected() -> None:
 
 
 def test_tools_http_request_request_error(monkeypatch: Any) -> None:
-    def fake_request(**kwargs: Any) -> Any:
+    def fail_request(**kwargs: Any) -> Any:
         del kwargs
         raise requests.ConnectionError("offline")
 
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(config={})
+    monkeypatch.setattr("broker.request_broker.requests.request", fail_request)
+    broker_client = InProcessRequestBrokerClient(
+        RequestBroker(HostCredentialRegistry(credentials={}))
+    )
+    tools = Tools(config={}, request_broker_client=broker_client)
 
     result = tools.execute(
         ToolCall(
@@ -565,7 +534,38 @@ def test_tools_http_request_request_error(monkeypatch: Any) -> None:
     assert result.exit_code == 1
     payload = _unwrap_data(result.stdout)
     assert payload["success"] is False
-    assert "http_request failed" in str(payload["error"])
+    assert payload["error_code"] == "request_failed"
+    assert "HTTP request failed" in payload["message"]
+
+
+def test_tools_http_request_does_not_use_direct_requests_path(monkeypatch: Any) -> None:
+    def fail_direct_request(*args: Any, **kwargs: Any) -> Any:
+        del args
+        del kwargs
+        raise AssertionError("tools http_request must not call requests.request directly")
+
+    monkeypatch.setattr("agent.tools.requests.request", fail_direct_request)
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": "ok",
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(config={}, request_broker_client=broker)
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={"method": "GET", "url": "https://example.com"},
+        )
+    )
+
+    assert result.exit_code == 0
+    assert len(broker.requests) == 1
 
 
 def _unwrap_data(text: str) -> dict[str, Any]:

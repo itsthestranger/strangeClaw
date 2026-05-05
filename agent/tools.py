@@ -11,8 +11,11 @@ import requests
 import trafilatura
 from requests import Response
 
-from agent.http_auth import HttpAuthResolver
 from agent.llm import ToolCall
+from agent.request_broker_client import (
+    RequestBrokerClient,
+    build_request_broker_client,
+)
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
@@ -22,7 +25,6 @@ _DEFAULT_WEB_FETCH_USER_AGENT = "strangeclaw/0.1 (+fetch)"
 _DEFAULT_WEB_FETCH_MAX_CHARS = 20000
 _WEB_FETCH_MAX_BYTES = 5 * 1024 * 1024
 _DEFAULT_HTTP_REQUEST_USER_AGENT = "strangeclaw/0.1 (+http)"
-_DEFAULT_HTTP_REQUEST_MAX_CHARS = 20000
 _HTTP_REQUEST_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 _KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
 
@@ -39,9 +41,14 @@ class ToolResult:
 class Tools:
     """Built-in capability registry and dispatcher."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        request_broker_client: RequestBrokerClient | None = None,
+    ) -> None:
         self._config = dict(config)
-        self._http_auth = HttpAuthResolver.from_config(config)
+        self._request_broker = request_broker_client or build_request_broker_client(config)
         raw_tools = config.get("tools")
         if isinstance(raw_tools, dict):
             enabled: set[str] = {
@@ -209,7 +216,7 @@ class Tools:
                 "Optional configured integration name. Use null or omit for anonymous requests."
             ),
         }
-        available_integrations = self._http_auth.available_names()
+        available_integrations = _request_broker_integration_names(self._config)
         if available_integrations:
             integration_schema["enum"] = [*available_integrations, None]
             integration_schema["description"] = (
@@ -492,12 +499,13 @@ class Tools:
                 stdout="",
                 stderr="http_request.integration must be a string or null.",
             )
-        normalized_headers, auth_error = self._http_auth.apply(
-            integration_name=integration_raw,
-            headers=normalized_headers,
-        )
-        if auth_error is not None:
-            return ToolResult(exit_code=1, stdout="", stderr=auth_error)
+        integration_name = integration_raw.strip() if isinstance(integration_raw, str) else None
+        if integration_name == "":
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="http_request.integration must be a non-empty string or null.",
+            )
         normalized_headers.setdefault("User-Agent", _DEFAULT_HTTP_REQUEST_USER_AGENT)
 
         body = args.get("body")
@@ -508,42 +516,25 @@ class Tools:
                 stderr="http_request.body must be a string or null.",
             )
 
-        try:
-            response = requests.request(
-                method=method,
-                url=target_url,
-                headers=normalized_headers,
-                data=body,
-                timeout=(10.0, 30.0),
-            )
-        except requests.RequestException as exc:
-            error_payload = _wrap_external_data(
-                {
-                    "success": False,
-                    "method": method,
-                    "url": target_url,
-                    "error": f"http_request failed: {exc}",
-                }
-            )
-            return ToolResult(exit_code=1, stdout=error_payload, stderr="")
-
-        response_headers = _headers_to_dict(getattr(response, "headers", {}))
-        raw_text = getattr(response, "text", "")
-        if not isinstance(raw_text, str):
-            raw_text = str(raw_text)
-        body_text, truncated = _truncate_text(raw_text, limit=_DEFAULT_HTTP_REQUEST_MAX_CHARS)
-        payload = _wrap_external_data(
+        broker_response = self._request_broker.execute(
             {
-                "success": True,
                 "method": method,
                 "url": target_url,
-                "status_code": int(getattr(response, "status_code", 0)),
-                "headers": response_headers,
-                "body": body_text,
-                "truncated": truncated,
+                "integration": integration_name,
+                "headers": normalized_headers,
+                "body": body,
             }
         )
-        return ToolResult(exit_code=0, stdout=payload, stderr="")
+        if not isinstance(broker_response, dict):
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="request_broker returned an invalid response payload.",
+            )
+
+        payload = _wrap_external_data(broker_response)
+        success = broker_response.get("success") is True
+        return ToolResult(exit_code=0 if success else 1, stdout=payload, stderr="")
 
 
 def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
@@ -611,6 +602,30 @@ def _wrap_external_data(payload: dict[str, Any]) -> str:
     return f"--- BEGIN DATA ---\n{body}\n--- END DATA ---"
 
 
+def _request_broker_integration_names(config: dict[str, Any]) -> list[str]:
+    broker_cfg = config.get("request_broker")
+    if not isinstance(broker_cfg, dict):
+        return []
+    metadata = broker_cfg.get("integration_metadata")
+    if not isinstance(metadata, list):
+        return []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in metadata:
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return sorted(names)
+
+
 def _read_limited_bytes(response: Response | Any, *, byte_limit: int) -> tuple[bytes, bool]:
     collected = bytearray()
     limited = False
@@ -651,14 +666,3 @@ def _safe_close_response(response: Response | Any | None) -> None:
         except Exception:
             return
 
-
-def _headers_to_dict(raw_headers: Any) -> dict[str, str]:
-    if isinstance(raw_headers, dict):
-        return {str(key): str(value) for key, value in raw_headers.items()}
-    items_method = getattr(raw_headers, "items", None)
-    if callable(items_method):
-        try:
-            return {str(key): str(value) for key, value in items_method()}
-        except Exception:
-            return {}
-    return {}
