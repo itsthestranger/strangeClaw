@@ -46,11 +46,12 @@ tools:
   http_request: true            # Medium risk: arbitrary HTTP API calls
 
 web_search:
-  # Quick-start: Brave API endpoint (requires api_key).
+  # Quick-start: Brave API endpoint via request broker integration
+  # (set integration to a host-only credential name from ~/.strangeclaw/secrets.yaml).
   # Self-hosted recommendation: set endpoint to SearXNG and format to "searxng".
   endpoint: "https://api.search.brave.com/res/v1/web/search"
   format: "brave"               # brave | searxng
-  api_key: ""                   # required for brave; not needed for searxng
+  integration: null             # required for brave; optional for searxng
   max_results: 10
 
 web_fetch:

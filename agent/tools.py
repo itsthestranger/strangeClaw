@@ -6,8 +6,8 @@ import json
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import requests
 import trafilatura
 
 from agent.llm import ToolCall
@@ -18,7 +18,6 @@ from agent.request_broker_client import (
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
-_DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 30.0
 _DEFAULT_WEB_SEARCH_USER_AGENT = "strangeclaw/0.1 (+local)"
 _DEFAULT_WEB_FETCH_USER_AGENT = "strangeclaw/0.1 (+fetch)"
 _DEFAULT_WEB_FETCH_MAX_CHARS = 20000
@@ -244,6 +243,7 @@ class Tools:
         query = args.get("query")
         if not isinstance(query, str) or not query.strip():
             return ToolResult(exit_code=1, stdout="", stderr="web_search.query must be a string.")
+        query_text = query.strip()
 
         web_search_cfg = self._config.get("web_search", {})
         if not isinstance(web_search_cfg, dict):
@@ -280,29 +280,37 @@ class Tools:
                 stderr="web_search.max_results must be a positive integer.",
             )
 
-        request_kwargs: dict[str, Any] = {
-            "timeout": _DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
-            "headers": {"User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT},
-        }
+        integration_raw = web_search_cfg.get("integration")
+        integration_name: str | None
+        if integration_raw is None:
+            integration_name = None
+        elif isinstance(integration_raw, str) and integration_raw.strip():
+            integration_name = integration_raw.strip()
+        else:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search.integration must be a non-empty string when provided.",
+            )
+
+        broker_headers: dict[str, str] = {"User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT}
+        broker_url: str
         if search_format == "brave":
-            api_key = web_search_cfg.get("api_key")
-            if not isinstance(api_key, str) or not api_key.strip():
+            if integration_name is None:
                 return ToolResult(
                     exit_code=1,
                     stdout="",
-                    stderr="web_search.api_key is required when web_search.format is brave.",
+                    stderr=(
+                        "web_search.integration is required when web_search.format is brave. "
+                        "Configure a host-only broker credential in ~/.strangeclaw/secrets.yaml "
+                        "and set web_search.integration (for example 'brave_search')."
+                    ),
                 )
-            request_kwargs["headers"] = {
-                "User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT,
-                "X-Subscription-Token": api_key.strip(),
-            }
-            request_kwargs["params"] = {"q": query.strip()}
+            broker_headers["Accept"] = "application/json"
+            broker_url = _append_query_params(endpoint.strip(), {"q": query_text})
         elif search_format == "searxng":
-            request_kwargs["headers"] = {
-                "User-Agent": _DEFAULT_WEB_SEARCH_USER_AGENT,
-                "Accept": "application/json",
-            }
-            request_kwargs["params"] = {"q": query.strip(), "format": "json"}
+            broker_headers["Accept"] = "application/json"
+            broker_url = _append_query_params(endpoint.strip(), {"q": query_text, "format": "json"})
         else:
             return ToolResult(
                 exit_code=1,
@@ -310,32 +318,69 @@ class Tools:
                 stderr=f"Unsupported web_search.format: {search_format}",
             )
 
-        try:
-            response = requests.get(endpoint.strip(), **request_kwargs)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
+        broker_response = self._request_broker.execute(
+            {
+                "method": "GET",
+                "url": broker_url,
+                "integration": integration_name,
+                "headers": broker_headers,
+                "body": None,
+            }
+        )
+        if not isinstance(broker_response, dict):
             return ToolResult(
                 exit_code=1,
                 stdout="",
-                stderr=f"web_search request failed: {exc}",
+                stderr="web_search request failed: request_broker returned invalid payload.",
             )
+
+        if broker_response.get("success") is not True:
+            message = broker_response.get("message")
+            if isinstance(message, str) and message.strip():
+                error_message = message.strip()
+            else:
+                error_message = "request_broker rejected or failed request."
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"web_search request failed: {error_message}",
+            )
+
+        status_code_raw = broker_response.get("status_code", 0)
+        try:
+            status_code = int(status_code_raw)
+        except (TypeError, ValueError):
+            status_code = 0
+        if status_code >= 400:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"web_search request failed: HTTP {status_code}",
+            )
+
+        body_raw = broker_response.get("body", "")
+        body_text = body_raw if isinstance(body_raw, str) else str(body_raw)
+        try:
+            payload = json.loads(body_text)
         except ValueError as exc:
             return ToolResult(
                 exit_code=1,
                 stdout="",
                 stderr=f"web_search returned invalid JSON: {exc}",
             )
-
         if not isinstance(payload, dict):
-            return ToolResult(exit_code=1, stdout="", stderr="web_search response must be JSON.")
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="web_search response must be JSON object.",
+            )
 
         if search_format == "brave":
             results = _normalize_brave_results(payload, max_results=max_results)
         else:
             results = _normalize_searxng_results(payload, max_results=max_results)
 
-        wrapped = _wrap_external_data({"query": query.strip(), "results": results})
+        wrapped = _wrap_external_data({"query": query_text, "results": results})
         return ToolResult(exit_code=0, stdout=wrapped, stderr="")
 
     def _execute_web_fetch(self, args: dict[str, Any]) -> ToolResult:
@@ -658,6 +703,21 @@ def _request_broker_integration_names(config: dict[str, Any]) -> list[str]:
     return sorted(names)
 
 
+def _append_query_params(url: str, params: dict[str, str]) -> str:
+    split = urlsplit(url)
+    existing = dict(parse_qsl(split.query, keep_blank_values=True))
+    existing.update(params)
+    return urlunsplit(
+        (
+            split.scheme,
+            split.netloc,
+            split.path,
+            urlencode(existing, doseq=True),
+            split.fragment,
+        )
+    )
+
+
 def _normalize_content_type(raw: str) -> str:
     lowered = raw.lower().strip()
     if ";" in lowered:
@@ -670,4 +730,3 @@ def _truncate_text(text: str, *, limit: int) -> tuple[str, bool]:
         return text, False
     notice = f"\n\n[... truncated, original {len(text)} chars ...]"
     return text[:limit] + notice, True
-

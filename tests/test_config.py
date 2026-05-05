@@ -115,7 +115,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["web_search"] == {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
         "format": "brave",
-        "api_key": "",
+        "integration": None,
         "max_results": 10,
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
@@ -254,7 +254,7 @@ def test_load_config_rejects_invalid_web_search_format(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_load_config_warns_when_brave_without_api_key(
+def test_load_config_warns_when_brave_without_integration(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -262,7 +262,7 @@ def test_load_config_warns_when_brave_without_api_key(
     config["web_search"] = {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
         "format": "brave",
-        "api_key": "",
+        "integration": None,
     }
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
@@ -271,7 +271,21 @@ def test_load_config_warns_when_brave_without_api_key(
         loaded = load_config(config_path)
 
     assert loaded["web_search"]["format"] == "brave"
-    assert "web_search.api_key is empty" in caplog.text
+    assert "web_search.integration is not set" in caplog.text
+
+
+def test_load_config_rejects_legacy_web_search_api_key_field(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_search"] = {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "api_key": "legacy-key",
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"web_search\.api_key is no longer supported"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None:

@@ -1749,7 +1749,7 @@ def _coerce_agent_config_template(
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
+                "integration": None,
                 "max_results": 10,
             },
             "web_fetch": {"max_chars": 20000},
@@ -1800,7 +1800,8 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         web_search = {}
     web_search.setdefault("endpoint", "https://api.search.brave.com/res/v1/web/search")
     web_search.setdefault("format", "brave")
-    web_search.setdefault("api_key", "")
+    web_search.pop("api_key", None)
+    web_search.setdefault("integration", None)
     web_search.setdefault("max_results", 10)
 
     web_fetch_raw = config.get("web_fetch")

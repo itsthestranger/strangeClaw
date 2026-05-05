@@ -15,19 +15,6 @@ from broker.credentials import HostCredential, HostCredentialRegistry
 from broker.request_broker import RequestBroker
 
 
-class _FakeResponse:
-    def __init__(self, payload: Any, status_code: int = 200) -> None:
-        self._payload = payload
-        self.status_code = status_code
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise RuntimeError(f"http {self.status_code}")
-
-    def json(self) -> Any:
-        return self._payload
-
-
 class _FakeBrokerHTTPResponse:
     def __init__(
         self,
@@ -111,52 +98,62 @@ def test_tools_shell_output_truncates_long_text() -> None:
 
 
 def test_tools_web_search_normalizes_brave(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        captured["url"] = url
-        captured["kwargs"] = kwargs
-        return _FakeResponse(
-            {
-                "web": {
-                    "results": [
-                        {
-                            "title": "Result One",
-                            "url": "https://example.com/1",
-                            "description": "Snippet 1",
-                        },
-                        {
-                            "title": "Result Two",
-                            "url": "https://example.com/2",
-                            "description": "Snippet 2",
-                        },
-                    ]
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(
+                {
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Result One",
+                                "url": "https://example.com/1",
+                                "description": "Snippet 1",
+                            },
+                            {
+                                "title": "Result Two",
+                                "url": "https://example.com/2",
+                                "description": "Snippet 2",
+                            },
+                        ]
+                    }
                 }
-            }
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
+            ),
+            "truncated": False,
+            "integration": "brave_search",
+        }
+    )
     tools = Tools(
         config={
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "test-token",
+                "integration": "brave_search",
                 "max_results": 1,
-            }
-        }
+            },
+        },
+        request_broker_client=broker,
     )
 
     result = tools.execute(ToolCall(tool="web_search", args={"query": "llm"}))
 
     assert result.exit_code == 0
     assert result.stderr == ""
-    assert captured["url"] == "https://api.search.brave.com/res/v1/web/search"
-    assert captured["kwargs"]["headers"] == {
-        "User-Agent": "strangeclaw/0.1 (+local)",
-        "X-Subscription-Token": "test-token",
-    }
-    assert captured["kwargs"]["params"] == {"q": "llm"}
+    assert broker.requests == [
+        {
+            "method": "GET",
+            "url": "https://api.search.brave.com/res/v1/web/search?q=llm",
+            "integration": "brave_search",
+            "headers": {
+                "User-Agent": "strangeclaw/0.1 (+local)",
+                "Accept": "application/json",
+            },
+            "body": None,
+        }
+    ]
 
     body = _unwrap_data(result.stdout)
     assert body["query"] == "llm"
@@ -166,49 +163,62 @@ def test_tools_web_search_normalizes_brave(monkeypatch: Any) -> None:
 
 
 def test_tools_web_search_normalizes_searxng(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        assert url == "http://localhost:8080/search"
-        assert kwargs["headers"] == {
-            "User-Agent": "strangeclaw/0.1 (+local)",
-            "Accept": "application/json",
+    del monkeypatch
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(
+                {
+                    "results": [
+                        {"title": "S1", "url": "https://s1", "content": "C1"},
+                        {"title": "S2", "url": "https://s2", "content": "C2"},
+                    ]
+                }
+            ),
+            "truncated": False,
+            "integration": None,
         }
-        assert kwargs["params"] == {"q": "solid state batteries", "format": "json"}
-        return _FakeResponse(
-            {
-                "results": [
-                    {"title": "S1", "url": "https://s1", "content": "C1"},
-                    {"title": "S2", "url": "https://s2", "content": "C2"},
-                ]
-            }
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
+    )
     tools = Tools(
         config={
             "web_search": {
                 "endpoint": "http://localhost:8080/search",
                 "format": "searxng",
                 "max_results": 10,
-            }
-        }
+            },
+        },
+        request_broker_client=broker,
     )
 
     result = tools.execute(ToolCall(tool="web_search", args={"query": "solid state batteries"}))
 
     assert result.exit_code == 0
+    assert broker.requests == [
+        {
+            "method": "GET",
+            "url": "http://localhost:8080/search?q=solid+state+batteries&format=json",
+            "integration": None,
+            "headers": {
+                "User-Agent": "strangeclaw/0.1 (+local)",
+                "Accept": "application/json",
+            },
+            "body": None,
+        }
+    ]
     assert _unwrap_data(result.stdout)["results"] == [
         {"title": "S1", "url": "https://s1", "snippet": "C1"},
         {"title": "S2", "url": "https://s2", "snippet": "C2"},
     ]
 
 
-def test_tools_web_search_brave_requires_api_key() -> None:
+def test_tools_web_search_brave_requires_integration() -> None:
     tools = Tools(
         config={
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
             }
         }
     )
@@ -216,7 +226,35 @@ def test_tools_web_search_brave_requires_api_key() -> None:
     result = tools.execute(ToolCall(tool="web_search", args={"query": "test"}))
 
     assert result.exit_code == 1
-    assert result.stderr == "web_search.api_key is required when web_search.format is brave."
+    assert "web_search.integration is required" in result.stderr
+
+
+def test_tools_web_search_does_not_use_direct_requests_path(monkeypatch: Any) -> None:
+    def fail_direct_get(*args: Any, **kwargs: Any) -> Any:
+        del args
+        del kwargs
+        raise AssertionError("tools web_search must not call requests.get directly")
+
+    monkeypatch.setattr("requests.get", fail_direct_get)
+    broker = _FakeBrokerClient(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"results": []}),
+            "truncated": False,
+            "integration": None,
+        }
+    )
+    tools = Tools(
+        config={"web_search": {"endpoint": "https://example.com/search", "format": "searxng"}},
+        request_broker_client=broker,
+    )
+
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "q"}))
+
+    assert result.exit_code == 0
+    assert len(broker.requests) == 1
 
 
 def test_tools_web_fetch_html_uses_trafilatura(monkeypatch: Any) -> None:
@@ -428,7 +466,7 @@ def test_tools_web_fetch_does_not_use_direct_requests_path(monkeypatch: Any) -> 
         del kwargs
         raise AssertionError("tools web_fetch must not call requests.get directly")
 
-    monkeypatch.setattr("agent.tools.requests.get", fail_direct_get)
+    monkeypatch.setattr("requests.get", fail_direct_get)
     broker = _FakeBrokerClient(
         {
             "success": True,
@@ -633,7 +671,7 @@ def test_tools_http_request_does_not_use_direct_requests_path(monkeypatch: Any) 
         del kwargs
         raise AssertionError("tools http_request must not call requests.request directly")
 
-    monkeypatch.setattr("agent.tools.requests.request", fail_direct_request)
+    monkeypatch.setattr("requests.request", fail_direct_request)
     broker = _FakeBrokerClient(
         {
             "success": True,

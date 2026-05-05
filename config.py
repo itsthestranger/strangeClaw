@@ -194,7 +194,7 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         config["web_search"] = {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
+            "integration": None,
             "max_results": 10,
         }
         web_search = config["web_search"]
@@ -214,14 +214,33 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         raise ConfigError("Config field web_search.format must be either 'brave' or 'searxng'.")
     web_search["format"] = normalized_format
 
-    api_key = web_search.get("api_key", "")
-    if not isinstance(api_key, str):
-        raise ConfigError("Config field web_search.api_key must be a string.")
-    web_search["api_key"] = api_key
-    if normalized_format == "brave" and not api_key.strip():
+    if "api_key" in web_search:
+        raise ConfigError(
+            "Config field web_search.api_key is no longer supported. "
+            "Use host-only request broker credentials in ~/.strangeclaw/secrets.yaml "
+            "and set web_search.integration."
+        )
+
+    integration_raw = web_search.get("integration")
+    integration: str | None
+    if integration_raw is None:
+        integration = None
+    elif isinstance(integration_raw, str):
+        integration = integration_raw.strip()
+        if not integration:
+            raise ConfigError(
+                "Config field web_search.integration must be a non-empty string or null."
+            )
+    else:
+        raise ConfigError(
+            "Config field web_search.integration must be a non-empty string or null."
+        )
+    web_search["integration"] = integration
+
+    if normalized_format == "brave" and integration is None:
         LOGGER.warning(
-            "web_search.format is brave but web_search.api_key is empty. "
-            "Brave requests will fail until an API key is set."
+            "web_search.format is brave but web_search.integration is not set. "
+            "Brave requests will fail until a host-only broker integration is configured."
         )
 
     max_results_raw = web_search.get("max_results", 10)

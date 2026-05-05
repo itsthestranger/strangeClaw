@@ -182,14 +182,21 @@ Set:
 web_search:
   endpoint: "https://api.search.brave.com/res/v1/web/search"
   format: "brave"      # or "searxng"
-  api_key: ""          # required for brave
+  integration: "brave_search"  # required for brave; host-only credential name
   max_results: 10
 ```
 
 Behavior:
-- `format: brave` sends `q=<query>` and uses `X-Subscription-Token`.
+- `format: brave` requires `web_search.integration` and sends the query through the request broker.
 - `format: searxng` sends `q=<query>&format=json`.
+- For `searxng`, integration is optional (anonymous brokered request by default).
 - Results are normalized into `{title, url, snippet}` for the model.
+
+Brave credentials are host-only:
+- Put Brave credentials in `~/.strangeclaw/secrets.yaml` as a broker credential
+  (for example `credentials.brave_search`) and reference that name via
+  `web_search.integration`.
+- `web_search.api_key` in `config.yaml` is deprecated and rejected.
 
 SearXNG local setup note:
 - I run SearXNG from Docker using the official container installation guide:
@@ -200,7 +207,7 @@ SearXNG local setup note:
   web_search:
     endpoint: "http://localhost:8080/search"
     format: "searxng"
-    api_key: ""
+    integration: null
     max_results: 10
   ```
 - In SearXNG's `settings.yml`, allow JSON output or requests with
@@ -212,10 +219,9 @@ SearXNG local setup note:
       - json
   ```
 
-Future direction:
-- A host-side request broker is planned and currently in work. Once complete,
-  HTTP/search/API requests and credential injection will move behind a host-side
-  policy layer so secrets do not need to be sent into the agent sandbox.
+Current direction:
+- `http_request` and `web_fetch` are brokered, and `web_search` is brokered as well.
+- Remaining broker work focuses on Fire transport parity, observability, and rate limits.
 
 ## Skills Config Defaults
 

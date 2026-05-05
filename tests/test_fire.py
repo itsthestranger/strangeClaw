@@ -226,7 +226,7 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
+                "integration": None,
                 "max_results": 10,
             },
             "web_fetch": {"max_chars": 20000},
@@ -1370,7 +1370,7 @@ def _agent_config(
         "web_search": {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
+            "integration": None,
             "max_results": 10,
         },
         "web_fetch": {"max_chars": 20000},
