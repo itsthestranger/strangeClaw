@@ -11,6 +11,7 @@ import requests
 import trafilatura
 from requests import Response
 
+from agent.broker_client import BrokerClient
 from agent.http_auth import HttpAuthResolver
 from agent.llm import ToolCall
 
@@ -39,8 +40,14 @@ class ToolResult:
 class Tools:
     """Built-in capability registry and dispatcher."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        broker: BrokerClient | None = None,
+    ) -> None:
         self._config = dict(config)
+        self._broker = broker
         self._http_auth = HttpAuthResolver.from_config(config)
         raw_tools = config.get("tools")
         if isinstance(raw_tools, dict):

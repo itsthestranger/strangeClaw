@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.protocol import decode_event, encode_event
+from sandbox.host_services import HostServiceServer
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -36,6 +37,7 @@ _TAP_CIDR_SUFFIX = 30
 _MAX_TAP_SUBNETS = 16384
 _FIRE_TAP_NAME_PATTERN = re.compile(r"^fc[0-9a-f]{12}$")
 _GUEST_VSOCK_PORT = 5000
+_HOST_SERVICES_VSOCK_PORT = 5001
 _DEFAULT_API_SOCKET_WAIT_SECONDS = 5.0
 _DEFAULT_VSOCK_RETRY_SECONDS = 0.5
 _DEFAULT_FIRE_DNS = ["8.8.8.8", "1.1.1.1"]
@@ -980,6 +982,7 @@ class FireSandbox:
         self._process: PopenProcess | None = None
         self._api_socket_path: Path | None = None
         self._vsock_uds_path: Path | None = None
+        self._host_services_uds_path: Path | None = None
         self._log_path: Path | None = None
         self._session_temp_dir: Path | None = None
         self._rootfs_copy_path: Path | None = None
@@ -987,6 +990,7 @@ class FireSandbox:
         self._allocation: TapNetworkAllocation | None = None
         self._guest_cid: int | None = None
         self._vsock_conn: ConnectedSocket | None = None
+        self._host_service_server: HostServiceServer | None = None
         self._recv_buffer = ""
         self._stopping = False
 
@@ -1020,6 +1024,22 @@ class FireSandbox:
 
         try:
             self._prepare_runtime_paths(session_id=session_id)
+            if self._host_services_uds_path is None:
+                raise RuntimeError("Host services uds path was not initialized.")
+            self._host_service_server = HostServiceServer(
+                mode="fire",
+                fire_uds_path=self._host_services_uds_path,
+            )
+            try:
+                self._host_service_server.start()
+            except OSError as exc:
+                LOGGER.warning(
+                    "Failed to start Fire host-services transport on %s: %s. "
+                    "Continuing without host services for this run.",
+                    self._host_services_uds_path,
+                    exc,
+                )
+                self._host_service_server = None
             self._copy_rootfs()
             self._allocation = self._tap_manager.create(session_id=session_id)
             if self._firecracker_config.host_expose_enabled and not host_expose_ports:
@@ -1117,6 +1137,10 @@ class FireSandbox:
         self._stopping = True
         try:
             self._safe_teardown_step(self._close_vsock_conn)
+            if self._host_service_server is not None:
+                server = self._host_service_server
+                self._safe_teardown_step(server.stop)
+                self._host_service_server = None
             self._safe_teardown_step(self._graceful_shutdown_process)
             self._safe_teardown_step(self._export_firecracker_log_artifact)
             if self._allocation is not None:
@@ -1141,6 +1165,7 @@ class FireSandbox:
             self._session_temp_dir = None
             self._api_socket_path = None
             self._vsock_uds_path = None
+            self._host_services_uds_path = None
             self._log_path = None
             self._rootfs_copy_path = None
             self._session_id = None
@@ -1199,6 +1224,9 @@ class FireSandbox:
         )
         self._api_socket_path = self._session_temp_dir / "firecracker.socket"
         self._vsock_uds_path = self._session_temp_dir / "fire.vsock"
+        self._host_services_uds_path = Path(
+            f"{self._vsock_uds_path}_{_HOST_SERVICES_VSOCK_PORT}"
+        )
         self._log_path = self._session_temp_dir / "firecracker.log"
         self._rootfs_copy_path = self._session_temp_dir / "rootfs.ext4"
 

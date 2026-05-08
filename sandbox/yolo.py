@@ -7,7 +7,9 @@ from collections.abc import Callable
 from typing import Any
 
 from agent.agent import Agent, AgentError, LLMRuntime
+from agent.broker_client import BrokerClient
 from agent.transport import InProcessTransport
+from sandbox.host_services import HostServiceServer
 
 
 class YoloSandbox:
@@ -48,6 +50,8 @@ class YoloSandbox:
         self._agent_transport: InProcessTransport | None = None
         self._agent_thread: threading.Thread | None = None
         self._thread_error: Exception | None = None
+        self._host_service_server: HostServiceServer | None = None
+        self._broker_client: BrokerClient | None = None
 
     def run(self, task: dict[str, Any]) -> None:
         """Start an agent run for a task."""
@@ -61,6 +65,9 @@ class YoloSandbox:
         self._host_transport = host_transport
         self._agent_transport = agent_transport
         self._thread_error = None
+        self._host_service_server = HostServiceServer(mode="yolo")
+        self._host_service_server.start()
+        self._broker_client = BrokerClient(mode="yolo", server=self._host_service_server)
 
         agent = Agent(
             transport=agent_transport,
@@ -72,6 +79,7 @@ class YoloSandbox:
             summary_threshold=self._summary_threshold,
             allow_task_llm=self._agent_config is None,
             llm_factory=self._llm_factory,
+            broker=self._broker_client,
         )
         self._agent_thread = threading.Thread(target=self._run_agent, args=(agent,), daemon=True)
         self._agent_thread.start()
@@ -106,10 +114,16 @@ class YoloSandbox:
             self._host_transport.close()
         if self._agent_transport is not None:
             self._agent_transport.close()
+        if self._broker_client is not None:
+            self._broker_client.close()
+        if self._host_service_server is not None:
+            self._host_service_server.stop()
 
         self._host_transport = None
         self._agent_transport = None
         self._agent_thread = None
+        self._broker_client = None
+        self._host_service_server = None
 
     def _cleanup_inactive_runtime(self) -> None:
         if self._agent_thread is not None and self._agent_thread.is_alive():
@@ -118,9 +132,15 @@ class YoloSandbox:
             self._host_transport.close()
         if self._agent_transport is not None:
             self._agent_transport.close()
+        if self._broker_client is not None:
+            self._broker_client.close()
+        if self._host_service_server is not None:
+            self._host_service_server.stop()
         self._host_transport = None
         self._agent_transport = None
         self._agent_thread = None
+        self._broker_client = None
+        self._host_service_server = None
 
     def _run_agent(self, agent: Agent) -> None:
         try:

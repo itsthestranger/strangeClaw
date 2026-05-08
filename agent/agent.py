@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent.broker_client import BrokerClient
 from agent.llm import LLMClient, LLMResponse, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools
@@ -153,6 +154,7 @@ class Agent:
         max_output_total_bytes: int = 10 * 1024 * 1024,
         allow_task_llm: bool = True,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
+        broker: BrokerClient | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise AgentError("max_iterations must be greater than zero.")
@@ -188,7 +190,7 @@ class Agent:
 
         skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
-        self._tools = Tools(self._agent_config or {})
+        self._tools = Tools(self._agent_config or {}, broker=broker)
         self._execution_action_surface = _build_execution_action_surface(
             self._tools.schema()
         )
@@ -1022,6 +1024,7 @@ def main(argv: list[str] | None = None) -> None:
         config_path = args.llm_config_path
 
     transport = VsockTransport(guest_port=int(args.vsock_port))
+    broker = BrokerClient(mode="fire", port=5001)
     try:
         agent = Agent(
             transport=transport,
@@ -1032,9 +1035,11 @@ def main(argv: list[str] | None = None) -> None:
             token_budget=int(args.token_budget),
             summary_threshold=int(args.summary_threshold),
             allow_task_llm=False,
+            broker=broker,
         )
         agent.run()
     finally:
+        broker.close()
         transport.close()
 
 
