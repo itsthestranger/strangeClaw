@@ -9,6 +9,8 @@ from typing import Any
 from agent.agent import Agent, AgentError, LLMRuntime
 from agent.broker_client import BrokerClient
 from agent.transport import InProcessTransport
+from host_secrets import credentials_from_loaded, load_secrets
+from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
 
 
@@ -52,6 +54,7 @@ class YoloSandbox:
         self._thread_error: Exception | None = None
         self._host_service_server: HostServiceServer | None = None
         self._broker_client: BrokerClient | None = None
+        self._request_broker: RequestBroker | None = None
 
     def run(self, task: dict[str, Any]) -> None:
         """Start an agent run for a task."""
@@ -66,6 +69,29 @@ class YoloSandbox:
         self._agent_transport = agent_transport
         self._thread_error = None
         self._host_service_server = HostServiceServer(mode="yolo")
+        loaded_secrets = load_secrets()
+        credentials = credentials_from_loaded(loaded_secrets)
+        broker_cfg = (
+            self._agent_config.get("broker", {})
+            if isinstance(self._agent_config, dict)
+            else {}
+        )
+        public_policy = {}
+        if isinstance(broker_cfg, dict):
+            maybe_public = broker_cfg.get("public_policy", {})
+            if isinstance(maybe_public, dict):
+                public_policy = dict(maybe_public)
+        web_search_cfg = {}
+        if isinstance(self._agent_config, dict):
+            maybe_search = self._agent_config.get("web_search", {})
+            if isinstance(maybe_search, dict):
+                web_search_cfg = dict(maybe_search)
+        self._request_broker = RequestBroker(
+            credentials=credentials,
+            public_policy=public_policy,
+            web_search_config=web_search_cfg,
+        )
+        self._host_service_server.register("broker", self._request_broker.handle)
         self._host_service_server.start()
         self._broker_client = BrokerClient(mode="yolo", server=self._host_service_server)
 
@@ -124,6 +150,7 @@ class YoloSandbox:
         self._agent_thread = None
         self._broker_client = None
         self._host_service_server = None
+        self._request_broker = None
 
     def _cleanup_inactive_runtime(self) -> None:
         if self._agent_thread is not None and self._agent_thread.is_alive():
@@ -141,6 +168,7 @@ class YoloSandbox:
         self._agent_thread = None
         self._broker_client = None
         self._host_service_server = None
+        self._request_broker = None
 
     def _run_agent(self, agent: Agent) -> None:
         try:

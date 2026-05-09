@@ -133,6 +133,7 @@ def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_tools_optional_fields(config)
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
+    _validate_broker_optional_fields(config)
     _validate_skills_optional_fields(config)
     _validate_integrations_optional_fields(config)
     _validate_firecracker_optional_fields(config)
@@ -220,7 +221,8 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
     if normalized_format == "brave" and not api_key.strip():
         LOGGER.warning(
             "web_search.format is brave but web_search.api_key is empty. "
-            "Brave requests will fail until an API key is set."
+            "This field is deprecated; configure credentials._web_search.token in "
+            "~/.strangeclaw/secrets.yaml for brokered search."
         )
 
     max_results_raw = web_search.get("max_results", 10)
@@ -233,6 +235,70 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
     if max_results <= 0:
         raise ConfigError("Config field web_search.max_results must be greater than zero.")
     web_search["max_results"] = max_results
+
+
+def _validate_broker_optional_fields(config: dict[str, Any]) -> None:
+    broker = config.get("broker")
+    if broker is None:
+        config["broker"] = {
+            "public_policy": {
+                "enabled": True,
+                "allowed_methods": ["GET"],
+                "max_response_bytes": 524288,
+            }
+        }
+        return
+    if not isinstance(broker, dict):
+        raise ConfigError("Config field broker must be a mapping.")
+
+    public_policy = broker.get("public_policy")
+    if public_policy is None:
+        broker["public_policy"] = {
+            "enabled": True,
+            "allowed_methods": ["GET"],
+            "max_response_bytes": 524288,
+        }
+        return
+    if not isinstance(public_policy, dict):
+        raise ConfigError("Config field broker.public_policy must be a mapping.")
+
+    enabled = public_policy.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("Config field broker.public_policy.enabled must be a boolean.")
+
+    allowed_methods_raw = public_policy.get("allowed_methods", ["GET"])
+    if not isinstance(allowed_methods_raw, list) or not allowed_methods_raw:
+        raise ConfigError(
+            "Config field broker.public_policy.allowed_methods must be a non-empty list."
+        )
+    allowed_methods: list[str] = []
+    for index, method in enumerate(allowed_methods_raw):
+        if not isinstance(method, str) or not method.strip():
+            raise ConfigError(
+                "Config field broker.public_policy.allowed_methods must contain "
+                f"non-empty strings (invalid at index {index})."
+            )
+        allowed_methods.append(method.strip().upper())
+
+    max_response_bytes_raw = public_policy.get("max_response_bytes", 524288)
+    if isinstance(max_response_bytes_raw, bool):
+        raise ConfigError(
+            "Config field broker.public_policy.max_response_bytes must be an integer."
+        )
+    try:
+        max_response_bytes = int(max_response_bytes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field broker.public_policy.max_response_bytes must be an integer."
+        ) from exc
+    if max_response_bytes <= 0:
+        raise ConfigError(
+            "Config field broker.public_policy.max_response_bytes must be greater than zero."
+        )
+
+    public_policy["enabled"] = enabled
+    public_policy["allowed_methods"] = allowed_methods
+    public_policy["max_response_bytes"] = max_response_bytes
 
 
 def _validate_web_fetch_optional_fields(config: dict[str, Any]) -> None:

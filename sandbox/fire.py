@@ -24,6 +24,8 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.protocol import decode_event, encode_event
+from host_secrets import credentials_from_loaded, load_secrets
+from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
@@ -991,6 +993,7 @@ class FireSandbox:
         self._guest_cid: int | None = None
         self._vsock_conn: ConnectedSocket | None = None
         self._host_service_server: HostServiceServer | None = None
+        self._request_broker: RequestBroker | None = None
         self._recv_buffer = ""
         self._stopping = False
 
@@ -1030,6 +1033,24 @@ class FireSandbox:
                 mode="fire",
                 fire_uds_path=self._host_services_uds_path,
             )
+            loaded_secrets = load_secrets()
+            credentials = credentials_from_loaded(loaded_secrets)
+            broker_cfg = self._agent_config_template.get("broker", {})
+            public_policy = {}
+            if isinstance(broker_cfg, Mapping):
+                maybe_public = broker_cfg.get("public_policy", {})
+                if isinstance(maybe_public, Mapping):
+                    public_policy = dict(maybe_public)
+            web_search_cfg = {}
+            maybe_search_cfg = self._agent_config_template.get("web_search", {})
+            if isinstance(maybe_search_cfg, Mapping):
+                web_search_cfg = dict(maybe_search_cfg)
+            self._request_broker = RequestBroker(
+                credentials=credentials,
+                public_policy=public_policy,
+                web_search_config=web_search_cfg,
+            )
+            self._host_service_server.register("broker", self._request_broker.handle)
             try:
                 self._host_service_server.start()
             except OSError as exc:
@@ -1141,6 +1162,7 @@ class FireSandbox:
                 server = self._host_service_server
                 self._safe_teardown_step(server.stop)
                 self._host_service_server = None
+                self._request_broker = None
             self._safe_teardown_step(self._graceful_shutdown_process)
             self._safe_teardown_step(self._export_firecracker_log_artifact)
             if self._allocation is not None:
@@ -1169,6 +1191,7 @@ class FireSandbox:
             self._log_path = None
             self._rootfs_copy_path = None
             self._session_id = None
+            self._request_broker = None
             self._recv_buffer = ""
         finally:
             self._process = None

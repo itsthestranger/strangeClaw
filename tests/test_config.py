@@ -119,6 +119,13 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
         "max_results": 10,
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
+    assert loaded["broker"] == {
+        "public_policy": {
+            "enabled": True,
+            "allowed_methods": ["GET"],
+            "max_response_bytes": 524288,
+        }
+    }
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
     assert loaded["integrations"] == {}
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
@@ -276,6 +283,26 @@ def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"web_fetch\.max_chars"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_broker_public_policy(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["broker"] = {"public_policy": {"enabled": "yes"}}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"broker\.public_policy\.enabled"):
+        load_config(config_path)
+
+    config["broker"] = {"public_policy": {"enabled": True, "allowed_methods": []}}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"broker\.public_policy\.allowed_methods"):
+        load_config(config_path)
+
+    config["broker"] = {"public_policy": {"enabled": True, "max_response_bytes": 0}}
+    _write_config(config_path, config)
+    with pytest.raises(ConfigError, match=r"broker\.public_policy\.max_response_bytes"):
         load_config(config_path)
 
 
