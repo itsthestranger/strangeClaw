@@ -26,7 +26,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["main", "config", "session"]
+py-modules = ["main", "config", "session", "host_secrets"]
 packages = ["agent", "adapters", "sandbox"]
 
 [tool.ruff]
@@ -40,7 +40,16 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["main.py", "config.py", "session.py", "agent", "adapters", "sandbox", "tests"]
+files = [
+  "main.py",
+  "config.py",
+  "session.py",
+  "host_secrets.py",
+  "agent",
+  "adapters",
+  "sandbox",
+  "tests",
+]
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
