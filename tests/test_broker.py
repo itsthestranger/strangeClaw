@@ -298,3 +298,113 @@ def test_execute_returns_structured_error_on_request_exception() -> None:
         "error": "ConnectionError",
         "detail": "connection failed",
     }
+
+
+class _FakeResponse:
+    status_code = 200
+    headers = {"Content-Type": "text/plain"}
+    encoding = "utf-8"
+
+    def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+        _ = chunk_size
+        return [b"ok"]
+
+
+def test_inject_bearer_captures_outbound_header_key_and_no_token_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    broker = _broker()
+    token = "token-bearer-secret"
+    policy = {
+        "name": "notion",
+        "auth_type": "bearer",
+        "token": token,
+        "default_headers": {"X-Default": "yes"},
+    }
+
+    captured: dict[str, object] = {}
+
+    def _fake_request(*args: object, **kwargs: object) -> _FakeResponse:
+        _ = args
+        captured.update(kwargs)
+        return _FakeResponse()
+
+    with caplog.at_level("DEBUG"):
+        final_headers, final_url = broker._inject(policy, {"X-Client": "1"}, "https://example.com")
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        broker._execute("GET", final_url, final_headers, None, 1024)
+
+    outbound_headers = captured["headers"]
+    assert isinstance(outbound_headers, dict)
+    assert "Authorization" in outbound_headers
+    assert "X-Default" in outbound_headers
+    assert "X-Client" in outbound_headers
+    assert token not in caplog.text
+
+
+def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    broker = _broker()
+    token = "token-header-secret"
+    policy = {
+        "name": "github",
+        "auth_type": "header",
+        "header_name": "X-API-Key",
+        "token": token,
+    }
+
+    captured: dict[str, object] = {}
+
+    def _fake_request(*args: object, **kwargs: object) -> _FakeResponse:
+        _ = args
+        captured.update(kwargs)
+        return _FakeResponse()
+
+    with caplog.at_level("DEBUG"):
+        final_headers, final_url = broker._inject(policy, {}, "https://example.com")
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        broker._execute("GET", final_url, final_headers, None, 1024)
+
+    outbound_headers = captured["headers"]
+    assert isinstance(outbound_headers, dict)
+    assert "X-API-Key" in outbound_headers
+    assert token not in caplog.text
+
+
+def test_inject_query_appends_token_param_and_no_token_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    broker = _broker()
+    token = "token-query-secret"
+    policy = {
+        "name": "search",
+        "auth_type": "query",
+        "query_param": "api_key",
+        "token": token,
+    }
+
+    captured: dict[str, object] = {}
+
+    def _fake_request(*args: object, **kwargs: object) -> _FakeResponse:
+        _ = args
+        captured.update(kwargs)
+        return _FakeResponse()
+
+    with caplog.at_level("DEBUG"):
+        final_headers, final_url = broker._inject(
+            policy,
+            {"X-Client": "1"},
+            "https://example.com/search?q=test",
+        )
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        broker._execute("GET", final_url, final_headers, None, 1024)
+
+    outbound_url = captured["url"]
+    assert isinstance(outbound_url, str)
+    assert "api_key=" in outbound_url
+    assert outbound_url.startswith("https://example.com/search?")
+    assert token not in caplog.text

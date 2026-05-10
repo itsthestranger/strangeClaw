@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -89,6 +92,57 @@ class RequestBroker:
             "requested_method": method.upper(),
             "requested_url": url,
         }
+
+    def _inject(
+        self,
+        policy: dict[str, Any],
+        headers: dict[str, str],
+        url: str,
+    ) -> tuple[dict[str, str], str]:
+        final_headers: dict[str, str] = {}
+        defaults = policy.get("default_headers", {})
+        if isinstance(defaults, dict):
+            for key, value in defaults.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    final_headers[key] = value
+        for key, value in headers.items():
+            final_headers[key] = value
+
+        auth_type = str(policy.get("auth_type", "")).lower()
+        integration = str(policy.get("name", "<unknown>"))
+        token = str(policy.get("token", ""))
+        LOGGER.debug("injecting %s credential for integration %s", auth_type, integration)
+
+        if auth_type == "bearer":
+            final_headers["Authorization"] = f"Bearer {token}"
+            return final_headers, url
+
+        if auth_type == "header":
+            header_name_raw = policy.get("header_name", "Authorization")
+            header_name = (
+                header_name_raw.strip()
+                if isinstance(header_name_raw, str) and header_name_raw.strip()
+                else "Authorization"
+            )
+            final_headers[header_name] = token
+            return final_headers, url
+
+        if auth_type == "query":
+            query_param_raw = policy.get("query_param")
+            query_param = (
+                query_param_raw.strip()
+                if isinstance(query_param_raw, str) and query_param_raw.strip()
+                else "token"
+            )
+            split = urlsplit(url)
+            params = parse_qsl(split.query, keep_blank_values=True)
+            params.append((query_param, token))
+            final_url = urlunsplit(
+                (split.scheme, split.netloc, split.path, urlencode(params), split.fragment)
+            )
+            return final_headers, final_url
+
+        return final_headers, url
 
     def _ssrf_check(self, url: str) -> PolicyResult:
         parsed = urlparse(url)
