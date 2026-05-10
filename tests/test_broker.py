@@ -9,7 +9,9 @@ import pytest
 import requests
 import responses
 
+from agent.broker_client import BrokerClient
 from sandbox.broker import PolicyResult, RequestBroker
+from sandbox.host_services import HostServiceServer
 
 
 def _broker() -> RequestBroker:
@@ -23,6 +25,66 @@ def _policy() -> dict[str, object]:
         "allowed_hosts": ["api.notion.com"],
         "allowed_paths": ["/v1/*"],
         "protected_headers": ["Authorization"],
+    }
+
+
+def _broker_config() -> dict[str, object]:
+    return {
+        "broker": {
+            "public_policy": {
+                "enabled": True,
+                "allowed_methods": ["GET"],
+                "max_response_bytes": 4096,
+            }
+        },
+        "web_fetch": {"max_chars": 20000},
+        "web_search": {
+            "endpoint": "https://search.example.com/search",
+            "format": "brave",
+            "max_results": 10,
+        },
+    }
+
+
+def _credentials() -> dict[str, dict[str, object]]:
+    return {
+        "notion": {
+            "name": "notion",
+            "auth_type": "bearer",
+            "token": "notion-secret-token",
+            "allowed_hosts": ["api.notion.com"],
+            "allowed_methods": ["GET", "POST"],
+            "allowed_paths": ["/v1/*"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {"Notion-Version": "2022-06-28"},
+            "max_response_bytes": 4096,
+            "rate_limit": {"requests": 10, "per_seconds": 1},
+        },
+        "_web_search": {
+            "name": "_web_search",
+            "auth_type": "header",
+            "header_name": "X-Subscription-Token",
+            "token": "search-secret-token",
+            "allowed_hosts": ["search.example.com"],
+            "allowed_methods": ["GET"],
+            "allowed_paths": ["/*"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {},
+            "max_response_bytes": 4096,
+            "rate_limit": None,
+        },
+        "_internal": {
+            "name": "_internal",
+            "auth_type": "header",
+            "token": "hidden-token",
+            "allowed_hosts": ["internal.example.com"],
+            "allowed_methods": ["GET"],
+            "allowed_paths": ["/*"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {},
+            "max_response_bytes": 4096,
+            "rate_limit": None,
+        },
     }
 
 
@@ -408,3 +470,257 @@ def test_inject_query_appends_token_param_and_no_token_in_logs(
     assert "api_key=" in outbound_url
     assert outbound_url.startswith("https://example.com/search?")
     assert token not in caplog.text
+
+
+def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo("93.184.216.34"),
+    )
+
+
+def test_handle_unknown_action() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "nope"})
+
+    assert result == {"success": False, "error": "unknown action: nope"}
+
+
+@responses.activate
+def test_handle_http_request_named_integration_success() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.POST,
+        "https://api.notion.com/v1/pages",
+        json={"id": "abc123"},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "POST",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {"X-Trace": "1"},
+            "body": "{\"title\":\"Test\"}",
+        }
+    )
+
+    assert result["status_code"] == 200
+    assert result["truncated"] is False
+
+
+@responses.activate
+def test_handle_http_request_public_policy_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/data",
+        body="hello",
+        status=200,
+        headers={"Content-Type": "text/plain"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/data",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["status_code"] == 200
+    assert result["body"] == "hello"
+
+
+def test_handle_http_request_public_policy_disabled_denial() -> None:
+    config = _broker_config()
+    config["broker"] = {"public_policy": {"enabled": False}}
+    broker = RequestBroker(credentials=_credentials(), config=config)
+
+    result = broker.handle(
+        {"action": "http_request", "method": "GET", "url": "https://public.example.com/"}
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "public requests disabled" in str(result.get("reason", ""))
+
+
+def test_handle_http_request_path_denied_and_no_token_leak() -> None:
+    creds = _credentials()
+    creds["notion"]["allowed_paths"] = ["/v1/pages/*"]
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "POST",
+            "url": "https://api.notion.com/v1/databases",
+            "headers": {},
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    secret_tokens = {"notion-secret-token", "search-secret-token", "hidden-token"}
+    for value in result.values():
+        rendered = str(value)
+        for token in secret_tokens:
+            assert token not in rendered
+
+
+@responses.activate
+def test_handle_http_request_rate_limited_on_n_plus_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    creds = _credentials()
+    creds["notion"]["rate_limit"] = {"requests": 1, "per_seconds": 60}
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+    responses.add(
+        responses.POST,
+        "https://api.notion.com/v1/pages",
+        json={"ok": True},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    first = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "POST",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+        }
+    )
+    second = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "POST",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+        }
+    )
+
+    assert first["status_code"] == 200
+    assert second == {
+        "success": False,
+        "error": "rate_limited",
+        "reason": "rate limit exceeded for integration 'notion'",
+    }
+
+
+@responses.activate
+def test_handle_web_fetch_html_runs_trafilatura(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/page",
+        body="<html><body><article>Main text</article></body></html>",
+        status=200,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+    class _Meta:
+        title = "Sample"
+
+    monkeypatch.setattr("sandbox.broker.trafilatura.extract", lambda *args, **kwargs: "MAIN")
+    monkeypatch.setattr(
+        "sandbox.broker.trafilatura.extract_metadata",
+        lambda *args, **kwargs: _Meta(),
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/page"})
+
+    assert result["success"] is True
+    assert result["content_type"] == "text/html"
+    assert result["title"] == "Sample"
+    assert result["text"] == "MAIN"
+
+
+@responses.activate
+def test_handle_web_search_normalizes_brave() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://search.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        json={
+            "web": {
+                "results": [
+                    {"title": "A", "url": "https://a.example", "description": "Snippet A"},
+                    {"title": "B", "url": "https://b.example", "description": "Snippet B"},
+                ]
+            }
+        },
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result == {
+        "success": True,
+        "results": [
+            {"title": "A", "url": "https://a.example", "snippet": "Snippet A"},
+            {"title": "B", "url": "https://b.example", "snippet": "Snippet B"},
+        ],
+    }
+
+
+@responses.activate
+def test_handle_web_search_normalizes_searxng() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://search.example.com/search",
+        "format": "searxng",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        json={
+            "results": [
+                {"title": "X", "url": "https://x.example", "content": "Snippet X"},
+                {"title": "Y", "url": "https://y.example", "content": "Snippet Y"},
+            ]
+        },
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result == {
+        "success": True,
+        "results": [
+            {"title": "X", "url": "https://x.example", "snippet": "Snippet X"},
+            {"title": "Y", "url": "https://y.example", "snippet": "Snippet Y"},
+        ],
+    }
+
+
+def test_handle_list_integrations_via_host_service_registration() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    server = HostServiceServer()
+    server.register("broker", broker.handle)
+    client = BrokerClient(server)
+
+    result = client.call("broker", {"action": "list_integrations"})
+
+    assert result == {"success": True, "integrations": ["notion"]}

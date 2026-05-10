@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import socket
+import time
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
+import trafilatura
+
+from host_secrets import list_integration_names
 
 LOGGER = logging.getLogger(__name__)
+_DEFAULT_PUBLIC_MAX_RESPONSE_BYTES = 524288
+_DEFAULT_WEB_FETCH_MAX_CHARS = 20000
+_WEB_FETCH_BODY_MULTIPLIER = 4
 
 
 @dataclass
@@ -23,12 +31,57 @@ class PolicyResult:
     reason: str | None
 
 
+class _TokenBucket:
+    """Simple token-bucket rate limiter."""
+
+    def __init__(self, requests_count: int, per_seconds: float) -> None:
+        self._capacity = float(requests_count)
+        self._tokens = float(requests_count)
+        self._refill_rate = float(requests_count) / float(per_seconds)
+        self._last_refill = time.monotonic()
+
+    def consume(self) -> bool:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._refill_rate)
+            self._last_refill = now
+        if self._tokens < 1.0:
+            return False
+        self._tokens -= 1.0
+        return True
+
+
 class RequestBroker:
     """Host-side request broker (validation slice for C5.3)."""
 
     def __init__(self, credentials: dict[str, Any], config: dict[str, Any]) -> None:
         self._credentials = credentials
         self._config = config
+        self._rate_limiters: dict[str, _TokenBucket] = {}
+        for integration, policy in credentials.items():
+            if not isinstance(policy, dict):
+                continue
+            rate_limit = policy.get("rate_limit")
+            if not isinstance(rate_limit, dict):
+                continue
+            requests_count = _to_positive_int(rate_limit.get("requests"))
+            per_seconds = _to_positive_float(rate_limit.get("per_seconds"))
+            if requests_count is None or per_seconds is None:
+                continue
+            self._rate_limiters[integration] = _TokenBucket(requests_count, per_seconds)
+
+    def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = payload.get("action")
+        if action == "http_request":
+            return self._handle_http_request(payload)
+        if action == "web_fetch":
+            return self._handle_web_fetch(payload)
+        if action == "web_search":
+            return self._handle_web_search(payload)
+        if action == "list_integrations":
+            return self._handle_list_integrations(payload)
+        return {"success": False, "error": f"unknown action: {action}"}
 
     def _validate(
         self,
@@ -234,3 +287,334 @@ class RequestBroker:
             ipaddress.ip_network("fc00::/7"),
         )
         return any(ip_obj in net for net in reserved_ranges)
+
+    def _handle_http_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        integration = payload.get("integration")
+        method = str(payload.get("method", "GET")).upper()
+        url = str(payload.get("url", ""))
+        model_headers = _normalize_headers(payload.get("headers"))
+        body_raw = payload.get("body")
+        body = body_raw if isinstance(body_raw, str) or body_raw is None else str(body_raw)
+
+        if isinstance(integration, str) and integration:
+            policy = self._credentials.get(integration)
+            if not isinstance(policy, dict):
+                reason = f"integration '{integration}' not found in secrets.yaml"
+                return self._deny(integration, method, url, reason)
+            integration_name = integration
+            use_public_policy = False
+        else:
+            public_cfg = self._public_policy_config()
+            if not bool(public_cfg.get("enabled", True)):
+                reason = "public requests disabled; specify an integration name"
+                return self._deny("_public", method, url, reason)
+            policy = self._build_public_policy(public_cfg)
+            integration_name = "_public"
+            use_public_policy = True
+
+        policy = dict(policy)
+        policy["name"] = integration_name
+
+        validation = self._validate(policy, method, url, model_headers)
+        if not validation.allowed:
+            return self._deny(integration_name, method, url, validation.reason or "policy denied")
+
+        if not self._consume_rate_limit(integration_name):
+            return {
+                "success": False,
+                "error": "rate_limited",
+                "reason": f"rate limit exceeded for integration '{integration_name}'",
+            }
+
+        if use_public_policy:
+            ssrf = self._ssrf_check(url)
+            if not ssrf.allowed:
+                return self._deny(integration_name, method, url, ssrf.reason or "SSRF denied")
+
+        final_headers, final_url = self._inject(policy, model_headers, url)
+        max_bytes = _to_positive_int(policy.get("max_response_bytes"))
+        if max_bytes is None:
+            max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
+        return self._execute(method, final_url, final_headers, body, max_bytes)
+
+    def _handle_web_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = str(payload.get("url", ""))
+        ssrf = self._ssrf_check(url)
+        if not ssrf.allowed:
+            return self._deny("_web_fetch", "GET", url, ssrf.reason or "SSRF denied")
+
+        max_chars = self._web_fetch_max_chars()
+        execute_result = self._execute(
+            "GET",
+            url,
+            {},
+            None,
+            max_chars * _WEB_FETCH_BODY_MULTIPLIER,
+        )
+        if execute_result.get("success") is False:
+            return execute_result
+
+        headers = execute_result.get("headers")
+        content_type = _normalize_content_type(
+            str(headers.get("Content-Type", "")) if isinstance(headers, dict) else ""
+        )
+        body_text = str(execute_result.get("body", ""))
+        body_bytes = body_text.encode("utf-8", errors="replace")
+        status_code = int(execute_result.get("status_code", 0))
+
+        title: str | None = None
+        if content_type == "text/html":
+            extracted = trafilatura.extract(body_text, include_links=True, include_tables=True)
+            metadata = trafilatura.extract_metadata(body_text)
+            maybe_title_raw: Any = None
+            if metadata is not None:
+                try:
+                    maybe_title_raw = metadata.title
+                except AttributeError:
+                    maybe_title_raw = None
+            if isinstance(maybe_title_raw, str):
+                maybe_title = maybe_title_raw.strip()
+                if maybe_title:
+                    title = maybe_title
+            text = extracted if isinstance(extracted, str) and extracted.strip() else body_text
+        elif content_type in {"text/plain", "application/json", "text/xml", "application/xml"}:
+            text = body_text
+        elif content_type == "application/pdf":
+            text = (
+                f"PDF document, {len(body_bytes)} bytes. "
+                "Use the shell tool with pdftotext to extract content."
+            )
+        else:
+            display_type = content_type or "application/octet-stream"
+            text = f"Binary content ({display_type}), {len(body_bytes)} bytes. No text extracted."
+
+        truncated_text, text_truncated = _truncate_text(text, max_chars)
+        return {
+            "success": True,
+            "url": url,
+            "status_code": status_code,
+            "content_type": content_type,
+            "title": title,
+            "text": truncated_text,
+            "truncated": bool(execute_result.get("truncated", False) or text_truncated),
+        }
+
+    def _handle_web_search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        policy = self._credentials.get("_web_search")
+        endpoint = self._web_search_endpoint()
+        if not isinstance(policy, dict):
+            reason = "web_search integration not configured in secrets.yaml"
+            return self._deny("_web_search", "GET", endpoint, reason)
+
+        query = str(payload.get("query", "")).strip()
+        if not query:
+            return {"success": False, "error": "invalid_request", "reason": "query is required"}
+
+        max_results = _to_positive_int(payload.get("max_results"))
+        if max_results is None:
+            max_results = self._web_search_max_results()
+
+        search_format = self._web_search_format()
+        if search_format == "brave":
+            query_params = {"q": query}
+        else:
+            query_params = {"q": query, "format": "json"}
+        search_url = _append_query_params(endpoint, query_params)
+
+        policy = dict(policy)
+        policy["name"] = "_web_search"
+        headers, final_url = self._inject(policy, {}, search_url)
+        max_bytes = _to_positive_int(policy.get("max_response_bytes"))
+        if max_bytes is None:
+            max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
+        execute_result = self._execute("GET", final_url, headers, None, max_bytes)
+        if execute_result.get("success") is False:
+            return execute_result
+
+        body_raw = execute_result.get("body", "")
+        try:
+            payload_json = json.loads(str(body_raw))
+        except json.JSONDecodeError as exc:
+            return {"success": False, "error": "invalid_json", "detail": str(exc)}
+        if not isinstance(payload_json, dict):
+            return {"success": False, "error": "invalid_json", "detail": "expected object payload"}
+
+        if search_format == "brave":
+            results = _normalize_brave_results(payload_json, max_results)
+        else:
+            results = _normalize_searxng_results(payload_json, max_results)
+        return {"success": True, "results": results}
+
+    def _handle_list_integrations(self, payload: dict[str, Any]) -> dict[str, Any]:
+        _ = payload
+        return {"success": True, "integrations": list_integration_names(self._credentials)}
+
+    def _consume_rate_limit(self, integration: str) -> bool:
+        limiter = self._rate_limiters.get(integration)
+        if limiter is None:
+            return True
+        return limiter.consume()
+
+    def _public_policy_config(self) -> dict[str, Any]:
+        broker_section = self._config.get("broker")
+        if not isinstance(broker_section, dict):
+            return {}
+        public_policy = broker_section.get("public_policy")
+        if not isinstance(public_policy, dict):
+            return {}
+        return public_policy
+
+    def _build_public_policy(self, public_cfg: dict[str, Any]) -> dict[str, Any]:
+        allowed_methods_raw = public_cfg.get("allowed_methods", ["GET"])
+        allowed_methods = ["GET"]
+        if isinstance(allowed_methods_raw, list):
+            normalized = [
+                str(item).upper()
+                for item in allowed_methods_raw
+                if isinstance(item, str) and item.strip()
+            ]
+            if normalized:
+                allowed_methods = normalized
+        max_response_bytes = _to_positive_int(public_cfg.get("max_response_bytes"))
+        if max_response_bytes is None:
+            max_response_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
+        return {
+            "name": "_public",
+            "auth_type": "none",
+            "token": "",
+            "allowed_hosts": ["*"],
+            "allowed_methods": allowed_methods,
+            "allowed_paths": ["/*"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {},
+            "max_response_bytes": max_response_bytes,
+        }
+
+    def _web_fetch_max_chars(self) -> int:
+        section = self._config.get("web_fetch")
+        if not isinstance(section, dict):
+            return _DEFAULT_WEB_FETCH_MAX_CHARS
+        value = _to_positive_int(section.get("max_chars"))
+        if value is None:
+            return _DEFAULT_WEB_FETCH_MAX_CHARS
+        return value
+
+    def _web_search_endpoint(self) -> str:
+        section = self._config.get("web_search")
+        if not isinstance(section, dict):
+            return ""
+        endpoint = section.get("endpoint")
+        return endpoint.strip() if isinstance(endpoint, str) else ""
+
+    def _web_search_format(self) -> str:
+        section = self._config.get("web_search")
+        if not isinstance(section, dict):
+            return "brave"
+        raw = section.get("format", "brave")
+        fmt = str(raw).strip().lower()
+        return "brave" if fmt != "searxng" else "searxng"
+
+    def _web_search_max_results(self) -> int:
+        section = self._config.get("web_search")
+        if not isinstance(section, dict):
+            return 10
+        value = _to_positive_int(section.get("max_results"))
+        return value if value is not None else 10
+
+
+def _to_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _to_positive_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0.0:
+        return None
+    return parsed
+
+
+def _normalize_headers(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, item in value.items():
+        if isinstance(key, str) and isinstance(item, str):
+            normalized[key] = item
+    return normalized
+
+
+def _normalize_content_type(raw: str) -> str:
+    lowered = raw.lower().strip()
+    if ";" in lowered:
+        lowered = lowered.split(";", 1)[0].strip()
+    return lowered
+
+
+def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    notice = f"\n\n[... truncated, original {len(text)} chars ...]"
+    return text[:limit] + notice, True
+
+
+def _normalize_brave_results(payload: dict[str, Any], max_results: int) -> list[dict[str, str]]:
+    web_obj = payload.get("web")
+    if not isinstance(web_obj, dict):
+        return []
+    raw_results = web_obj.get("results")
+    if not isinstance(raw_results, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        url = item.get("url")
+        snippet = item.get("description", "")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        normalized.append({"title": title, "url": url, "snippet": str(snippet)})
+        if len(normalized) >= max_results:
+            break
+    return normalized
+
+
+def _normalize_searxng_results(payload: dict[str, Any], max_results: int) -> list[dict[str, str]]:
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        url = item.get("url")
+        snippet = item.get("content", "")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        normalized.append({"title": title, "url": url, "snippet": str(snippet)})
+        if len(normalized) >= max_results:
+            break
+    return normalized
+
+
+def _append_query_params(url: str, params: dict[str, str]) -> str:
+    split = urlsplit(url)
+    existing = parse_qsl(split.query, keep_blank_values=True)
+    for key, value in params.items():
+        existing.append((key, value))
+    query = urlencode(existing)
+    return urlunsplit((split.scheme, split.netloc, split.path, query, split.fragment))
