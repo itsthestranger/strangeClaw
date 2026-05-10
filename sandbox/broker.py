@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any
 from urllib.parse import urlparse
+
+import requests
 
 
 @dataclass
@@ -85,3 +89,94 @@ class RequestBroker:
             "requested_method": method.upper(),
             "requested_url": url,
         }
+
+    def _ssrf_check(self, url: str) -> PolicyResult:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return PolicyResult(allowed=False, reason="DNS resolution failed for <unknown>")
+
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            return PolicyResult(allowed=False, reason=f"DNS resolution failed for {hostname}")
+
+        for info in infos:
+            sockaddr = info[4]
+            if not isinstance(sockaddr, tuple) or not sockaddr:
+                continue
+            ip_text = str(sockaddr[0])
+            try:
+                ip_obj = ipaddress.ip_address(ip_text)
+            except ValueError:
+                continue
+            if self._is_reserved_ip(ip_obj):
+                return PolicyResult(
+                    allowed=False,
+                    reason=f"SSRF: {hostname} resolves to reserved address {ip_text}",
+                )
+
+        return PolicyResult(allowed=True, reason=None)
+
+    def _execute(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: str | None,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        session = requests.Session()
+        session.max_redirects = 5
+        try:
+            response = session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                data=body,
+                timeout=(10, 30),
+                allow_redirects=True,
+                stream=True,
+            )
+
+            chunks: list[bytes] = []
+            total = 0
+            truncated = False
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                if total + len(chunk) > max_bytes:
+                    keep = max_bytes - total
+                    if keep > 0:
+                        chunks.append(chunk[:keep])
+                        total += keep
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+
+            raw = b"".join(chunks)
+            body_text = raw.decode(response.encoding or "utf-8", errors="replace")
+            return {
+                "status_code": response.status_code,
+                "headers": dict(response.headers),
+                "body": body_text,
+                "truncated": truncated,
+            }
+        except requests.RequestException as exc:
+            return {"success": False, "error": exc.__class__.__name__, "detail": str(exc)}
+        finally:
+            session.close()
+
+    @staticmethod
+    def _is_reserved_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        reserved_ranges = (
+            ipaddress.ip_network("10.0.0.0/8"),
+            ipaddress.ip_network("172.16.0.0/12"),
+            ipaddress.ip_network("192.168.0.0/16"),
+            ipaddress.ip_network("127.0.0.0/8"),
+            ipaddress.ip_network("169.254.0.0/16"),
+            ipaddress.ip_network("::1/128"),
+            ipaddress.ip_network("fc00::/7"),
+        )
+        return any(ip_obj in net for net in reserved_ranges)
