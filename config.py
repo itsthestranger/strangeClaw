@@ -214,14 +214,15 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         raise ConfigError("Config field web_search.format must be either 'brave' or 'searxng'.")
     web_search["format"] = normalized_format
 
+    api_key_present = "api_key" in web_search
     api_key = web_search.get("api_key", "")
     if not isinstance(api_key, str):
         raise ConfigError("Config field web_search.api_key must be a string.")
     web_search["api_key"] = api_key
-    if normalized_format == "brave" and not api_key.strip():
+    if api_key_present:
         LOGGER.warning(
-            "web_search.format is brave but web_search.api_key is empty. "
-            "This field is deprecated; configure credentials._web_search.token in "
+            "web_search.api_key in config.yaml is deprecated and ignored. "
+            "Configure credentials._web_search.token in "
             "~/.strangeclaw/secrets.yaml for brokered search."
         )
 

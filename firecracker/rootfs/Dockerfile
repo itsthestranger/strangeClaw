@@ -38,6 +38,7 @@ COPY firecracker/rootfs/entrypoint.sh /tmp/entrypoint.sh
 RUN python3.11 -m venv /opt/strangeclaw/.venv \
     && /opt/strangeclaw/.venv/bin/pip install --upgrade pip \
     && /opt/strangeclaw/.venv/bin/pip install --no-cache-dir . \
+    && /opt/strangeclaw/.venv/bin/pip uninstall -y trafilatura \
     && install -m 0755 /tmp/entrypoint.sh /sbin/entrypoint.sh \
     && ln -sf /usr/bin/tini /sbin/tini \
     && rm -f /sbin/init \

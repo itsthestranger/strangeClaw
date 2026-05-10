@@ -3,81 +3,34 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
-import requests
-
+from agent.broker_client import HostServiceError
 from agent.llm import ToolCall
 from agent.tools import Tools
 
 
-class _FakeResponse:
-    def __init__(self, payload: Any, status_code: int = 200) -> None:
-        self._payload = payload
-        self.status_code = status_code
+class _FakeBroker:
+    def __init__(self, response: dict[str, Any] | None = None) -> None:
+        self.response = response or {"success": True}
+        self.calls: list[dict[str, Any]] = []
+        self.error: HostServiceError | None = None
 
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise RuntimeError(f"http {self.status_code}")
-
-    def json(self) -> Any:
-        return self._payload
-
-
-class _FakeStreamingResponse:
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-        body: bytes = b"",
-    ) -> None:
-        self.status_code = status_code
-        self.headers = headers or {}
-        self._body = body
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"http {self.status_code}")
-
-    def iter_content(self, chunk_size: int = 8192) -> Any:
-        del chunk_size
-        yield self._body
-
-    def close(self) -> None:
-        return
+    def call(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(payload)
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
-class _FakeHTTPResponse:
-    def __init__(
-        self,
-        *,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-        text: str = "",
-    ) -> None:
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-
-
-class _FakeMetadata:
-    def __init__(self, title: str | None) -> None:
-        self.title = title
-
-
-class _FakeTrafilatura:
-    @staticmethod
-    def extract(html: str, include_links: bool, include_tables: bool) -> str:
-        assert include_links is True
-        assert include_tables is True
-        assert "<html>" in html
-        return "main extracted text"
-
-    @staticmethod
-    def extract_metadata(html: str) -> _FakeMetadata:
-        assert "<title>Example</title>" in html
-        return _FakeMetadata("Example")
+def _tools_with_broker(
+    *,
+    config: dict[str, Any] | None = None,
+    broker_response: dict[str, Any] | None = None,
+) -> tuple[Tools, _FakeBroker]:
+    broker = _FakeBroker(response=broker_response)
+    tools = Tools(config=config or {}, broker=cast(Any, broker))
+    return tools, broker
 
 
 def test_tools_shell_execute_success() -> None:
@@ -120,256 +73,85 @@ def test_tools_shell_output_truncates_long_text() -> None:
     assert len(result.stdout) < 9005
 
 
-def test_tools_web_search_normalizes_brave(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        captured["url"] = url
-        captured["kwargs"] = kwargs
-        return _FakeResponse(
-            {
-                "web": {
-                    "results": [
-                        {
-                            "title": "Result One",
-                            "url": "https://example.com/1",
-                            "description": "Snippet 1",
-                        },
-                        {
-                            "title": "Result Two",
-                            "url": "https://example.com/2",
-                            "description": "Snippet 2",
-                        },
-                    ]
-                }
-            }
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(
-        config={
-            "web_search": {
-                "endpoint": "https://api.search.brave.com/res/v1/web/search",
-                "format": "brave",
-                "api_key": "test-token",
-                "max_results": 1,
-            }
-        }
+def test_tools_web_search_calls_broker_with_config_default_max_results() -> None:
+    tools, broker = _tools_with_broker(
+        config={"web_search": {"max_results": 7}},
+        broker_response={
+            "success": True,
+            "query": "llm",
+            "results": [{"title": "T1", "url": "https://example.com/1", "snippet": "S1"}],
+        },
     )
 
     result = tools.execute(ToolCall(tool="web_search", args={"query": "llm"}))
 
     assert result.exit_code == 0
-    assert result.stderr == ""
-    assert captured["url"] == "https://api.search.brave.com/res/v1/web/search"
-    assert captured["kwargs"]["headers"] == {
-        "User-Agent": "strangeclaw/0.1 (+local)",
-        "X-Subscription-Token": "test-token",
-    }
-    assert captured["kwargs"]["params"] == {"q": "llm"}
-
-    body = _unwrap_data(result.stdout)
-    assert body["query"] == "llm"
-    assert body["results"] == [
-        {"title": "Result One", "url": "https://example.com/1", "snippet": "Snippet 1"}
-    ]
-
-
-def test_tools_web_search_normalizes_searxng(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        assert url == "http://localhost:8080/search"
-        assert kwargs["headers"] == {
-            "User-Agent": "strangeclaw/0.1 (+local)",
-            "Accept": "application/json",
-        }
-        assert kwargs["params"] == {"q": "solid state batteries", "format": "json"}
-        return _FakeResponse(
-            {
-                "results": [
-                    {"title": "S1", "url": "https://s1", "content": "C1"},
-                    {"title": "S2", "url": "https://s2", "content": "C2"},
-                ]
-            }
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(
-        config={
-            "web_search": {
-                "endpoint": "http://localhost:8080/search",
-                "format": "searxng",
-                "max_results": 10,
-            }
-        }
-    )
-
-    result = tools.execute(ToolCall(tool="web_search", args={"query": "solid state batteries"}))
-
-    assert result.exit_code == 0
+    assert broker.calls == [{"action": "web_search", "query": "llm", "max_results": 7}]
     assert _unwrap_data(result.stdout)["results"] == [
-        {"title": "S1", "url": "https://s1", "snippet": "C1"},
-        {"title": "S2", "url": "https://s2", "snippet": "C2"},
+        {"title": "T1", "url": "https://example.com/1", "snippet": "S1"}
     ]
 
 
-def test_tools_web_search_brave_requires_api_key() -> None:
-    tools = Tools(
-        config={
-            "web_search": {
-                "endpoint": "https://api.search.brave.com/res/v1/web/search",
-                "format": "brave",
-                "api_key": "",
-            }
+def test_tools_web_search_args_override_max_results() -> None:
+    tools, broker = _tools_with_broker(config={"web_search": {"max_results": 7}})
+
+    result = tools.execute(
+        ToolCall(tool="web_search", args={"query": "llm", "max_results": 2})
+    )
+
+    assert result.exit_code == 0
+    assert broker.calls == [{"action": "web_search", "query": "llm", "max_results": 2}]
+
+
+def test_tools_web_search_requires_broker() -> None:
+    tools = Tools(config={})
+
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "llm"}))
+
+    assert result.exit_code == 1
+    assert result.stderr == "web_search requires a host broker connection."
+
+
+def test_tools_web_search_rejects_invalid_max_results() -> None:
+    tools, _ = _tools_with_broker()
+
+    result = tools.execute(
+        ToolCall(tool="web_search", args={"query": "llm", "max_results": 0})
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == "web_search.max_results must be a positive integer."
+
+
+def test_tools_web_fetch_calls_broker() -> None:
+    tools, broker = _tools_with_broker(
+        broker_response={
+            "success": True,
+            "url": "https://example.com",
+            "text": "Hello",
         }
     )
 
-    result = tools.execute(ToolCall(tool="web_search", args={"query": "test"}))
-
-    assert result.exit_code == 1
-    assert result.stderr == "web_search.api_key is required when web_search.format is brave."
-
-
-def test_tools_web_fetch_html_uses_trafilatura(monkeypatch: Any) -> None:
-    html = b"<html><head><title>Example</title></head><body><p>Hello</p></body></html>"
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        assert url == "https://example.com"
-        assert kwargs["stream"] is True
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/html; charset=utf-8"},
-            body=html,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    monkeypatch.setattr("agent.tools.trafilatura", _FakeTrafilatura())
-    tools = Tools(config={"web_fetch": {"max_chars": 20000}})
-
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 0
-    payload = _unwrap_data(result.stdout)
-    assert payload["success"] is True
-    assert payload["content_type"] == "text/html"
-    assert payload["title"] == "Example"
-    assert payload["text"] == "main extracted text"
-    assert payload["truncated"] is False
+    assert broker.calls == [{"action": "web_fetch", "url": "https://example.com"}]
+    assert _unwrap_data(result.stdout)["success"] is True
 
 
-def test_tools_web_fetch_json_returns_body(monkeypatch: Any) -> None:
-    body = b'{"ok":true}'
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://api.example.com/data"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "application/json"},
-            body=body,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={})
-
-    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://api.example.com/data"}))
-
-    assert result.exit_code == 0
-    payload = _unwrap_data(result.stdout)
-    assert payload["content_type"] == "application/json"
-    assert payload["text"] == '{"ok":true}'
-
-
-def test_tools_web_fetch_pdf_returns_metadata_hint(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/doc.pdf"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "application/pdf"},
-            body=b"%PDF-1.4",
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={})
-
-    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/doc.pdf"}))
-
-    assert result.exit_code == 0
-    payload = _unwrap_data(result.stdout)
-    assert payload["content_type"] == "application/pdf"
-    assert "Use shell tool with pdftotext" in str(payload["text"])
-
-
-def test_tools_web_fetch_truncates_at_max_chars(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/text"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/plain"},
-            body=b"abcdefghijklmnopqrstuvwxyz",
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={"web_fetch": {"max_chars": 10}})
-
-    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/text"}))
-
-    assert result.exit_code == 0
-    payload = _unwrap_data(result.stdout)
-    assert payload["truncated"] is True
-    assert str(payload["text"]).startswith("abcdefghij")
-    assert "truncated, original" in str(payload["text"])
-
-
-def test_tools_web_fetch_handles_request_error(monkeypatch: Any) -> None:
-    def fake_get(url: str, **kwargs: Any) -> Any:
-        del url
-        del kwargs
-        raise requests.Timeout("boom")
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
+def test_tools_web_fetch_requires_broker() -> None:
     tools = Tools(config={})
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
 
     assert result.exit_code == 1
-    payload = _unwrap_data(result.stdout)
-    assert payload["success"] is False
-    assert "web_fetch request failed" in str(payload["error"])
+    assert result.stderr == "web_fetch requires a host broker connection."
 
 
-def test_tools_web_fetch_applies_5mb_cap(monkeypatch: Any) -> None:
-    body = b"a" * (6 * 1024 * 1024)
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeStreamingResponse:
-        del kwargs
-        assert url == "https://example.com/huge"
-        return _FakeStreamingResponse(
-            headers={"Content-Type": "text/plain"},
-            body=body,
-        )
-
-    monkeypatch.setattr("agent.tools.requests.get", fake_get)
-    tools = Tools(config={"web_fetch": {"max_chars": 6000000}})
-
-    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com/huge"}))
-
-    assert result.exit_code == 0
-    payload = _unwrap_data(result.stdout)
-    assert payload["truncated"] is True
-    assert "response body capped at 5242880 bytes" in str(payload["text"])
-
-
-def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(
-            status_code=201,
-            headers={"Content-Type": "application/json"},
-            text='{"ok":true}',
-        )
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(config={})
+def test_tools_http_request_calls_broker_with_payload() -> None:
+    tools, broker = _tools_with_broker(
+        broker_response={"success": True, "status_code": 201, "body": '{"ok":true}'}
+    )
 
     result = tools.execute(
         ToolCall(
@@ -377,164 +159,40 @@ def test_tools_http_request_captures_response(monkeypatch: Any) -> None:
             args={
                 "method": "post",
                 "url": "https://api.example.com/items",
-                "headers": {"Authorization": "Bearer token"},
+                "integration": "notion",
+                "headers": {"Accept": "application/json"},
                 "body": '{"name":"x"}',
             },
         )
     )
 
     assert result.exit_code == 0
-    assert captured["method"] == "POST"
-    assert captured["url"] == "https://api.example.com/items"
-    assert captured["data"] == '{"name":"x"}'
-    assert captured["headers"]["Authorization"] == "Bearer token"
-    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
-    payload = _unwrap_data(result.stdout)
-    assert payload["success"] is True
-    assert payload["status_code"] == 201
-    assert payload["body"] == '{"ok":true}'
-    assert payload["truncated"] is False
-
-
-def test_tools_http_request_applies_generic_bearer_integration(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(
-        config={
-            "integrations": {
-                "notion": {
-                    "token": "notion-secret",
-                    "auth": {"type": "bearer"},
-                    "default_headers": {"Notion-Version": "2026-03-11"},
-                }
-            }
+    assert broker.calls == [
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "POST",
+            "url": "https://api.example.com/items",
+            "headers": {"Accept": "application/json"},
+            "body": '{"name":"x"}',
         }
-    )
+    ]
+    assert _unwrap_data(result.stdout)["status_code"] == 201
 
-    schema = next(item for item in tools.schema() if item["name"] == "http_request")
-    assert schema["parameters"]["properties"]["integration"]["enum"] == ["notion", None]
+
+def test_tools_http_request_requires_broker() -> None:
+    tools = Tools(config={})
 
     result = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.notion.com/v1/data_sources/source-id",
-                "integration": "notion",
-                "headers": {},
-            },
-        )
-    )
-
-    assert result.exit_code == 0
-    assert captured["headers"]["Authorization"] == "Bearer notion-secret"
-    assert captured["headers"]["Notion-Version"] == "2026-03-11"
-    assert captured["headers"]["User-Agent"] == "strangeclaw/0.1 (+http)"
-
-
-def test_tools_http_request_applies_generic_header_integration(monkeypatch: Any) -> None:
-    captured: dict[str, Any] = {}
-
-    def fake_request(**kwargs: Any) -> _FakeHTTPResponse:
-        captured.update(kwargs)
-        return _FakeHTTPResponse(status_code=200, text='{"ok":true}')
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(
-        config={
-            "integrations": {
-                "jira": {
-                    "token": "jira-secret",
-                    "auth": {"type": "header", "header": "X-API-Key", "prefix": "Token "},
-                    "default_headers": {"Accept": "application/json"},
-                }
-            }
-        }
-    )
-
-    result = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://jira.example.com/rest/api/3/issue/ABC-1",
-                "integration": "jira",
-                "headers": {},
-            },
-        )
-    )
-
-    assert result.exit_code == 0
-    assert captured["headers"]["X-API-Key"] == "Token jira-secret"
-    assert captured["headers"]["Accept"] == "application/json"
-
-
-def test_tools_http_request_rejects_integration_header_override() -> None:
-    tools = Tools(
-        config={
-            "integrations": {
-                "github": {
-                    "token": "github-secret",
-                    "auth": {"type": "bearer"},
-                    "default_headers": {"Accept": "application/vnd.github+json"},
-                }
-            }
-        }
-    )
-
-    result = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.github.com/repos/o/r",
-                "integration": "github",
-                "headers": {"Authorization": "Bearer attacker"},
-            },
-        )
+        ToolCall(tool="http_request", args={"method": "GET", "url": "https://api.example.com"})
     )
 
     assert result.exit_code == 1
-    assert "must not include 'Authorization'" in result.stderr
-
-
-def test_tools_http_request_rejects_unknown_or_unconfigured_integration() -> None:
-    tools = Tools(config={"integrations": {"github": {"token": "", "auth": {"type": "bearer"}}}})
-
-    unknown = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.github.com/repos/o/r",
-                "integration": "jira",
-            },
-        )
-    )
-    assert unknown.exit_code == 1
-    assert "integration 'jira' is not configured" in unknown.stderr
-
-    missing_token = tools.execute(
-        ToolCall(
-            tool="http_request",
-            args={
-                "method": "GET",
-                "url": "https://api.github.com/repos/o/r",
-                "integration": "github",
-            },
-        )
-    )
-    assert missing_token.exit_code == 1
-    assert "has no token configured" in missing_token.stderr
+    assert result.stderr == "http_request requires a host broker connection."
 
 
 def test_tools_http_request_invalid_method_rejected() -> None:
-    tools = Tools(config={})
+    tools, _ = _tools_with_broker()
 
     result = tools.execute(
         ToolCall(
@@ -547,25 +205,62 @@ def test_tools_http_request_invalid_method_rejected() -> None:
     assert "http_request.method must be one of" in result.stderr
 
 
-def test_tools_http_request_request_error(monkeypatch: Any) -> None:
-    def fake_request(**kwargs: Any) -> Any:
-        del kwargs
-        raise requests.ConnectionError("offline")
-
-    monkeypatch.setattr("agent.tools.requests.request", fake_request)
-    tools = Tools(config={})
+def test_tools_http_request_invalid_headers_rejected() -> None:
+    tools, _ = _tools_with_broker()
 
     result = tools.execute(
         ToolCall(
             tool="http_request",
-            args={"method": "GET", "url": "https://api.example.com"},
+            args={
+                "method": "GET",
+                "url": "https://api.example.com",
+                "headers": {"X-Test": 1},
+            },
         )
+    )
+
+    assert result.exit_code == 1
+    assert result.stderr == "http_request.headers must contain only string keys and values."
+
+
+def test_tools_http_request_schema_integration_description_mentions_secrets_yaml() -> None:
+    tools, _ = _tools_with_broker()
+
+    schema = next(item for item in tools.schema() if item["name"] == "http_request")
+    integration = schema["parameters"]["properties"]["integration"]
+    assert "secrets.yaml" in integration["description"]
+
+
+def test_tools_broker_denial_returns_structured_payload() -> None:
+    tools, _ = _tools_with_broker(
+        broker_response={
+            "success": False,
+            "error": "policy_denied",
+            "reason": "method POST is not allowed",
+        }
+    )
+
+    result = tools.execute(
+        ToolCall(tool="http_request", args={"method": "POST", "url": "https://api.example.com"})
     )
 
     assert result.exit_code == 1
     payload = _unwrap_data(result.stdout)
     assert payload["success"] is False
-    assert "http_request failed" in str(payload["error"])
+    assert payload["error"] == "policy_denied"
+    assert payload["reason"] == "method POST is not allowed"
+    assert result.stderr == ""
+
+
+def test_tools_broker_transport_error_is_stderr() -> None:
+    tools, broker = _tools_with_broker()
+    broker.error = HostServiceError("transport down")
+
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "transport down"
 
 
 def _unwrap_data(text: str) -> dict[str, Any]:

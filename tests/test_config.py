@@ -256,7 +256,7 @@ def test_load_config_rejects_invalid_web_search_format(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_load_config_warns_when_brave_without_api_key(
+def test_load_config_warns_when_web_search_api_key_present(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -273,7 +273,7 @@ def test_load_config_warns_when_brave_without_api_key(
         loaded = load_config(config_path)
 
     assert loaded["web_search"]["format"] == "brave"
-    assert "web_search.api_key is empty" in caplog.text
+    assert "web_search.api_key in config.yaml is deprecated and ignored" in caplog.text
 
 
 def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None:
