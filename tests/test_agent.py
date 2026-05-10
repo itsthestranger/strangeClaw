@@ -15,8 +15,10 @@ import pytest
 
 import agent.agent as agent_module
 from agent.agent import Agent
+from agent.broker_client import BrokerClient
 from agent.llm import LLMClient, LLMResponse, ToolCall
 from agent.transport import InProcessTransport
+from sandbox.host_services import HostServiceServer
 
 
 class ScriptedLLM:
@@ -301,6 +303,7 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
         history=history,
         activated_skills={},
     )
+    assert "Configured integrations: none" in messages[0]["content"]
     payload = json.loads(messages[1]["content"])
     assert payload["recent_history"] == [{"type": "action", "idx": 3}]
     assert payload["enabled_tools"] == ["http_request", "shell", "web_fetch", "web_search"]
@@ -316,6 +319,55 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     )
     assert payload["activated_skills"] == {}
     assert payload["output_instruction"] == "Place any files for the user in /output/."
+
+
+def test_agent_loads_integrations_via_broker_at_startup() -> None:
+    scripted_llm = ScriptedLLM(responses=[])
+    calls: list[dict[str, Any]] = []
+
+    def _broker_handler(payload: dict[str, Any]) -> dict[str, Any]:
+        calls.append(dict(payload))
+        return {"integrations": ["github", "notion"]}
+
+    server = HostServiceServer()
+    server.register("broker", _broker_handler)
+    broker = BrokerClient(server)
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        broker=broker,
+    )
+
+    assert calls == [{"action": "list_integrations"}]
+    assert agent._integrations == ["github", "notion"]
+
+
+def test_execution_prompt_includes_configured_integrations() -> None:
+    scripted_llm = ScriptedLLM(responses=[])
+    server = HostServiceServer()
+    server.register("broker", lambda payload: {"integrations": ["notion"]})
+    broker = BrokerClient(server)
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        broker=broker,
+    )
+    agent._llm = scripted_llm
+
+    messages = agent.build_execution_prompt(
+        goal="g",
+        plan={"steps": []},
+        history=[],
+        activated_skills={},
+    )
+
+    assert "Configured integrations: notion" in messages[0]["content"]
 
 
 def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> None:

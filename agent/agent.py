@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent.broker_client import BrokerClient, HostServiceError
 from agent.llm import LLMClient, LLMResponse, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools
@@ -153,6 +154,7 @@ class Agent:
         max_output_total_bytes: int = 10 * 1024 * 1024,
         allow_task_llm: bool = True,
         llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
+        broker: BrokerClient | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise AgentError("max_iterations must be greater than zero.")
@@ -188,7 +190,9 @@ class Agent:
 
         skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
-        self._tools = Tools(self._agent_config or {})
+        self._broker = broker
+        self._tools = Tools(self._agent_config or {}, broker=broker)
+        self._integrations = self._load_integrations()
         self._execution_action_surface = _build_execution_action_surface(
             self._tools.schema()
         )
@@ -201,6 +205,18 @@ class Agent:
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
         self._history_summarized_count = 0
+
+    def _load_integrations(self) -> list[str]:
+        if self._broker is None:
+            return []
+        try:
+            response = self._broker.call("broker", {"action": "list_integrations"})
+        except HostServiceError:
+            return []
+        names = response.get("integrations")
+        if not isinstance(names, list):
+            return []
+        return sorted(name for name in names if isinstance(name, str) and name.strip())
 
     def run(self) -> None:
         """Run one task from transport input."""
@@ -808,7 +824,13 @@ class Agent:
                 "output_instruction": "Place any files for the user in /output/.",
             }
             messages = [
-                {"role": "system", "content": EXECUTION_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{EXECUTION_SYSTEM_PROMPT}\nConfigured integrations: "
+                        f"{', '.join(self._integrations) if self._integrations else 'none'}"
+                    ),
+                },
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
             ]
             token_count = self._require_llm().count_tokens(messages)
