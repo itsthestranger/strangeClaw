@@ -46,44 +46,27 @@ tools:
   http_request: true            # Medium risk: arbitrary HTTP API calls
 
 web_search:
-  # Quick-start: Brave API endpoint (requires api_key).
+  # Quick-start: Brave API endpoint.
   # Self-hosted recommendation: set endpoint to SearXNG and format to "searxng".
   endpoint: "https://api.search.brave.com/res/v1/web/search"
   format: "brave"               # brave | searxng
-  api_key: ""                   # required for brave; not needed for searxng
+  # API key moved to secrets.yaml under credentials._web_search.token.
   max_results: 10
 
 web_fetch:
   max_chars: 20000              # truncate extracted text (~5k tokens)
 
-integrations:
-  # Convenience credential storage for API skills.
-  # Tokens are resolved from environment variables by config loading.
-  # Current limitation: in Fire mode these tokens are delivered to the VM as
-  # part of agent config. The planned host-side request broker will keep them
-  # host-only later. Add a new API by adding another integration name and a
-  # matching skill that calls http_request with integration: "<name>".
-  notion:
-    token: ""                   # e.g. ${NOTION_API_TOKEN}
-    auth:
-      type: bearer              # bearer | header | basic | none
-    default_headers:
-      Notion-Version: "2026-03-11"
-  github:
-    token: ""                   # e.g. ${GITHUB_TOKEN}
-    auth:
-      type: bearer
-    default_headers:
-      Accept: "application/vnd.github+json"
-      X-GitHub-Api-Version: "2022-11-28"
-  # Example custom API key header integration:
-  # jira:
-  #   token: ${JIRA_API_TOKEN}
-  #   auth:
-  #     type: header
-  #     header: X-API-Key
-  #   default_headers:
-  #     Accept: "application/json"
+broker:
+  public_policy:
+    # When true, unauthenticated public GET requests are allowed for
+    # http_request calls without an integration name.
+    enabled: true
+    # Restrict methods allowed when integration is omitted.
+    allowed_methods: [GET]
+    # Response size cap (bytes) for the public policy path.
+    max_response_bytes: 524288
+    # Set enabled: false to require integration: "<name>" for every
+    # http_request call.
 
 context:
   token_budget: 4000

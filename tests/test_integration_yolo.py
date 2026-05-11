@@ -93,6 +93,17 @@ def _collect_until_done(
             return events
 
 
+def _unwrap_data(text: str) -> dict[str, Any]:
+    prefix = "--- BEGIN DATA ---\n"
+    suffix = "\n--- END DATA ---"
+    assert text.startswith(prefix)
+    assert text.endswith(suffix)
+    payload = text[len(prefix) : -len(suffix)]
+    loaded = json.loads(payload)
+    assert isinstance(loaded, dict)
+    return loaded
+
+
 def test_yolo_integration_success_path() -> None:
     llm = ScriptedLLM(
         responses=[
@@ -393,3 +404,63 @@ def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> Non
     assert done_event["type"] == "done"
     assert done_event["success"] is True
     assert done_event["reply"] == "autonomous done"
+
+
+def test_yolo_integration_missing_notion_credentials_denial_no_retry(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr("sandbox.yolo.load_secrets", lambda: {})
+    llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["create notion page"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="http_request",
+                    args={
+                        "integration": "notion",
+                        "method": "POST",
+                        "url": "https://api.notion.com/v1/pages",
+                        "headers": {},
+                        "body": "{\"parent\":{\"data_source_id\":\"abc\"}}",
+                    },
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="agent_done",
+                    args={"reply": "Notion integration is not configured; cannot continue."},
+                ),
+                usage=None,
+            ),
+        ]
+    )
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
+    sandbox.run(_task())
+    try:
+        events = _collect_until_done(sandbox)
+    finally:
+        sandbox.stop()
+
+    http_actions = [
+        event
+        for event in events
+        if event["type"] == "action" and event["tool"] == "http_request"
+    ]
+    assert len(http_actions) == 1
+    denial_payload = _unwrap_data(http_actions[0]["result"]["stdout"])
+    assert denial_payload["error"] == "policy_denied"
+    assert denial_payload["integration"] == "notion"
+    assert denial_payload["requested_method"] == "POST"
+    assert denial_payload["requested_url"] == "https://api.notion.com/v1/pages"
+    assert "not found in secrets.yaml" in denial_payload["reason"]
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    assert "not configured" in done_event["reply"].lower()
