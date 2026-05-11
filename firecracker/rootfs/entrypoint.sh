@@ -132,6 +132,7 @@ except Exception:
 
 os.makedirs(os.path.dirname(config_path), mode=0o700, exist_ok=True)
 
+# No credential values are written here. All secrets are held by the host broker.
 fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
     json.dump(agent_config, handle, ensure_ascii=True, separators=(",", ":"))

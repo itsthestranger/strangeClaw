@@ -23,6 +23,7 @@ from sandbox.fire import (
     TapDeviceManager,
     TapNetworkAllocation,
     VMBootError,
+    _assert_no_secrets,
     _default_popen_factory,
     configure_microvm_preboot,
     load_firecracker_config,
@@ -226,8 +227,6 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
-                "max_results": 10,
             },
             "web_fetch": {"max_chars": 20000},
             "skills": {"directory": "./skills", "max_file_chars": 20000},
@@ -305,6 +304,46 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
             api_client=_NoopClient(),
             config=config,
             preboot=preboot,
+        )
+
+
+def test_assert_no_secrets_raises_on_token_leak() -> None:
+    with pytest.raises(ValueError, match=r"credential leaked into MMDS: notion"):
+        _assert_no_secrets(
+            mmds_json='{"config":{"llm":{"api_key":"safe"},"web_search":{"endpoint":"x"}},"token":"notion-secret"}',
+            credentials={
+                "notion": {"token": "notion-secret"},
+                "_web_search": {"token": "search-secret"},
+            },
+        )
+
+
+def test_configure_microvm_preboot_rejects_credentials_in_mmds_payload(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    preboot = _build_preboot_config(
+        tmp_path,
+        agent_config={
+            "llm": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "sk-host",
+                "max_tokens": 1024,
+                "temperature": 0.2,
+            },
+            "web_search": {
+                "endpoint": "https://api.search.brave.com/res/v1/web/search",
+                "format": "brave",
+            },
+            "skills": {"directory": "./skills", "max_file_chars": 20000},
+            "leak": "ghp-secret-leak",
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"credential leaked into MMDS: github"):
+        configure_microvm_preboot(
+            api_client=_NoopClient(),
+            config=config,
+            preboot=preboot,
+            credentials={"github": {"token": "ghp-secret-leak"}},
         )
 
 
@@ -793,6 +832,11 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
         "/mmds",
         "/actions",
     ]
+    mmds_payload = api_factory.payload_for("/mmds")
+    assert mmds_payload["config"]["web_search"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+    }
 
     sandbox.stop()
     assert iptables_manager.cleaned is True
@@ -1448,8 +1492,6 @@ def _agent_config(
         "web_search": {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
-            "max_results": 10,
         },
         "web_fetch": {"max_chars": 20000},
         "skills": {"directory": "./skills", "max_file_chars": 20000},

@@ -856,6 +856,7 @@ def configure_microvm_preboot(
     api_client: FirecrackerRequestClient,
     config: FirecrackerConfig,
     preboot: FirePrebootConfig,
+    credentials: Mapping[str, Any] | None = None,
 ) -> None:
     """Configure and start the microVM via sequential pre-boot API PUT calls."""
     _validate_preboot_config(preboot)
@@ -930,6 +931,9 @@ def configure_microvm_preboot(
         ),
     ]
     for path, payload in requests:
+        if path == "/mmds":
+            mmds_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+            _assert_no_secrets(mmds_json, credentials or {})
         api_client.put(path, payload)
 
 
@@ -998,6 +1002,7 @@ class FireSandbox:
         self._install_exit_handlers = install_exit_handlers
         self._atexit_registered = False
         self._previous_signal_handlers: dict[int, Any] = {}
+        self._credentials: dict[str, Any] = {}
         if self._install_exit_handlers:
             self._register_exit_handlers()
 
@@ -1025,6 +1030,7 @@ class FireSandbox:
 
         try:
             credentials = load_secrets()
+            self._credentials = credentials
             request_broker = RequestBroker(
                 credentials=credentials,
                 config=self._agent_config_template,
@@ -1147,6 +1153,7 @@ class FireSandbox:
             self._rootfs_copy_path = None
             self._session_id = None
             self._recv_buffer = ""
+            self._credentials = {}
         finally:
             self._process = None
             self._host_service_server = None
@@ -1352,6 +1359,7 @@ class FireSandbox:
             api_client=api_client,
             config=self._firecracker_config,
             preboot=preboot,
+            credentials=self._credentials,
         )
 
     def _connect_vsock_with_retry(self, *, timeout_seconds: float) -> ConnectedSocket:
@@ -1866,15 +1874,27 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         }
 
     web_search_raw = config.get("web_search")
-    web_search: dict[str, Any]
+    web_search: dict[str, str]
     if isinstance(web_search_raw, Mapping):
-        web_search = dict(web_search_raw)
+        endpoint_value = web_search_raw.get("endpoint")
+        format_value = web_search_raw.get("format")
+        web_search = {
+            "endpoint": (
+                endpoint_value
+                if isinstance(endpoint_value, str) and endpoint_value.strip()
+                else "https://api.search.brave.com/res/v1/web/search"
+            ),
+            "format": (
+                format_value
+                if isinstance(format_value, str) and format_value.strip()
+                else "brave"
+            ),
+        }
     else:
-        web_search = {}
-    web_search.setdefault("endpoint", "https://api.search.brave.com/res/v1/web/search")
-    web_search.setdefault("format", "brave")
-    web_search.setdefault("api_key", "")
-    web_search.setdefault("max_results", 10)
+        web_search = {
+            "endpoint": "https://api.search.brave.com/res/v1/web/search",
+            "format": "brave",
+        }
 
     web_fetch_raw = config.get("web_fetch")
     web_fetch: dict[str, Any]
@@ -1929,6 +1949,17 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
     }
     _validate_agent_config_payload(payload)
     return payload
+
+
+def _assert_no_secrets(mmds_json: str, credentials: Mapping[str, Any]) -> None:
+    for integration_name, record in credentials.items():
+        if not isinstance(record, Mapping):
+            continue
+        token = record.get("token")
+        if not isinstance(token, str) or token == "":
+            continue
+        if token in mmds_json:
+            raise ValueError(f"credential leaked into MMDS: {integration_name}")
 
 
 def _tap_guest_ips_from_index(session_index: int) -> tuple[str, str]:
