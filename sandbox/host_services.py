@@ -51,3 +51,23 @@ class HostServiceServer:
             return {"request_id": request_id, "success": False, "error": str(exc)}
 
         return {"request_id": request_id, "success": True, "payload": result}
+
+    def handle_incoming(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Handle one broker_request event and return a broker_response event."""
+        request = {
+            "request_id": event.get("request_id"),
+            "service": event.get("service"),
+            "payload": event.get("payload"),
+        }
+        dispatched = self._dispatch(request)
+        response: dict[str, Any] = {
+            "type": "broker_response",
+            "request_id": str(dispatched.get("request_id", "")),
+            "success": bool(dispatched.get("success")),
+        }
+        if response["success"]:
+            payload = dispatched.get("payload")
+            response["payload"] = payload if isinstance(payload, dict) else {}
+        else:
+            response["error"] = str(dispatched.get("error", "unknown service error"))
+        return response

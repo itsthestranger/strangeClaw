@@ -949,6 +949,84 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         sandbox.stop()
 
 
+def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+
+    event_stream: list[dict[str, Any]] = [
+        {"type": "agent_ready"},
+        {
+            "type": "broker_request",
+            "request_id": "req-1",
+            "service": "broker",
+            "payload": {"action": "list_integrations"},
+        },
+        {"type": "message", "role": "status", "content": "working"},
+        {
+            "type": "done",
+            "success": True,
+            "reply": "ok",
+            "state": {"goal": "x"},
+            "files": [],
+        },
+    ]
+    stream_chunk = (
+        b"OK 100\n" + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+    )
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[stream_chunk])]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "broker roundtrip",
+                "session_id": "sess-broker-fire",
+                "approval_mode": "auto",
+            }
+        )
+        event_one = sandbox.receive(timeout_seconds=1.0)
+        event_two = sandbox.receive(timeout_seconds=1.0)
+        assert event_one == {"type": "message", "role": "status", "content": "working"}
+        assert event_two is not None
+        assert event_two["type"] == "done"
+
+        sent_payloads = socket_factory.sockets[0].sent
+        decoded_sent = [
+            payload.decode("utf-8", errors="replace")
+            for payload in sent_payloads
+            if payload.startswith(b"{")
+        ]
+        assert any('"type":"broker_response"' in payload for payload in decoded_sent)
+        assert any('"request_id":"req-1"' in payload for payload in decoded_sent)
+    finally:
+        sandbox.stop()
+
+
 def test_fire_sandbox_connect_retries_with_new_socket(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     vsock_path = tmp_path / "fire.vsock"

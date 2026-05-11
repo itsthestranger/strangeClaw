@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.broker_client import HostServiceError
 from agent.protocol import decode_event, encode_event
+from host_secrets import load_secrets
+from sandbox.broker import RequestBroker
+from sandbox.host_services import HostServiceServer
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -989,6 +993,7 @@ class FireSandbox:
         self._vsock_conn: ConnectedSocket | None = None
         self._recv_buffer = ""
         self._stopping = False
+        self._host_service_server: HostServiceServer | None = None
 
         self._install_exit_handlers = install_exit_handlers
         self._atexit_registered = False
@@ -1019,6 +1024,15 @@ class FireSandbox:
         host_expose_ports = self._host_expose_ports()
 
         try:
+            credentials = load_secrets()
+            request_broker = RequestBroker(
+                credentials=credentials,
+                config=self._agent_config_template,
+            )
+            host_services = HostServiceServer()
+            host_services.register("broker", request_broker.handle)
+            host_services.start()
+            self._host_service_server = host_services
             self._prepare_runtime_paths(session_id=session_id)
             self._copy_rootfs()
             self._allocation = self._tap_manager.create(session_id=session_id)
@@ -1066,14 +1080,9 @@ class FireSandbox:
             raise RuntimeError(f"Failed to send event over vsock: {exc}") from exc
 
     def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
-        """Receive an event from the agent."""
-        conn = self._require_vsock_conn()
+        """Receive one non-broker event from the agent."""
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("timeout_seconds must be >= 0.")
-
-        line = self._extract_line()
-        if line is not None:
-            return decode_event(line)
 
         deadline: float | None = None
         if timeout_seconds is not None:
@@ -1085,30 +1094,19 @@ class FireSandbox:
                 remaining = deadline - self._monotonic()
                 if remaining <= 0:
                     return None
-            conn.settimeout(remaining)
-            try:
-                chunk = conn.recv(65 * 1024)
-            except TimeoutError:
+            event = self._receive_raw_event(timeout_seconds=remaining)
+            if event is None:
                 return None
-            except OSError as exc:
-                if self._stopping:
-                    return None
-                raise RuntimeError(f"Failed to receive event over vsock: {exc}") from exc
-
-            if not chunk:
-                if self._stopping:
-                    return None
-                exit_code = self._process.poll() if self._process is not None else None
-                if exit_code is None:
-                    raise RuntimeError("Guest vsock connection closed unexpectedly.")
-                raise RuntimeError(
-                    f"Guest vsock connection closed (firecracker exited with code {exit_code})."
+            event_type = event.get("type")
+            if event_type == "broker_request":
+                self._handle_broker_request_event(event)
+                continue
+            if event_type == "broker_response":
+                LOGGER.warning(
+                    "Received unexpected broker_response from guest; discarding."
                 )
-
-            self._recv_buffer += chunk.decode("utf-8", errors="strict")
-            line = self._extract_line()
-            if line is not None:
-                return decode_event(line)
+                continue
+            return event
 
     def stop(self) -> None:
         """Stop the VM and clean up resources."""
@@ -1119,6 +1117,10 @@ class FireSandbox:
             self._safe_teardown_step(self._close_vsock_conn)
             self._safe_teardown_step(self._graceful_shutdown_process)
             self._safe_teardown_step(self._export_firecracker_log_artifact)
+            if self._host_service_server is not None:
+                host_services = self._host_service_server
+                self._safe_teardown_step(host_services.stop)
+                self._host_service_server = None
             if self._allocation is not None:
                 allocation = self._allocation
                 host_expose_ports = self._host_expose_ports()
@@ -1147,8 +1149,81 @@ class FireSandbox:
             self._recv_buffer = ""
         finally:
             self._process = None
+            self._host_service_server = None
             self._safe_teardown_step(self._unregister_exit_handlers)
             self._stopping = False
+
+    def _receive_raw_event(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
+        conn = self._require_vsock_conn()
+
+        line = self._extract_line()
+        if line is not None:
+            return decode_event(line)
+        deadline: float | None = None
+        if timeout_seconds is not None:
+            deadline = self._monotonic() + timeout_seconds
+
+        while True:
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    return None
+
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(65 * 1024)
+            except TimeoutError:
+                return None
+            except OSError as exc:
+                if self._stopping:
+                    return None
+                raise RuntimeError(f"Failed to receive event over vsock: {exc}") from exc
+
+            if not chunk:
+                if self._stopping:
+                    return None
+                exit_code = self._process.poll() if self._process is not None else None
+                if exit_code is None:
+                    raise RuntimeError("Guest vsock connection closed unexpectedly.")
+                raise RuntimeError(
+                    "Guest vsock connection closed (firecracker exited with code "
+                    f"{exit_code})."
+                )
+
+            self._recv_buffer += chunk.decode("utf-8", errors="strict")
+            line = self._extract_line()
+            if line is not None:
+                return decode_event(line)
+
+    def _handle_broker_request_event(self, event: dict[str, Any]) -> None:
+        request_id = event.get("request_id")
+        if not isinstance(request_id, str):
+            return
+        if self._host_service_server is None:
+            self.send(
+                {
+                    "type": "broker_response",
+                    "request_id": request_id,
+                    "success": False,
+                    "error": "host services unavailable",
+                }
+            )
+            return
+
+        try:
+            response = self._host_service_server.handle_incoming(event)
+        except Exception as exc:
+            response = {
+                "type": "broker_response",
+                "request_id": request_id,
+                "success": False,
+                "error": str(exc),
+            }
+        try:
+            self.send(response)
+        except Exception as exc:
+            raise HostServiceError(f"Failed to send broker_response to guest: {exc}") from exc
 
     def _safe_teardown_step(self, operation: Callable[[], None]) -> None:
         try:

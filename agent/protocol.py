@@ -13,6 +13,8 @@ EVENT_TYPES = {
     "message",
     "action",
     "done",
+    "broker_request",
+    "broker_response",
 }
 MESSAGE_ROLES = {"plan", "clarification", "status", "reply"}
 
@@ -92,6 +94,21 @@ def validate_event(event: dict[str, Any]) -> None:
         files = event.get("files")
         if files is not None and not isinstance(files, list):
             raise ProtocolError("Event field 'files' must be an array when provided.")
+        return
+
+    if event_type == "broker_request":
+        _require_str(event, "request_id")
+        _require_str(event, "service")
+        _require_dict(event, "payload")
+        return
+
+    if event_type == "broker_response":
+        _require_str(event, "request_id")
+        success = _require_bool(event, "success")
+        if success:
+            _require_dict(event, "payload")
+            return
+        _require_str(event, "error")
         return
 
 

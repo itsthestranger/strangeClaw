@@ -1045,6 +1045,11 @@ def main(argv: list[str] | None = None) -> None:
 
     transport = VsockTransport(guest_port=int(args.vsock_port))
     try:
+        broker = BrokerClient(
+            mode="fire",
+            send_fn=transport.send,
+            receive_fn=transport.receive,
+        )
         agent = Agent(
             transport=transport,
             skills_dir=str(args.skills_dir),
@@ -1054,6 +1059,7 @@ def main(argv: list[str] | None = None) -> None:
             token_budget=int(args.token_budget),
             summary_threshold=int(args.summary_threshold),
             allow_task_llm=False,
+            broker=broker,
         )
         agent.run()
     finally:
