@@ -293,6 +293,9 @@ The broker executes the call only if `~/.strangeclaw/secrets.yaml` contains a
 matching `credentials.github` entry. It validates method, host, path, protected
 headers, response size, and rate limits before injecting the credential. The
 model never sees token values.
+As a deliberate security decision, integration auth supports only `bearer` and
+`header` modes. Query-string credential injection (`auth_type: query`) is not
+supported.
 
 A skill without a matching credentials entry is inert at execution time. For
 example, the `notion` skill can teach the model Notion API shapes, but Notion

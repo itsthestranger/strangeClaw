@@ -183,21 +183,6 @@ class RequestBroker:
             final_headers[header_name] = token
             return final_headers, url
 
-        if auth_type == "query":
-            query_param_raw = policy.get("query_param")
-            query_param = (
-                query_param_raw.strip()
-                if isinstance(query_param_raw, str) and query_param_raw.strip()
-                else "token"
-            )
-            split = urlsplit(url)
-            params = parse_qsl(split.query, keep_blank_values=True)
-            params.append((query_param, token))
-            final_url = urlunsplit(
-                (split.scheme, split.netloc, split.path, urlencode(params), split.fragment)
-            )
-            return final_headers, final_url
-
         return final_headers, url
 
     def _ssrf_check(self, url: str) -> PolicyResult:

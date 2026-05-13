@@ -88,7 +88,7 @@ def test_load_secrets_skips_invalid_records_without_logging_tokens(
                     "allowed_hosts": ["api.example.com"],
                 },
                 "bad_hosts": {
-                    "auth_type": "query",
+                    "auth_type": "header",
                     "token": leaked_token,
                     "allowed_hosts": [],
                 },
@@ -105,6 +105,30 @@ def test_load_secrets_skips_invalid_records_without_logging_tokens(
     assert "skipping integration 'bad_auth'" in caplog.text
     assert "skipping integration 'bad_hosts'" in caplog.text
     assert leaked_token not in caplog.text
+
+
+def test_load_secrets_rejects_legacy_query_auth_type(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "legacy_query": {
+                    "auth_type": "query",
+                    "token": "legacy-token",
+                    "allowed_hosts": ["api.example.com"],
+                }
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        loaded = load_secrets(str(secrets_path))
+
+    assert loaded == {}
+    assert "auth_type must be one of: bearer, header" in caplog.text
 
 
 def test_list_integration_names_excludes_internal_and_sorts() -> None:

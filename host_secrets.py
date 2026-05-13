@@ -10,7 +10,7 @@ import yaml
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SECRETS_PATH = Path.home() / ".strangeclaw" / "secrets.yaml"
-_VALID_AUTH_TYPES = {"bearer", "header", "query"}
+_VALID_AUTH_TYPES = {"bearer", "header"}
 
 
 def load_secrets(path: str | None = None) -> dict[str, dict[str, Any]]:
@@ -70,10 +70,10 @@ def _normalize_record(record: Any) -> tuple[dict[str, Any], str | None]:
 
     auth_type = record.get("auth_type")
     if not isinstance(auth_type, str):
-        return {}, "auth_type must be one of: bearer, header, query"
+        return {}, "auth_type must be one of: bearer, header"
     normalized_auth_type = auth_type.strip().lower()
     if normalized_auth_type not in _VALID_AUTH_TYPES:
-        return {}, "auth_type must be one of: bearer, header, query"
+        return {}, "auth_type must be one of: bearer, header"
 
     token = record.get("token")
     if not isinstance(token, str) or not token.strip():
@@ -143,10 +143,7 @@ def _normalize_record(record: Any) -> tuple[dict[str, Any], str | None]:
         normalized["header_name"] = header_name.strip()
 
     if "query_param" in record:
-        query_param = record["query_param"]
-        if not isinstance(query_param, str) or not query_param.strip():
-            return {}, "query_param must be a non-empty string when provided"
-        normalized["query_param"] = query_param.strip()
+        return {}, "query_param is not supported; use bearer/header auth with host policy"
 
     return normalized, None
 

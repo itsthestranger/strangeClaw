@@ -436,15 +436,14 @@ def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
     assert token not in caplog.text
 
 
-def test_inject_query_appends_token_param_and_no_token_in_logs(
+def test_inject_unknown_auth_type_does_not_inject_token_or_modify_url(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     broker = _broker()
-    token = "token-query-secret"
+    token = "token-unknown-secret"
     policy = {
         "name": "search",
-        "auth_type": "query",
-        "query_param": "api_key",
+        "auth_type": "unsupported",
         "token": token,
     }
 
@@ -466,9 +465,12 @@ def test_inject_query_appends_token_param_and_no_token_in_logs(
         broker._execute("GET", final_url, final_headers, None, 1024)
 
     outbound_url = captured["url"]
+    outbound_headers = captured["headers"]
     assert isinstance(outbound_url, str)
-    assert "api_key=" in outbound_url
-    assert outbound_url.startswith("https://example.com/search?")
+    assert outbound_url == "https://example.com/search?q=test"
+    assert isinstance(outbound_headers, dict)
+    assert "X-Client" in outbound_headers
+    assert "Authorization" not in outbound_headers
     assert token not in caplog.text
 
 
