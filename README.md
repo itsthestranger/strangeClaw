@@ -261,7 +261,8 @@ SearXNG local setup note:
 - For local SearXNG without authentication, keep the `_web_search` entry in
   `secrets.yaml` so the broker knows the allowed host and policy. The current
   secrets loader requires a non-empty `token`, so use a non-secret placeholder
-  value if your SearXNG instance does not need one.
+  value if your SearXNG instance does not need one (for example
+  `"unused-local-searxng-token"`).
 - In SearXNG's `settings.yml`, allow JSON output or requests with
   `format=json` will be rejected. The relevant setting is:
   ```yaml

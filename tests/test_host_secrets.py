@@ -118,3 +118,54 @@ def test_list_integration_names_excludes_internal_and_sorts() -> None:
     names = list_integration_names(credentials)
 
     assert names == ["github", "notion"]
+
+
+def test_load_secrets_skips_web_search_with_empty_token(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "_web_search": {
+                    "auth_type": "header",
+                    "header_name": "X-Subscription-Token",
+                    "token": "",
+                    "allowed_hosts": ["localhost"],
+                    "allowed_methods": ["GET"],
+                    "allowed_paths": ["/*"],
+                }
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        loaded = load_secrets(str(secrets_path))
+
+    assert loaded == {}
+    assert "skipping integration '_web_search': token must be a non-empty string" in caplog.text
+
+
+def test_load_secrets_accepts_web_search_placeholder_token(tmp_path: Path) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "_web_search": {
+                    "auth_type": "header",
+                    "header_name": "X-Subscription-Token",
+                    "token": "unused-local-searxng-token",
+                    "allowed_hosts": ["localhost", "127.0.0.1"],
+                    "allowed_methods": ["GET"],
+                    "allowed_paths": ["/search"],
+                }
+            }
+        },
+    )
+
+    loaded = load_secrets(str(secrets_path))
+
+    assert loaded["_web_search"]["token"] == "unused-local-searxng-token"
+    assert loaded["_web_search"]["allowed_hosts"] == ["localhost", "127.0.0.1"]
