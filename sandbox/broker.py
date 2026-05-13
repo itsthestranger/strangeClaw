@@ -7,10 +7,11 @@ import json
 import logging
 import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 import trafilatura
@@ -21,6 +22,8 @@ LOGGER = logging.getLogger(__name__)
 _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES = 524288
 _DEFAULT_WEB_FETCH_MAX_CHARS = 20000
 _WEB_FETCH_BODY_MULTIPLIER = 4
+_MAX_REDIRECT_HOPS = 5
+_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 
 @dataclass
@@ -234,7 +237,6 @@ class RequestBroker:
         max_bytes: int,
     ) -> dict[str, Any]:
         session = requests.Session()
-        session.max_redirects = 5
         try:
             response = session.request(
                 method=method,
@@ -242,7 +244,7 @@ class RequestBroker:
                 headers=headers,
                 data=body,
                 timeout=(10, 30),
-                allow_redirects=True,
+                allow_redirects=False,
                 stream=True,
             )
 
@@ -274,6 +276,61 @@ class RequestBroker:
             return {"success": False, "error": exc.__class__.__name__, "detail": str(exc)}
         finally:
             session.close()
+
+    def _execute_with_redirects(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: str | None,
+        max_bytes: int,
+        redirect_guard: Callable[[str, str], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        current_method = method.upper()
+        current_url = url
+        redirects_followed = 0
+
+        while True:
+            result = self._execute(
+                current_method,
+                current_url,
+                headers,
+                body,
+                max_bytes,
+            )
+            if result.get("success") is False:
+                return result
+
+            status_code = _to_int(result.get("status_code"))
+            next_url = _redirect_target_from_result(current_url, status_code, result)
+            if next_url is None:
+                return result
+
+            if current_method != "GET":
+                return {
+                    "success": False,
+                    "error": "unsupported_redirect",
+                    "detail": (
+                        "redirect handling for non-GET methods is disabled "
+                        f"(method={current_method}, status={status_code})"
+                    ),
+                }
+
+            redirects_followed += 1
+            if redirects_followed > _MAX_REDIRECT_HOPS:
+                return {
+                    "success": False,
+                    "error": "too_many_redirects",
+                    "detail": f"redirect limit exceeded ({_MAX_REDIRECT_HOPS}) for {url}",
+                }
+
+            if redirect_guard is not None:
+                denial = redirect_guard(next_url, current_method)
+                if denial is not None:
+                    return denial
+
+            current_url = next_url
 
     @staticmethod
     def _is_reserved_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -335,7 +392,47 @@ class RequestBroker:
         max_bytes = _to_positive_int(policy.get("max_response_bytes"))
         if max_bytes is None:
             max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
-        return self._execute(method, final_url, final_headers, body, max_bytes)
+        if use_public_policy:
+            def public_redirect_guard(
+                redirect_url: str,
+                redirect_method: str,
+            ) -> dict[str, Any] | None:
+                ssrf = self._ssrf_check(redirect_url)
+                if not ssrf.allowed:
+                    return self._deny(
+                        integration_name,
+                        redirect_method,
+                        redirect_url,
+                        ssrf.reason or "SSRF denied",
+                    )
+                return None
+
+            redirect_guard = public_redirect_guard
+        else:
+            def integration_redirect_guard(
+                redirect_url: str,
+                redirect_method: str,
+            ) -> dict[str, Any] | None:
+                validation = self._validate(policy, redirect_method, redirect_url, model_headers)
+                if not validation.allowed:
+                    return self._deny(
+                        integration_name,
+                        redirect_method,
+                        redirect_url,
+                        validation.reason or "policy denied",
+                    )
+                return None
+
+            redirect_guard = integration_redirect_guard
+
+        return self._execute_with_redirects(
+            method=method,
+            url=final_url,
+            headers=final_headers,
+            body=body,
+            max_bytes=max_bytes,
+            redirect_guard=redirect_guard,
+        )
 
     def _handle_web_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = str(payload.get("url", ""))
@@ -344,12 +441,28 @@ class RequestBroker:
             return self._deny("_web_fetch", "GET", url, ssrf.reason or "SSRF denied")
 
         max_chars = self._web_fetch_max_chars()
-        execute_result = self._execute(
-            "GET",
-            url,
-            {},
-            None,
-            max_chars * _WEB_FETCH_BODY_MULTIPLIER,
+
+        def web_fetch_redirect_guard(
+            redirect_url: str,
+            redirect_method: str,
+        ) -> dict[str, Any] | None:
+            ssrf = self._ssrf_check(redirect_url)
+            if not ssrf.allowed:
+                return self._deny(
+                    "_web_fetch",
+                    redirect_method,
+                    redirect_url,
+                    ssrf.reason or "SSRF denied",
+                )
+            return None
+
+        execute_result = self._execute_with_redirects(
+            method="GET",
+            url=url,
+            headers={},
+            body=None,
+            max_bytes=max_chars * _WEB_FETCH_BODY_MULTIPLIER,
+            redirect_guard=web_fetch_redirect_guard,
         )
         if execute_result.get("success") is False:
             return execute_result
@@ -546,6 +659,15 @@ def _to_positive_float(value: Any) -> float | None:
     return parsed
 
 
+def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_headers(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -618,3 +740,22 @@ def _append_query_params(url: str, params: dict[str, str]) -> str:
         existing.append((key, value))
     query = urlencode(existing)
     return urlunsplit((split.scheme, split.netloc, split.path, query, split.fragment))
+
+
+def _redirect_target_from_result(
+    base_url: str,
+    status_code: int | None,
+    result: dict[str, Any],
+) -> str | None:
+    if status_code not in _REDIRECT_STATUS_CODES:
+        return None
+    headers = result.get("headers")
+    if not isinstance(headers, dict):
+        return None
+    location_raw = headers.get("Location")
+    if not isinstance(location_raw, str):
+        return None
+    location = location_raw.strip()
+    if not location:
+        return None
+    return urljoin(base_url, location)

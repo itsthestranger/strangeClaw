@@ -480,6 +480,21 @@ def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _mapped_dns(
+    monkeypatch: pytest.MonkeyPatch,
+    mapping: dict[str, str],
+) -> None:
+    def _resolver(
+        host: str,
+        port: object,
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        _ = port
+        ip = mapping.get(host, "93.184.216.34")
+        return _fake_getaddrinfo(ip)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _resolver)
+
+
 def test_handle_unknown_action() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
 
@@ -724,3 +739,240 @@ def test_handle_list_integrations_via_host_service_registration() -> None:
     result = client.call("broker", {"action": "list_integrations"})
 
     assert result == {"success": True, "integrations": ["notion"]}
+
+
+@responses.activate
+def test_handle_http_request_public_redirect_to_loopback_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(
+        monkeypatch,
+        {
+            "public.example.com": "93.184.216.34",
+            "127.0.0.1": "127.0.0.1",
+        },
+    )
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/start",
+        status=302,
+        headers={"Location": "http://127.0.0.1/private"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/start",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "SSRF" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_web_fetch_redirect_to_reserved_address_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(
+        monkeypatch,
+        {
+            "example.com": "93.184.216.34",
+            "192.168.1.10": "192.168.1.10",
+        },
+    )
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/start",
+        status=302,
+        headers={"Location": "http://192.168.1.10/internal"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/start"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "SSRF" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_to_disallowed_host_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_to_disallowed_path_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://api.notion.com/admin"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_paths" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_no_credential_forward_to_disallowed_redirect_host(
+) -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert len(responses.calls) == 1
+    first_request_headers = responses.calls[0].request.headers
+    assert "Authorization" in first_request_headers
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_within_policy_succeeds() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://api.notion.com/v1/pages/next"},
+    )
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages/next",
+        json={"ok": True},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["status_code"] == 200
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_handle_http_request_redirect_loop_returns_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(monkeypatch, {"public.example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r1",
+        status=302,
+        headers={"Location": "https://public.example.com/r2"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r2",
+        status=302,
+        headers={"Location": "https://public.example.com/r3"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r3",
+        status=302,
+        headers={"Location": "https://public.example.com/r4"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r4",
+        status=302,
+        headers={"Location": "https://public.example.com/r5"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r5",
+        status=302,
+        headers={"Location": "https://public.example.com/r6"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r6",
+        status=302,
+        headers={"Location": "https://public.example.com/r7"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/r1",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "too_many_redirects",
+        "detail": "redirect limit exceeded (5) for https://public.example.com/r1",
+    }
+    assert len(responses.calls) == 6
