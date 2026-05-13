@@ -536,11 +536,42 @@ class RequestBroker:
 
         policy = dict(policy)
         policy["name"] = "_web_search"
+        validation = self._validate(policy, "GET", search_url, {})
+        if not validation.allowed:
+            return self._deny(
+                "_web_search",
+                "GET",
+                search_url,
+                validation.reason or "policy denied",
+            )
+
         headers, final_url = self._inject(policy, {}, search_url)
         max_bytes = _to_positive_int(policy.get("max_response_bytes"))
         if max_bytes is None:
             max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
-        execute_result = self._execute("GET", final_url, headers, None, max_bytes)
+
+        def web_search_redirect_guard(
+            redirect_url: str,
+            redirect_method: str,
+        ) -> dict[str, Any] | None:
+            hop_validation = self._validate(policy, redirect_method, redirect_url, {})
+            if not hop_validation.allowed:
+                return self._deny(
+                    "_web_search",
+                    redirect_method,
+                    redirect_url,
+                    hop_validation.reason or "policy denied",
+                )
+            return None
+
+        execute_result = self._execute_with_redirects(
+            method="GET",
+            url=final_url,
+            headers=headers,
+            body=None,
+            max_bytes=max_bytes,
+            redirect_guard=web_search_redirect_guard,
+        )
         if execute_result.get("success") is False:
             return execute_result
 

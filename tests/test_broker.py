@@ -730,6 +730,67 @@ def test_handle_web_search_normalizes_searxng() -> None:
     }
 
 
+@responses.activate
+def test_handle_web_search_denies_allowed_hosts_mismatch() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://wrong.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 0
+
+
+@responses.activate
+def test_handle_web_search_denies_allowed_paths_mismatch() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://search.example.com/private",
+        "format": "brave",
+        "max_results": 10,
+    }
+    credentials = _credentials()
+    credentials["_web_search"] = {
+        **credentials["_web_search"],
+        "allowed_paths": ["/search"],
+    }
+    broker = RequestBroker(credentials=credentials, config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_paths" in str(result.get("reason", ""))
+    assert len(responses.calls) == 0
+
+
+@responses.activate
+def test_handle_web_search_redirect_to_disallowed_host_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        status=302,
+        headers={"Location": "https://evil.example.com/search"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+    request_headers = responses.calls[0].request.headers
+    assert "X-Subscription-Token" in request_headers
+
+
 def test_handle_list_integrations_via_host_service_registration() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
     server = HostServiceServer()
