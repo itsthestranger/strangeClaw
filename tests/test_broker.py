@@ -11,7 +11,7 @@ import requests
 import responses
 
 from agent.broker_client import BrokerClient
-from sandbox.broker import PolicyResult, RequestBroker
+from sandbox.broker import Policy, PolicyResult, RequestBroker
 from sandbox.host_services import HostServiceServer
 
 
@@ -19,14 +19,21 @@ def _broker() -> RequestBroker:
     return RequestBroker(credentials={}, config={})
 
 
-def _policy() -> dict[str, object]:
-    return {
-        "name": "notion",
-        "allowed_methods": ["GET"],
-        "allowed_hosts": ["api.notion.com"],
-        "allowed_paths": ["/v1/*"],
-        "protected_headers": ["Authorization"],
-    }
+def _policy() -> Policy:
+    return Policy(
+        name="notion",
+        auth_type="bearer",
+        token="notion-secret-token",
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.notion.com",),
+        allowed_paths=("/v1/*",),
+        protected_headers=("Authorization",),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
 
 def _broker_config() -> dict[str, object]:
@@ -380,12 +387,20 @@ def test_inject_bearer_captures_outbound_header_key_and_no_token_in_logs(
 ) -> None:
     broker = _broker()
     token = "token-bearer-secret"
-    policy = {
-        "name": "notion",
-        "auth_type": "bearer",
-        "token": token,
-        "default_headers": {"X-Default": "yes"},
-    }
+    policy = Policy(
+        name="notion",
+        auth_type="bearer",
+        token=token,
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.notion.com",),
+        allowed_paths=("/*",),
+        protected_headers=("Authorization",),
+        default_headers={"X-Default": "yes"},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -413,12 +428,20 @@ def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
 ) -> None:
     broker = _broker()
     token = "token-header-secret"
-    policy = {
-        "name": "github",
-        "auth_type": "header",
-        "header_name": "X-API-Key",
-        "token": token,
-    }
+    policy = Policy(
+        name="github",
+        auth_type="header",
+        token=token,
+        header_name="X-API-Key",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.github.com",),
+        allowed_paths=("/*",),
+        protected_headers=("Authorization", "X-API-Key"),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -444,11 +467,20 @@ def test_inject_unknown_auth_type_does_not_inject_token_or_modify_url(
 ) -> None:
     broker = _broker()
     token = "token-unknown-secret"
-    policy = {
-        "name": "search",
-        "auth_type": "unsupported",
-        "token": token,
-    }
+    policy = Policy(
+        name="search",
+        auth_type="unsupported",
+        token=token,
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("search.example.com",),
+        allowed_paths=("/*",),
+        protected_headers=("Authorization",),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -506,6 +538,74 @@ def test_handle_unknown_action() -> None:
     result = broker.handle({"action": "nope"})
 
     assert result == {"success": False, "error": "unknown action: nope"}
+
+
+def test_handle_list_integrations_skips_invalid_policy_records() -> None:
+    credentials = _credentials()
+    credentials["broken"] = {
+        "name": "broken",
+        "auth_type": "query",
+        "token": "ignored",
+        "allowed_hosts": ["api.invalid.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/*"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=credentials, config=_broker_config())
+
+    listed = broker.handle({"action": "list_integrations"})
+    denied = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "broken",
+            "method": "GET",
+            "url": "https://api.invalid.local/v1/check",
+        }
+    )
+
+    assert listed == {"success": True, "integrations": ["notion"]}
+    assert denied["success"] is False
+    assert denied["error"] == "policy_denied"
+    assert "not found in secrets.yaml" in str(denied.get("reason", ""))
+
+
+@responses.activate
+def test_handle_http_request_public_policy_custom_allowed_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _public_dns(monkeypatch)
+    config = _broker_config()
+    config["broker"] = {
+        "public_policy": {
+            "enabled": True,
+            "allowed_methods": ["GET", "POST"],
+            "max_response_bytes": 4096,
+        }
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+    responses.add(
+        responses.POST,
+        "https://public.example.com/submit",
+        body='{"ok":true}',
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "POST",
+            "url": "https://public.example.com/submit",
+            "headers": {"Content-Type": "application/json"},
+            "body": '{"x":1}',
+        }
+    )
+
+    assert result["success"] is True
+    assert result["status_code"] == 200
 
 
 @responses.activate

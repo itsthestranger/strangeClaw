@@ -34,6 +34,24 @@ class PolicyResult:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class Policy:
+    """Normalized broker policy record used by all security-sensitive paths."""
+
+    name: str
+    auth_type: str
+    token: str
+    header_name: str
+    allowed_hosts: tuple[str, ...]
+    allowed_methods: tuple[str, ...]
+    allowed_paths: tuple[str, ...]
+    protected_headers: tuple[str, ...]
+    default_headers: dict[str, str]
+    max_response_bytes: int
+    rate_limit_requests: int | None
+    rate_limit_period_seconds: float | None
+
+
 class _TokenBucket:
     """Simple token-bucket rate limiter."""
 
@@ -60,20 +78,24 @@ class RequestBroker:
 
     def __init__(self, credentials: dict[str, Any], config: dict[str, Any]) -> None:
         self._credentials = credentials
+        self._policies: dict[str, Policy] = {}
         self._config = config
         self._redaction_tokens = _collect_credential_tokens(credentials)
         self._rate_limiters: dict[str, _TokenBucket] = {}
         for integration, policy in credentials.items():
-            if not isinstance(policy, dict):
+            normalized = _normalize_policy(integration, policy)
+            if normalized is None:
                 continue
-            rate_limit = policy.get("rate_limit")
-            if not isinstance(rate_limit, dict):
+            self._policies[integration] = normalized
+            if (
+                normalized.rate_limit_requests is None
+                or normalized.rate_limit_period_seconds is None
+            ):
                 continue
-            requests_count = _to_positive_int(rate_limit.get("requests"))
-            per_seconds = _to_positive_float(rate_limit.get("per_seconds"))
-            if requests_count is None or per_seconds is None:
-                continue
-            self._rate_limiters[integration] = _TokenBucket(requests_count, per_seconds)
+            self._rate_limiters[integration] = _TokenBucket(
+                normalized.rate_limit_requests,
+                normalized.rate_limit_period_seconds,
+            )
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
         action = payload.get("action")
@@ -95,45 +117,41 @@ class RequestBroker:
 
     def _validate(
         self,
-        policy: dict[str, Any],
+        policy: Policy,
         method: str,
         url: str,
         headers: dict[str, str],
     ) -> PolicyResult:
-        integration = str(policy.get("name", "<unknown>"))
+        integration = policy.name
         method_upper = method.upper()
-        allowed_methods = policy.get("allowed_methods", [])
-        if method_upper not in allowed_methods:
+        if method_upper not in policy.allowed_methods:
             return PolicyResult(
                 allowed=False,
                 reason=(
-                    f"method {method_upper} not in allowed_methods {allowed_methods} "
+                    f"method {method_upper} not in allowed_methods {list(policy.allowed_methods)} "
                     f"for integration '{integration}'"
                 ),
             )
 
         parsed = urlparse(url)
         host = parsed.hostname or ""
-        allowed_hosts = policy.get("allowed_hosts", [])
-        if not any(fnmatch(host, str(pattern)) for pattern in allowed_hosts):
+        if not any(fnmatch(host, pattern) for pattern in policy.allowed_hosts):
             return PolicyResult(
                 allowed=False,
                 reason=f"host {host} not in allowed_hosts for integration '{integration}'",
             )
 
         path = parsed.path or "/"
-        allowed_paths = policy.get("allowed_paths", [])
-        if not any(fnmatch(path, str(pattern)) for pattern in allowed_paths):
+        if not any(fnmatch(path, pattern) for pattern in policy.allowed_paths):
             return PolicyResult(
                 allowed=False,
                 reason=(
-                    f"path {path} not matched by allowed_paths {allowed_paths} "
+                    f"path {path} not matched by allowed_paths {list(policy.allowed_paths)} "
                     f"for integration '{integration}'"
                 ),
             )
 
-        protected_headers = policy.get("protected_headers", [])
-        protected_by_lower = {str(name).lower(): str(name) for name in protected_headers}
+        protected_by_lower = {name.lower(): name for name in policy.protected_headers}
         for header_name in headers:
             canonical = protected_by_lower.get(header_name.lower())
             if canonical is not None:
@@ -158,22 +176,19 @@ class RequestBroker:
 
     def _inject(
         self,
-        policy: dict[str, Any],
+        policy: Policy,
         headers: dict[str, str],
         url: str,
     ) -> tuple[dict[str, str], str]:
         final_headers: dict[str, str] = {}
-        defaults = policy.get("default_headers", {})
-        if isinstance(defaults, dict):
-            for key, value in defaults.items():
-                if isinstance(key, str) and isinstance(value, str):
-                    final_headers[key] = value
+        for key, value in policy.default_headers.items():
+            final_headers[key] = value
         for key, value in headers.items():
             final_headers[key] = value
 
-        auth_type = str(policy.get("auth_type", "")).lower()
-        integration = str(policy.get("name", "<unknown>"))
-        token = str(policy.get("token", ""))
+        auth_type = policy.auth_type
+        integration = policy.name
+        token = policy.token
         LOGGER.debug("injecting %s credential for integration %s", auth_type, integration)
 
         if auth_type == "bearer":
@@ -181,13 +196,7 @@ class RequestBroker:
             return final_headers, url
 
         if auth_type == "header":
-            header_name_raw = policy.get("header_name", "Authorization")
-            header_name = (
-                header_name_raw.strip()
-                if isinstance(header_name_raw, str) and header_name_raw.strip()
-                else "Authorization"
-            )
-            final_headers[header_name] = token
+            final_headers[policy.header_name] = token
             return final_headers, url
 
         return final_headers, url
@@ -347,8 +356,8 @@ class RequestBroker:
         body = body_raw if isinstance(body_raw, str) or body_raw is None else str(body_raw)
 
         if isinstance(integration, str) and integration:
-            policy = self._credentials.get(integration)
-            if not isinstance(policy, dict):
+            policy = self._policies.get(integration)
+            if policy is None:
                 reason = f"integration '{integration}' not found in secrets.yaml"
                 return self._deny(integration, method, url, reason)
             integration_name = integration
@@ -361,9 +370,6 @@ class RequestBroker:
             policy = self._build_public_policy(public_cfg)
             integration_name = "_public"
             use_public_policy = True
-
-        policy = dict(policy)
-        policy["name"] = integration_name
 
         validation = self._validate(policy, method, url, model_headers)
         if not validation.allowed:
@@ -382,9 +388,7 @@ class RequestBroker:
                 return self._deny(integration_name, method, url, ssrf.reason or "SSRF denied")
 
         final_headers, final_url = self._inject(policy, model_headers, url)
-        max_bytes = _to_positive_int(policy.get("max_response_bytes"))
-        if max_bytes is None:
-            max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
+        max_bytes = policy.max_response_bytes
         if use_public_policy:
             def public_redirect_guard(
                 redirect_url: str,
@@ -506,9 +510,9 @@ class RequestBroker:
         }
 
     def _handle_web_search(self, payload: dict[str, Any]) -> dict[str, Any]:
-        policy = self._credentials.get("_web_search")
+        policy = self._policies.get("_web_search")
         endpoint = self._web_search_endpoint()
-        if not isinstance(policy, dict):
+        if policy is None:
             reason = "web_search integration not configured in secrets.yaml"
             return self._deny("_web_search", "GET", endpoint, reason)
 
@@ -527,8 +531,6 @@ class RequestBroker:
             query_params = {"q": query, "format": "json"}
         search_url = _append_query_params(endpoint, query_params)
 
-        policy = dict(policy)
-        policy["name"] = "_web_search"
         validation = self._validate(policy, "GET", search_url, {})
         if not validation.allowed:
             return self._deny(
@@ -539,9 +541,7 @@ class RequestBroker:
             )
 
         headers, final_url = self._inject(policy, {}, search_url)
-        max_bytes = _to_positive_int(policy.get("max_response_bytes"))
-        if max_bytes is None:
-            max_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
+        max_bytes = policy.max_response_bytes
 
         def web_search_redirect_guard(
             redirect_url: str,
@@ -584,7 +584,7 @@ class RequestBroker:
 
     def _handle_list_integrations(self, payload: dict[str, Any]) -> dict[str, Any]:
         _ = payload
-        return {"success": True, "integrations": list_integration_names(self._credentials)}
+        return {"success": True, "integrations": list_integration_names(self._policies)}
 
     def _redact_value(self, value: Any) -> Any:
         if not self._redaction_tokens:
@@ -620,9 +620,9 @@ class RequestBroker:
             return {}
         return public_policy
 
-    def _build_public_policy(self, public_cfg: dict[str, Any]) -> dict[str, Any]:
+    def _build_public_policy(self, public_cfg: dict[str, Any]) -> Policy:
         allowed_methods_raw = public_cfg.get("allowed_methods", ["GET"])
-        allowed_methods = ["GET"]
+        allowed_methods: tuple[str, ...] = ("GET",)
         if isinstance(allowed_methods_raw, list):
             normalized = [
                 str(item).upper()
@@ -630,21 +630,24 @@ class RequestBroker:
                 if isinstance(item, str) and item.strip()
             ]
             if normalized:
-                allowed_methods = normalized
+                allowed_methods = tuple(normalized)
         max_response_bytes = _to_positive_int(public_cfg.get("max_response_bytes"))
         if max_response_bytes is None:
             max_response_bytes = _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES
-        return {
-            "name": "_public",
-            "auth_type": "none",
-            "token": "",
-            "allowed_hosts": ["*"],
-            "allowed_methods": allowed_methods,
-            "allowed_paths": ["/*"],
-            "protected_headers": ["Authorization"],
-            "default_headers": {},
-            "max_response_bytes": max_response_bytes,
-        }
+        return Policy(
+            name="_public",
+            auth_type="none",
+            token="",
+            header_name="Authorization",
+            allowed_hosts=("*",),
+            allowed_methods=allowed_methods,
+            allowed_paths=("/*",),
+            protected_headers=("Authorization",),
+            default_headers={},
+            max_response_bytes=max_response_bytes,
+            rate_limit_requests=None,
+            rate_limit_period_seconds=None,
+        )
 
     def _web_fetch_max_chars(self) -> int:
         section = self._config.get("web_fetch")
@@ -693,6 +696,89 @@ def _collect_credential_tokens(credentials: dict[str, Any]) -> tuple[str, ...]:
 
     collect(credentials)
     return tuple(sorted(tokens, key=len, reverse=True))
+
+
+def _normalize_policy(name: str, raw_policy: Any) -> Policy | None:
+    if not isinstance(raw_policy, dict):
+        return None
+
+    auth_type_raw = raw_policy.get("auth_type")
+    if not isinstance(auth_type_raw, str):
+        return None
+    auth_type = auth_type_raw.strip().lower()
+    if auth_type not in {"bearer", "header"}:
+        return None
+
+    token_raw = raw_policy.get("token")
+    if not isinstance(token_raw, str):
+        return None
+
+    allowed_hosts = _normalize_string_tuple(raw_policy.get("allowed_hosts"))
+    allowed_methods = _normalize_string_tuple(raw_policy.get("allowed_methods"))
+    allowed_paths = _normalize_string_tuple(raw_policy.get("allowed_paths"))
+    protected_headers = _normalize_string_tuple(raw_policy.get("protected_headers"))
+    if (
+        allowed_hosts is None
+        or allowed_methods is None
+        or allowed_paths is None
+        or protected_headers is None
+    ):
+        return None
+
+    normalized_methods = tuple(item.upper() for item in allowed_methods)
+
+    default_headers_raw = raw_policy.get("default_headers")
+    if not isinstance(default_headers_raw, dict):
+        return None
+    default_headers: dict[str, str] = {}
+    for key, value in default_headers_raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return None
+        default_headers[key] = value
+
+    max_response_bytes = _to_positive_int(raw_policy.get("max_response_bytes"))
+    if max_response_bytes is None:
+        return None
+
+    rate_limit = raw_policy.get("rate_limit")
+    rate_limit_requests: int | None = None
+    rate_limit_period_seconds: float | None = None
+    if isinstance(rate_limit, dict):
+        rate_limit_requests = _to_positive_int(rate_limit.get("requests"))
+        rate_limit_period_seconds = _to_positive_float(rate_limit.get("per_seconds"))
+
+    header_name = "Authorization"
+    if auth_type == "header":
+        header_name_raw = raw_policy.get("header_name", "Authorization")
+        if not isinstance(header_name_raw, str) or not header_name_raw.strip():
+            return None
+        header_name = header_name_raw.strip()
+
+    return Policy(
+        name=name,
+        auth_type=auth_type,
+        token=token_raw,
+        header_name=header_name,
+        allowed_hosts=allowed_hosts,
+        allowed_methods=normalized_methods,
+        allowed_paths=allowed_paths,
+        protected_headers=protected_headers,
+        default_headers=default_headers,
+        max_response_bytes=max_response_bytes,
+        rate_limit_requests=rate_limit_requests,
+        rate_limit_period_seconds=rate_limit_period_seconds,
+    )
+
+
+def _normalize_string_tuple(value: Any) -> tuple[str, ...] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        items.append(item.strip())
+    return tuple(items)
 
 
 def _redact_string(value: str, tokens: tuple[str, ...]) -> str:
