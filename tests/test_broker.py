@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Callable
 from unittest.mock import patch
 
 import pytest
@@ -608,6 +609,42 @@ def test_handle_http_request_public_policy_custom_allowed_methods(
     assert result["status_code"] == 200
 
 
+def test_execute_policy_request_helper_denies_disallowed_redirect_host() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    policy = broker._policies["notion"]
+
+    def _fake_execute_with_redirects(
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: str | None,
+        max_bytes: int,
+        redirect_guard: Callable[[str, str], dict[str, object] | None] | None,
+    ) -> dict[str, object]:
+        _ = (method, url, headers, body, max_bytes)
+        assert redirect_guard is not None
+        denied = redirect_guard("https://evil.example.com/v1/pages", "GET")
+        assert denied is not None
+        return denied
+
+    with patch.object(broker, "_execute_with_redirects", side_effect=_fake_execute_with_redirects):
+        result = broker._execute_policy_request(
+            policy=policy,
+            integration_name="notion",
+            method="GET",
+            url="https://api.notion.com/v1/pages",
+            model_headers={},
+            body=None,
+        )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert result["integration"] == "notion"
+    assert result["requested_method"] == "GET"
+    assert result["requested_url"] == "https://evil.example.com/v1/pages"
+
+
 @responses.activate
 def test_handle_http_request_named_integration_success() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
@@ -1031,6 +1068,46 @@ def test_handle_web_search_redirect_to_disallowed_host_is_denied() -> None:
     assert len(responses.calls) == 1
     request_headers = responses.calls[0].request.headers
     assert "X-Subscription-Token" in request_headers
+
+
+@responses.activate
+def test_redirect_denials_match_between_http_request_and_web_search() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        status=302,
+        headers={"Location": "https://evil.example.com/search"},
+    )
+
+    http_result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+    search_result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert http_result["success"] is False
+    assert search_result["success"] is False
+    assert http_result["error"] == "policy_denied"
+    assert search_result["error"] == "policy_denied"
+    assert http_result["requested_method"] == "GET"
+    assert search_result["requested_method"] == "GET"
+    assert http_result["integration"] == "notion"
+    assert search_result["integration"] == "_web_search"
+    assert "allowed_hosts" in str(http_result.get("reason", ""))
+    assert "allowed_hosts" in str(search_result.get("reason", ""))
 
 
 def test_handle_list_integrations_via_host_service_registration() -> None:
