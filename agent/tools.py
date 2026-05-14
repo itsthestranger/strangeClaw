@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +14,6 @@ _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
 _HTTP_REQUEST_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
 _KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
-LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -33,7 +31,6 @@ class Tools:
     def __init__(self, config: dict[str, Any], broker: BrokerClient | None = None) -> None:
         self._config = dict(config)
         self._broker = broker
-        self._warn_if_deprecated_web_search_key_present()
         raw_tools = config.get("tools")
         if isinstance(raw_tools, dict):
             enabled: set[str] = {
@@ -44,17 +41,6 @@ class Tools:
         else:
             enabled = set(_KNOWN_TOOLS)
         self._enabled = enabled
-
-    def _warn_if_deprecated_web_search_key_present(self) -> None:
-        web_search = self._config.get("web_search")
-        if not isinstance(web_search, dict):
-            return
-        api_key = web_search.get("api_key")
-        if isinstance(api_key, str) and api_key.strip():
-            LOGGER.warning(
-                "web_search.api_key in config.yaml is deprecated and ignored. "
-                "Move it to secrets.yaml under credentials._web_search.token."
-            )
 
     def list_enabled(self) -> list[str]:
         """Return enabled tool names."""

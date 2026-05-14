@@ -200,7 +200,6 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         config["web_search"] = {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
             "max_results": 10,
         }
         web_search = config["web_search"]
@@ -220,15 +219,16 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         raise ConfigError("Config field web_search.format must be either 'brave' or 'searxng'.")
     web_search["format"] = normalized_format
 
-    api_key = web_search.get("api_key", "")
-    if not isinstance(api_key, str):
-        raise ConfigError("Config field web_search.api_key must be a string.")
-    web_search["api_key"] = api_key
-    if normalized_format == "brave" and not api_key.strip():
-        LOGGER.warning(
-            "web_search.format is brave but web_search.api_key is empty. "
-            "Brave requests will fail until an API key is set."
-        )
+    if "api_key" in web_search:
+        api_key = web_search.get("api_key")
+        if not isinstance(api_key, str):
+            raise ConfigError("Config field web_search.api_key must be a string when provided.")
+        if api_key.strip():
+            raise ConfigError(
+                "web_search.api_key is no longer supported. Move search credentials to "
+                "~/.strangeclaw/secrets.yaml under credentials._web_search.token."
+            )
+        web_search.pop("api_key", None)
 
     max_results_raw = web_search.get("max_results", 10)
     if isinstance(max_results_raw, bool):

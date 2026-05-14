@@ -260,15 +260,14 @@ def test_tools_http_request_handles_host_service_error() -> None:
     assert result.stderr == "offline"
 
 
-def test_tools_warns_when_web_search_api_key_present(caplog: pytest.LogCaptureFixture) -> None:
+def test_tools_does_not_emit_legacy_web_search_key_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level("WARNING")
 
-    _ = Tools(config={"web_search": {"api_key": "legacy-key"}})
+    _ = Tools(config={"web_search": {"api_key": ""}})
 
-    assert (
-        "web_search.api_key in config.yaml is deprecated and ignored. "
-        "Move it to secrets.yaml under credentials._web_search.token."
-    ) in caplog.text
+    assert "web_search.api_key" not in caplog.text
 
 
 def _unwrap_data(text: str) -> dict[str, Any]:

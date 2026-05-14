@@ -836,7 +836,11 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
     assert mmds_payload["config"]["web_search"] == {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
         "format": "brave",
+        "max_results": 10,
     }
+    assert "api_key" not in mmds_payload["config"]["web_search"]
+    assert "credentials" not in mmds_payload["config"]
+    assert "integrations" not in mmds_payload["config"]
 
     sandbox.stop()
     assert iptables_manager.cleaned is True
@@ -1529,6 +1533,7 @@ def _agent_config(
         "web_search": {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
+            "max_results": 10,
         },
         "web_fetch": {"max_chars": 20000},
         "skills": {"directory": "./skills", "max_file_chars": 20000},
