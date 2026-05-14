@@ -244,8 +244,15 @@ class Tools:
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
         wrapped = _wrap_external_data(result)
-        if result.get("success") is False:
+        success = result.get("success")
+        if success is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
+        if success is not True:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="invalid broker response for web_search: missing success envelope.",
+            )
         return ToolResult(exit_code=0, stdout=wrapped, stderr="")
 
     def _execute_web_fetch(self, args: dict[str, Any]) -> ToolResult:
@@ -263,8 +270,15 @@ class Tools:
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
         wrapped = _wrap_external_data(result)
-        if result.get("success") is False:
+        success = result.get("success")
+        if success is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
+        if success is not True:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="invalid broker response for web_fetch: missing success envelope.",
+            )
         return ToolResult(exit_code=0, stdout=wrapped, stderr="")
 
     def _execute_http_request(self, args: dict[str, Any]) -> ToolResult:
@@ -344,6 +358,13 @@ class Tools:
             )
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
+        success = result.get("success")
+        if success is not True and success is not False:
+            return ToolResult(
+                exit_code=1,
+                stdout="",
+                stderr="invalid broker response for http_request: missing success envelope.",
+            )
         result_payload = dict(result)
         body_value = result_payload.get("body", "")
         result_payload["body"] = _wrap_external_data(

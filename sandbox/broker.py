@@ -259,6 +259,7 @@ class RequestBroker:
             raw = b"".join(chunks)
             body_text = raw.decode(response.encoding or "utf-8", errors="replace")
             return {
+                "success": True,
                 "status_code": response.status_code,
                 "headers": dict(response.headers),
                 "body": body_text,

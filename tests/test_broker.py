@@ -323,6 +323,7 @@ def test_execute_returns_status_headers_body_without_truncation() -> None:
 
     result = broker._execute("GET", "https://example.com/data", {"X-Test": "1"}, None, 1024)
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["headers"]["Content-Type"] == "text/plain"
     assert result["body"] == "hello world"
@@ -342,6 +343,7 @@ def test_execute_truncates_when_body_exceeds_max_bytes() -> None:
 
     result = broker._execute("GET", "https://example.com/long", {}, None, 5)
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["body"] == "abcde"
     assert result["truncated"] is True
@@ -528,6 +530,7 @@ def test_handle_http_request_named_integration_success() -> None:
         }
     )
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["truncated"] is False
 
@@ -554,6 +557,7 @@ def test_handle_http_request_public_policy_success(monkeypatch: pytest.MonkeyPat
         }
     )
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["body"] == "hello"
 
