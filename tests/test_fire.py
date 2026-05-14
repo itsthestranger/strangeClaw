@@ -993,7 +993,37 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         sandbox.stop()
 
 
-def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(tmp_path: Path) -> None:
+def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reflected_token = "fire-broker-secret-token"
+    monkeypatch.setattr(
+        "sandbox.fire.load_secrets",
+        lambda: {
+            "notion": {
+                "name": "notion",
+                "auth_type": "bearer",
+                "token": reflected_token,
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["GET"],
+                "allowed_paths": ["/v1/*"],
+                "protected_headers": ["Authorization"],
+                "default_headers": {},
+                "max_response_bytes": 4096,
+                "rate_limit": None,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "sandbox.broker.RequestBroker._handle_list_integrations",
+        lambda self, payload: {  # noqa: ARG005
+            "success": True,
+            "integrations": ["notion"],
+            "echo": reflected_token,
+        },
+    )
+
     config = _build_firecracker_config(tmp_path)
     command_runner = _CopyingCommandRunner()
     tap_manager = _FakeTapManager(_build_allocation())
@@ -1067,6 +1097,13 @@ def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(tmp_pat
         ]
         assert any('"type":"broker_response"' in payload for payload in decoded_sent)
         assert any('"request_id":"req-1"' in payload for payload in decoded_sent)
+        broker_payloads = [
+            payload for payload in decoded_sent if '"type":"broker_response"' in payload
+        ]
+        assert broker_payloads
+        for payload in broker_payloads:
+            assert reflected_token not in payload
+            assert "[REDACTED]" in payload
     finally:
         sandbox.stop()
 

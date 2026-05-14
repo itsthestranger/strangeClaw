@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 from unittest.mock import patch
 
@@ -592,6 +593,141 @@ def test_handle_http_request_path_denied_and_no_token_leak() -> None:
         rendered = str(value)
         for token in secret_tokens:
             assert token not in rendered
+
+
+def test_handle_http_request_redacts_reflected_bearer_token() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    class _EchoResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        encoding = "utf-8"
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+            _ = chunk_size
+            return [self._body.encode("utf-8")]
+
+    def _fake_request(*args: object, **kwargs: object) -> _EchoResponse:
+        _ = args
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        auth = str(headers.get("Authorization", ""))
+        return _EchoResponse(f'{{"echo":"{auth}"}}')
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "notion",
+                "method": "POST",
+                "url": "https://api.notion.com/v1/pages",
+                "headers": {},
+                "body": '{"title":"x"}',
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_handle_http_request_redacts_reflected_custom_header_token() -> None:
+    creds = _credentials()
+    creds["custom"] = {
+        "name": "custom",
+        "auth_type": "header",
+        "header_name": "X-API-Key",
+        "token": "custom-header-secret-token",
+        "allowed_hosts": ["api.custom.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/v1/*"],
+        "protected_headers": ["Authorization", "X-API-Key"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    class _EchoResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        encoding = "utf-8"
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+            _ = chunk_size
+            return [self._body.encode("utf-8")]
+
+    def _fake_request(*args: object, **kwargs: object) -> _EchoResponse:
+        _ = args
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        token_header = str(headers.get("X-API-Key", ""))
+        return _EchoResponse(f'{{"echo":"{token_header}"}}')
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "custom",
+                "method": "GET",
+                "url": "https://api.custom.local/v1/check",
+                "headers": {},
+                "body": None,
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "custom-header-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_handle_http_request_redacts_token_in_exception_detail() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    with patch.object(
+        requests.Session,
+        "request",
+        side_effect=requests.ConnectionError("upstream echoed notion-secret-token"),
+    ):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "notion",
+                "method": "GET",
+                "url": "https://api.notion.com/v1/pages",
+                "headers": {},
+                "body": None,
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+@responses.activate
+def test_handle_web_fetch_redacts_token_in_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/page",
+        body="token leak search-secret-token in content",
+        status=200,
+        headers={"Content-Type": "text/plain"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/page"})
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "search-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
 
 
 @responses.activate

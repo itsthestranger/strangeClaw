@@ -61,6 +61,7 @@ class RequestBroker:
     def __init__(self, credentials: dict[str, Any], config: dict[str, Any]) -> None:
         self._credentials = credentials
         self._config = config
+        self._redaction_tokens = _collect_credential_tokens(credentials)
         self._rate_limiters: dict[str, _TokenBucket] = {}
         for integration, policy in credentials.items():
             if not isinstance(policy, dict):
@@ -77,14 +78,20 @@ class RequestBroker:
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
         action = payload.get("action")
         if action == "http_request":
-            return self._handle_http_request(payload)
-        if action == "web_fetch":
-            return self._handle_web_fetch(payload)
-        if action == "web_search":
-            return self._handle_web_search(payload)
-        if action == "list_integrations":
-            return self._handle_list_integrations(payload)
-        return {"success": False, "error": f"unknown action: {action}"}
+            result = self._handle_http_request(payload)
+        elif action == "web_fetch":
+            result = self._handle_web_fetch(payload)
+        elif action == "web_search":
+            result = self._handle_web_search(payload)
+        elif action == "list_integrations":
+            result = self._handle_list_integrations(payload)
+        else:
+            result = {"success": False, "error": f"unknown action: {action}"}
+
+        redacted = self._redact_value(result)
+        if isinstance(redacted, dict):
+            return redacted
+        return {"success": False, "error": "internal_error", "detail": "invalid broker response"}
 
     def _validate(
         self,
@@ -578,6 +585,25 @@ class RequestBroker:
         _ = payload
         return {"success": True, "integrations": list_integration_names(self._credentials)}
 
+    def _redact_value(self, value: Any) -> Any:
+        if not self._redaction_tokens:
+            return value
+        if isinstance(value, str):
+            return _redact_string(value, self._redaction_tokens)
+        if isinstance(value, dict):
+            redacted: dict[Any, Any] = {}
+            for key, item in value.items():
+                redacted_key = (
+                    _redact_string(key, self._redaction_tokens) if isinstance(key, str) else key
+                )
+                redacted[redacted_key] = self._redact_value(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_value(item) for item in value)
+        return value
+
     def _consume_rate_limit(self, integration: str) -> bool:
         limiter = self._rate_limiters.get(integration)
         if limiter is None:
@@ -649,6 +675,30 @@ class RequestBroker:
             return 10
         value = _to_positive_int(section.get("max_results"))
         return value if value is not None else 10
+
+
+def _collect_credential_tokens(credentials: dict[str, Any]) -> tuple[str, ...]:
+    tokens: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "token" and isinstance(item, str) and item:
+                    tokens.add(item)
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(credentials)
+    return tuple(sorted(tokens, key=len, reverse=True))
+
+
+def _redact_string(value: str, tokens: tuple[str, ...]) -> str:
+    redacted = value
+    for token in tokens:
+        redacted = redacted.replace(token, "[REDACTED]")
+    return redacted
 
 
 def _to_positive_int(value: Any) -> int | None:
