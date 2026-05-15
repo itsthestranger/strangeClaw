@@ -224,9 +224,8 @@ def test_tools_http_request_calls_broker_with_expected_payload() -> None:
     ]
     payload = _unwrap_data(result.stdout)
     assert payload["status_code"] == 201
-    wrapped_body = payload["body"]
-    assert isinstance(wrapped_body, str)
-    assert wrapped_body.startswith("--- BEGIN DATA ---\n")
+    assert payload["body"] == '{"ok":true}'
+    assert _wrapper_count(result.stdout) == 1
 
 
 def test_tools_http_request_broker_denial_returns_wrapped_payload() -> None:
@@ -251,6 +250,63 @@ def test_tools_http_request_broker_denial_returns_wrapped_payload() -> None:
     assert result.stderr == ""
     payload = _unwrap_data(result.stdout)
     assert payload["error"] == "policy_denied"
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_web_search_output_uses_single_data_wrapper() -> None:
+    broker = _RecordingBroker({"success": True, "results": []})
+    tools = Tools(config={"web_search": {"max_results": 10}}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "test"}))
+
+    assert result.exit_code == 0
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_web_fetch_output_uses_single_data_wrapper() -> None:
+    broker = _RecordingBroker(
+        {
+            "success": True,
+            "url": "https://example.com",
+            "status_code": 200,
+            "content_type": "text/plain",
+            "text": "hello",
+            "truncated": False,
+        }
+    )
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
+
+    assert result.exit_code == 0
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_http_request_body_preserves_raw_broker_value() -> None:
+    broker = _RecordingBroker(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": "raw-upstream-body",
+            "truncated": False,
+        }
+    )
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={"method": "GET", "url": "https://api.example.com"},
+        )
+    )
+
+    assert result.exit_code == 0
+    payload = _unwrap_data(result.stdout)
+    assert payload["body"] == "raw-upstream-body"
+    assert isinstance(payload["body"], str)
+    assert not payload["body"].startswith("--- BEGIN DATA ---")
+    assert _wrapper_count(result.stdout) == 1
 
 
 def test_tools_http_request_invalid_method_rejected() -> None:
@@ -317,3 +373,7 @@ def _unwrap_data(text: str) -> dict[str, Any]:
     loaded = json.loads(payload)
     assert isinstance(loaded, dict)
     return loaded
+
+
+def _wrapper_count(text: str) -> int:
+    return text.count("--- BEGIN DATA ---")

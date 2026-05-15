@@ -366,10 +366,6 @@ class Tools:
                 stderr="invalid broker response for http_request: missing success envelope.",
             )
         result_payload = dict(result)
-        body_value = result_payload.get("body", "")
-        result_payload["body"] = _wrap_external_data(
-            {"body": body_value if isinstance(body_value, str) else str(body_value)}
-        )
         wrapped = _wrap_external_data(result_payload)
         if result_payload.get("success") is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
