@@ -4,8 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import uuid
+from pathlib import Path
 from typing import Literal
+
+# Ensure repo-root imports resolve when this script is run as a file.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import load_config
 from sandbox.fire import FireSandbox, IptablesManager, TapDeviceManager, load_firecracker_config
@@ -132,6 +139,16 @@ def _verify_lifecycle(args: argparse.Namespace) -> int:
                 return 0
 
         print("LIFECYCLE_ERROR: did not receive done event within max-events limit")
+        process = getattr(sandbox, "_process", None)
+        if process is not None:
+            print(f"LIFECYCLE_PROCESS_EXIT={process.poll()}")
+        log_tail_fn = getattr(sandbox, "_read_log_tail_best_effort", None)
+        if callable(log_tail_fn):
+            log_tail = str(log_tail_fn())
+            if log_tail:
+                print("LIFECYCLE_LOG_TAIL_BEGIN")
+                print(log_tail)
+                print("LIFECYCLE_LOG_TAIL_END")
         return 2
     finally:
         sandbox.stop()
