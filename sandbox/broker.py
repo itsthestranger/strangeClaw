@@ -1,4 +1,4 @@
-"""Request broker policy validation primitives."""
+"""Host-side request broker for policy-validated HTTP/search/fetch execution."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ _WEB_FETCH_BODY_MULTIPLIER = 4
 _MAX_REDIRECT_HOPS = 5
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _PUBLIC_ALLOWED_SCHEMES = {"http", "https"}
+_Handler = Callable[[dict[str, Any]], dict[str, Any]]
+_RedirectGuard = Callable[[str, str], dict[str, Any] | None]
 
 
 @dataclass
@@ -75,13 +77,19 @@ class _TokenBucket:
 
 
 class RequestBroker:
-    """Host-side request broker (validation slice for C5.3)."""
+    """Host-side broker that validates, executes, and redacts outbound HTTP actions."""
 
     def __init__(self, credentials: dict[str, Any], config: dict[str, Any]) -> None:
         self._credentials = credentials
         self._policies: dict[str, Policy] = {}
         self._config = config
         self._redaction_tokens = _collect_credential_tokens(credentials)
+        self._handlers: dict[str, _Handler] = {
+            "http_request": self._handle_http_request,
+            "web_fetch": self._handle_web_fetch,
+            "web_search": self._handle_web_search,
+            "list_integrations": self._handle_list_integrations,
+        }
         self._rate_limiters: dict[str, _TokenBucket] = {}
         for integration, policy in credentials.items():
             normalized = _normalize_policy(integration, policy)
@@ -99,17 +107,13 @@ class RequestBroker:
             )
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
-        action = payload.get("action")
-        if action == "http_request":
-            result = self._handle_http_request(payload)
-        elif action == "web_fetch":
-            result = self._handle_web_fetch(payload)
-        elif action == "web_search":
-            result = self._handle_web_search(payload)
-        elif action == "list_integrations":
-            result = self._handle_list_integrations(payload)
+        action_raw = payload.get("action")
+        action = str(action_raw) if isinstance(action_raw, str) else ""
+        handler = self._handlers.get(action)
+        if handler is None:
+            result = {"success": False, "error": f"unknown action: {action_raw}"}
         else:
-            result = {"success": False, "error": f"unknown action: {action}"}
+            result = handler(payload)
 
         redacted = self._redact_value(result)
         if isinstance(redacted, dict):
@@ -367,11 +371,7 @@ class RequestBroker:
 
     def _handle_http_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         integration = payload.get("integration")
-        method = str(payload.get("method", "GET")).upper()
-        url = str(payload.get("url", ""))
-        model_headers = _normalize_headers(payload.get("headers"))
-        body_raw = payload.get("body")
-        body = body_raw if isinstance(body_raw, str) or body_raw is None else str(body_raw)
+        method, url, model_headers, body = _parse_http_request_payload(payload)
 
         if isinstance(integration, str) and integration:
             policy = self._policies.get(integration)
@@ -417,9 +417,15 @@ class RequestBroker:
         body: str | None,
         rate_limit_key: str | None = None,
     ) -> dict[str, Any]:
-        validation = self._validate(policy, method, url, model_headers)
-        if not validation.allowed:
-            return self._deny(integration_name, method, url, validation.reason or "policy denied")
+        validation_denial = self._validate_or_deny(
+            policy=policy,
+            integration_name=integration_name,
+            method=method,
+            url=url,
+            model_headers=model_headers,
+        )
+        if validation_denial is not None:
+            return validation_denial
 
         if rate_limit_key is not None and not self._consume_rate_limit(rate_limit_key):
             return {
@@ -429,20 +435,11 @@ class RequestBroker:
             }
 
         final_headers, final_url = self._inject(policy, model_headers, url)
-
-        def policy_redirect_guard(
-            redirect_url: str,
-            redirect_method: str,
-        ) -> dict[str, Any] | None:
-            hop_validation = self._validate(policy, redirect_method, redirect_url, model_headers)
-            if not hop_validation.allowed:
-                return self._deny(
-                    integration_name,
-                    redirect_method,
-                    redirect_url,
-                    hop_validation.reason or "policy denied",
-                )
-            return None
+        redirect_guard = self._make_policy_redirect_guard(
+            policy=policy,
+            integration_name=integration_name,
+            model_headers=model_headers,
+        )
 
         return self._execute_with_redirects(
             method=method,
@@ -450,7 +447,7 @@ class RequestBroker:
             headers=final_headers,
             body=body,
             max_bytes=policy.max_response_bytes,
-            redirect_guard=policy_redirect_guard,
+            redirect_guard=redirect_guard,
         )
 
     def _execute_public_request(
@@ -468,50 +465,33 @@ class RequestBroker:
         enforce_redirect_ssrf: bool,
     ) -> dict[str, Any]:
         if enforce_validation:
-            validation = self._validate(policy, method, url, model_headers)
-            if not validation.allowed:
-                return self._deny(
-                    integration_name,
-                    method,
-                    url,
-                    validation.reason or "policy denied",
-                )
+            validation_denial = self._validate_or_deny(
+                policy=policy,
+                integration_name=integration_name,
+                method=method,
+                url=url,
+                model_headers=model_headers,
+            )
+            if validation_denial is not None:
+                return validation_denial
 
         if enforce_initial_ssrf:
-            ssrf = self._ssrf_check(url)
-            if not ssrf.allowed:
-                return self._deny(integration_name, method, url, ssrf.reason or "SSRF denied")
+            ssrf_denial = self._ssrf_or_deny(
+                integration_name=integration_name,
+                method=method,
+                url=url,
+            )
+            if ssrf_denial is not None:
+                return ssrf_denial
 
         final_headers, final_url = self._inject(policy, model_headers, url)
-
-        def public_redirect_guard(
-            redirect_url: str,
-            redirect_method: str,
-        ) -> dict[str, Any] | None:
-            if enforce_validation:
-                hop_validation = self._validate(
-                    policy,
-                    redirect_method,
-                    redirect_url,
-                    model_headers,
-                )
-                if not hop_validation.allowed:
-                    return self._deny(
-                        integration_name,
-                        redirect_method,
-                        redirect_url,
-                        hop_validation.reason or "policy denied",
-                    )
-            if enforce_redirect_ssrf:
-                ssrf = self._ssrf_check(redirect_url)
-                if not ssrf.allowed:
-                    return self._deny(
-                        integration_name,
-                        redirect_method,
-                        redirect_url,
-                        ssrf.reason or "SSRF denied",
-                    )
-            return None
+        redirect_guard = self._make_public_redirect_guard(
+            policy=policy,
+            integration_name=integration_name,
+            model_headers=model_headers,
+            enforce_validation=enforce_validation,
+            enforce_redirect_ssrf=enforce_redirect_ssrf,
+        )
 
         return self._execute_with_redirects(
             method=method,
@@ -519,8 +499,82 @@ class RequestBroker:
             headers=final_headers,
             body=body,
             max_bytes=max_bytes,
-            redirect_guard=public_redirect_guard,
+            redirect_guard=redirect_guard,
         )
+
+    def _validate_or_deny(
+        self,
+        *,
+        policy: Policy,
+        integration_name: str,
+        method: str,
+        url: str,
+        model_headers: dict[str, str],
+    ) -> dict[str, Any] | None:
+        validation = self._validate(policy, method, url, model_headers)
+        if validation.allowed:
+            return None
+        return self._deny(integration_name, method, url, validation.reason or "policy denied")
+
+    def _ssrf_or_deny(
+        self,
+        *,
+        integration_name: str,
+        method: str,
+        url: str,
+    ) -> dict[str, Any] | None:
+        ssrf = self._ssrf_check(url)
+        if ssrf.allowed:
+            return None
+        return self._deny(integration_name, method, url, ssrf.reason or "SSRF denied")
+
+    def _make_policy_redirect_guard(
+        self,
+        *,
+        policy: Policy,
+        integration_name: str,
+        model_headers: dict[str, str],
+    ) -> _RedirectGuard:
+        def guard(redirect_url: str, redirect_method: str) -> dict[str, Any] | None:
+            return self._validate_or_deny(
+                policy=policy,
+                integration_name=integration_name,
+                method=redirect_method,
+                url=redirect_url,
+                model_headers=model_headers,
+            )
+
+        return guard
+
+    def _make_public_redirect_guard(
+        self,
+        *,
+        policy: Policy,
+        integration_name: str,
+        model_headers: dict[str, str],
+        enforce_validation: bool,
+        enforce_redirect_ssrf: bool,
+    ) -> _RedirectGuard:
+        def guard(redirect_url: str, redirect_method: str) -> dict[str, Any] | None:
+            if enforce_validation:
+                validation_denial = self._validate_or_deny(
+                    policy=policy,
+                    integration_name=integration_name,
+                    method=redirect_method,
+                    url=redirect_url,
+                    model_headers=model_headers,
+                )
+                if validation_denial is not None:
+                    return validation_denial
+            if enforce_redirect_ssrf:
+                return self._ssrf_or_deny(
+                    integration_name=integration_name,
+                    method=redirect_method,
+                    url=redirect_url,
+                )
+            return None
+
+        return guard
 
     def _handle_web_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = str(payload.get("url", ""))
@@ -868,6 +922,17 @@ def _to_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_http_request_payload(
+    payload: dict[str, Any],
+) -> tuple[str, str, dict[str, str], str | None]:
+    method = str(payload.get("method", "GET")).upper()
+    url = str(payload.get("url", ""))
+    model_headers = _normalize_headers(payload.get("headers"))
+    body_raw = payload.get("body")
+    body = body_raw if isinstance(body_raw, str) or body_raw is None else str(body_raw)
+    return method, url, model_headers, body
 
 
 def _normalize_headers(value: Any) -> dict[str, str]:
