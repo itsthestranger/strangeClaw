@@ -20,6 +20,7 @@ firecracker/rootfs/*.upstream
 Agents.md
 todo.md
 tool_use_error.md
+secrets.yaml
 
 web-search-not-working.md
 web-search-not-working-again.md

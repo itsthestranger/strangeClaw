@@ -30,6 +30,24 @@ ROUNDTRIP_EVENTS = [
         "args": {"command": "python3 --version"},
         "result": {"exit_code": 0, "stdout": "Python 3.13.0", "stderr": ""},
     },
+    {
+        "type": "broker_request",
+        "request_id": "abc123",
+        "service": "broker",
+        "payload": {"action": "list_integrations"},
+    },
+    {
+        "type": "broker_response",
+        "request_id": "abc123",
+        "success": True,
+        "payload": {"success": True, "integrations": ["notion"]},
+    },
+    {
+        "type": "broker_response",
+        "request_id": "def456",
+        "success": False,
+        "error": "policy_denied",
+    },
     {"type": "done", "success": True, "reply": "done", "state": {"goal": "x"}, "files": []},
 ]
 

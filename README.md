@@ -149,6 +149,8 @@ LM Studio loopback gotcha:
 - Optional redacted session event journal (`events.jsonl`).
 - Optional Firecracker runtime log artifact export to session outputs.
 - Optional Fire-mode local LLM routing via `firecracker.host_expose`.
+- Host-side request broker for `web_search`, `web_fetch`, and `http_request`
+  so external API credentials stay out of the sandbox.
 
 ## Architecture
 
@@ -158,8 +160,30 @@ High-level runtime shape:
 Host (main/coordinator/adapters)
   -> Sandbox (Yolo or Fire)
     -> Agent loop (plan -> inspect -> choose -> act -> observe -> repeat)
-      -> Skills + LLM calls inside sandbox
+      -> Tools + skills + LLM calls inside sandbox
+      -> HTTP/search/API calls via host-side broker
 ```
+
+## Tools vs Skills
+
+Tools are capabilities. They are built into strangeclaw, can be enabled or
+disabled in `config.yaml`, and are the permission boundary:
+
+- `shell`: run shell commands. High risk.
+- `web_search`: search via the host broker. Low risk.
+- `web_fetch`: fetch and extract public URL content via the host broker. Low risk.
+- `http_request`: make structured HTTP/API calls via the host broker. Medium risk.
+
+Skills are instructions and workflow context. A skill is a directory under
+`skills/` with a `SKILL.md` file using YAML frontmatter, plus optional
+`references/`, `scripts/`, and `assets/` files. Installing a skill grants no new
+permissions. A skill can only cause effects through enabled tools.
+
+Adding a skill means dropping a directory into `skills/`. During planning, the
+agent sees only each skill's name and description. During execution, referenced
+skills are activated and their docs are added to context. Bundled files are read
+on demand through `agent_read_skill_file`; bundled scripts are only executable if
+the `shell` tool is enabled.
 
 ## Agentic Loop Contract
 
@@ -173,17 +197,49 @@ Host (main/coordinator/adapters)
 - The runtime does not choose actions for the model; it only validates, executes, and feeds observations back into history.
 - Runtime-owned safety exits still exist (iteration guard, stop/shutdown, sandbox/runtime failures).
 
-## Web Search Configuration
+## Tool Configuration
 
-`web_search` is configured via `config.yaml` (not environment-variable override).
-Set:
+Enable or disable tools in `config.yaml`:
+
+```yaml
+tools:
+  shell: true
+  web_search: true
+  web_fetch: true
+  http_request: true
+```
+
+Disabled tools are removed from the model's action surface. If a skill depends
+on a disabled tool, that skill remains readable documentation but cannot perform
+the blocked action.
+
+## Web Search Setup
+
+`web_search` uses two config locations:
+
+- `config.yaml` selects the endpoint and response format.
+- `~/.strangeclaw/secrets.yaml` holds the optional `_web_search` credential.
+
+Brave quick-start in `config.yaml`:
 
 ```yaml
 web_search:
   endpoint: "https://api.search.brave.com/res/v1/web/search"
-  format: "brave"      # or "searxng"
-  api_key: ""          # required for brave
+  format: "brave"
   max_results: 10
+```
+
+Add the Brave key to `~/.strangeclaw/secrets.yaml`:
+
+```yaml
+credentials:
+  _web_search:
+    auth_type: header
+    header_name: X-Subscription-Token
+    token: "..."
+    allowed_hosts: ["api.search.brave.com"]
+    allowed_methods: [GET]
+    allowed_paths: ["/*"]
 ```
 
 Behavior:
@@ -200,9 +256,13 @@ SearXNG local setup note:
   web_search:
     endpoint: "http://localhost:8080/search"
     format: "searxng"
-    api_key: ""
     max_results: 10
   ```
+- For local SearXNG without authentication, keep the `_web_search` entry in
+  `secrets.yaml` so the broker knows the allowed host and policy. The current
+  secrets loader requires a non-empty `token`, so use a non-secret placeholder
+  value if your SearXNG instance does not need one (for example
+  `"unused-local-searxng-token"`).
 - In SearXNG's `settings.yml`, allow JSON output or requests with
   `format=json` will be rejected. The relevant setting is:
   ```yaml
@@ -212,10 +272,52 @@ SearXNG local setup note:
       - json
   ```
 
-Future direction:
-- A host-side request broker is planned and currently in work. Once complete,
-  HTTP/search/API requests and credential injection will move behind a host-side
-  policy layer so secrets do not need to be sent into the agent sandbox.
+## External API Integrations
+
+All HTTP egress for `http_request`, `web_fetch`, and `web_search` goes through
+the host-side request broker.
+
+For authenticated APIs, the model calls `http_request` with an integration name:
+
+```json
+{
+  "integration": "github",
+  "method": "GET",
+  "url": "https://api.github.com/user/repos",
+  "headers": {},
+  "body": null
+}
+```
+
+The broker executes the call only if `~/.strangeclaw/secrets.yaml` contains a
+matching `credentials.github` entry. It validates method, host, path, protected
+headers, response size, and rate limits before injecting the credential. The
+model never sees token values.
+As a deliberate security decision, integration auth supports only `bearer` and
+`header` modes. Query-string credential injection (`auth_type: query`) is not
+supported.
+
+A skill without a matching credentials entry is inert at execution time. For
+example, the `notion` skill can teach the model Notion API shapes, but Notion
+calls are denied until `credentials.notion` exists.
+
+## Setting Up `secrets.yaml`
+
+Start from the example file:
+
+```bash
+cp secrets.example.yaml ~/.strangeclaw/secrets.yaml
+chmod 600 ~/.strangeclaw/secrets.yaml
+```
+
+Then fill in only the credentials you want to authorize. Common entries are:
+
+- `credentials._web_search` for Brave or SearXNG-backed `web_search`.
+- `credentials.notion` for the `notion` skill.
+- `credentials.github` for the `github` skill.
+
+Policy fields in `secrets.yaml` are the authorization boundary. Keep
+`allowed_hosts`, `allowed_methods`, and `allowed_paths` as narrow as practical.
 
 ## Skills Config Defaults
 

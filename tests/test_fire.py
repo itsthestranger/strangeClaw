@@ -23,6 +23,7 @@ from sandbox.fire import (
     TapDeviceManager,
     TapNetworkAllocation,
     VMBootError,
+    _assert_no_secrets,
     _default_popen_factory,
     configure_microvm_preboot,
     load_firecracker_config,
@@ -226,8 +227,6 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
-                "max_results": 10,
             },
             "web_fetch": {"max_chars": 20000},
             "skills": {"directory": "./skills", "max_file_chars": 20000},
@@ -305,6 +304,46 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
             api_client=_NoopClient(),
             config=config,
             preboot=preboot,
+        )
+
+
+def test_assert_no_secrets_raises_on_token_leak() -> None:
+    with pytest.raises(ValueError, match=r"credential leaked into MMDS: notion"):
+        _assert_no_secrets(
+            mmds_json='{"config":{"llm":{"api_key":"safe"},"web_search":{"endpoint":"x"}},"token":"notion-secret"}',
+            credentials={
+                "notion": {"token": "notion-secret"},
+                "_web_search": {"token": "search-secret"},
+            },
+        )
+
+
+def test_configure_microvm_preboot_rejects_credentials_in_mmds_payload(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    preboot = _build_preboot_config(
+        tmp_path,
+        agent_config={
+            "llm": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "sk-host",
+                "max_tokens": 1024,
+                "temperature": 0.2,
+            },
+            "web_search": {
+                "endpoint": "https://api.search.brave.com/res/v1/web/search",
+                "format": "brave",
+            },
+            "skills": {"directory": "./skills", "max_file_chars": 20000},
+            "leak": "ghp-secret-leak",
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"credential leaked into MMDS: github"):
+        configure_microvm_preboot(
+            api_client=_NoopClient(),
+            config=config,
+            preboot=preboot,
+            credentials={"github": {"token": "ghp-secret-leak"}},
         )
 
 
@@ -793,6 +832,15 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
         "/mmds",
         "/actions",
     ]
+    mmds_payload = api_factory.payload_for("/mmds")
+    assert mmds_payload["config"]["web_search"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    assert "api_key" not in mmds_payload["config"]["web_search"]
+    assert "credentials" not in mmds_payload["config"]
+    assert "integrations" not in mmds_payload["config"]
 
     sandbox.stop()
     assert iptables_manager.cleaned is True
@@ -945,6 +993,121 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         assert done_event["files"]
         assert done_event["files"][0]["path"] == "artifact.txt"
         assert not done_event["files"][0]["path"].startswith("/")
+    finally:
+        sandbox.stop()
+
+
+def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reflected_token = "fire-broker-secret-token"
+    monkeypatch.setattr(
+        "sandbox.fire.load_secrets",
+        lambda: {
+            "notion": {
+                "name": "notion",
+                "auth_type": "bearer",
+                "token": reflected_token,
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["GET"],
+                "allowed_paths": ["/v1/*"],
+                "protected_headers": ["Authorization"],
+                "default_headers": {},
+                "max_response_bytes": 4096,
+                "rate_limit": None,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "sandbox.broker.RequestBroker._handle_list_integrations",
+        lambda self, payload: {  # noqa: ARG005
+            "success": True,
+            "integrations": ["notion"],
+            "echo": reflected_token,
+        },
+    )
+
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+
+    event_stream: list[dict[str, Any]] = [
+        {"type": "agent_ready"},
+        {
+            "type": "broker_request",
+            "request_id": "req-1",
+            "service": "broker",
+            "payload": {"action": "list_integrations"},
+        },
+        {"type": "message", "role": "status", "content": "working"},
+        {
+            "type": "done",
+            "success": True,
+            "reply": "ok",
+            "state": {"goal": "x"},
+            "files": [],
+        },
+    ]
+    stream_chunk = (
+        b"OK 100\n" + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+    )
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[stream_chunk])]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "broker roundtrip",
+                "session_id": "sess-broker-fire",
+                "approval_mode": "auto",
+            }
+        )
+        event_one = sandbox.receive(timeout_seconds=1.0)
+        event_two = sandbox.receive(timeout_seconds=1.0)
+        assert event_one == {"type": "message", "role": "status", "content": "working"}
+        assert event_two is not None
+        assert event_two["type"] == "done"
+
+        sent_payloads = socket_factory.sockets[0].sent
+        decoded_sent = [
+            payload.decode("utf-8", errors="replace")
+            for payload in sent_payloads
+            if payload.startswith(b"{")
+        ]
+        assert any('"type":"broker_response"' in payload for payload in decoded_sent)
+        assert any('"request_id":"req-1"' in payload for payload in decoded_sent)
+        broker_payloads = [
+            payload for payload in decoded_sent if '"type":"broker_response"' in payload
+        ]
+        assert broker_payloads
+        for payload in broker_payloads:
+            assert reflected_token not in payload
+            assert "[REDACTED]" in payload
     finally:
         sandbox.stop()
 
@@ -1370,7 +1533,6 @@ def _agent_config(
         "web_search": {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
             "max_results": 10,
         },
         "web_fetch": {"max_chars": 20000},

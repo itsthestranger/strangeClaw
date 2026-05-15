@@ -55,10 +55,10 @@ def test_repository_notion_skill_is_self_contained() -> None:
     skill_md = doc["skill_md"]
     assert "`http_request`" in skill_md
     assert 'integration: "notion"' in skill_md
-    assert "integrations.notion.token" in skill_md
+    assert "Configured integrations" in skill_md
+    assert "host-side broker" in skill_md
     assert "https://api.notion.com" in skill_md
     assert "POST /v1/data_sources/{data_source_id}/query" in skill_md
-    assert "Notion-Version" in skill_md
 
 
 def test_repository_github_skill_is_self_contained() -> None:
@@ -69,7 +69,8 @@ def test_repository_github_skill_is_self_contained() -> None:
     skill_md = doc["skill_md"]
     assert "`http_request`" in skill_md
     assert 'integration: "github"' in skill_md
-    assert "integrations.github.token" in skill_md
+    assert "Configured integrations" in skill_md
+    assert "host-side broker" in skill_md
     assert "https://api.github.com" in skill_md
     assert "POST /repos/{owner}/{repo}/issues" in skill_md
     assert "GET /repos/{owner}/{repo}/pulls" in skill_md

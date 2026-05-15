@@ -115,12 +115,10 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["web_search"] == {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
         "format": "brave",
-        "api_key": "",
         "max_results": 10,
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
-    assert loaded["integrations"] == {}
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -249,10 +247,44 @@ def test_load_config_rejects_invalid_web_search_format(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_load_config_warns_when_brave_without_api_key(
+def test_load_config_allows_brave_without_web_search_api_key(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_search"] = {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["web_search"]["format"] == "brave"
+    assert "api_key" not in loaded["web_search"]
+
+
+def test_load_config_rejects_legacy_web_search_api_key(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_search"] = {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "api_key": "secret-key",
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"web_search\.api_key is no longer supported\. Move search credentials to "
+            r"~/.strangeclaw/secrets\.yaml under credentials\._web_search\.token\."
+        ),
+    ):
+        load_config(config_path)
+
+
+def test_load_config_accepts_empty_legacy_web_search_api_key_and_strips_it(tmp_path: Path) -> None:
     config = _base_config(api_key="plain-key")
     config["web_search"] = {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
@@ -262,11 +294,13 @@ def test_load_config_warns_when_brave_without_api_key(
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
 
-    with caplog.at_level("WARNING"):
-        loaded = load_config(config_path)
+    loaded = load_config(config_path)
 
-    assert loaded["web_search"]["format"] == "brave"
-    assert "web_search.api_key is empty" in caplog.text
+    assert loaded["web_search"] == {
+        "endpoint": "https://api.search.brave.com/res/v1/web/search",
+        "format": "brave",
+        "max_results": 10,
+    }
 
 
 def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None:
@@ -279,56 +313,13 @@ def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None
         load_config(config_path)
 
 
-def test_load_config_normalizes_generic_integrations(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("NOTION_TOKEN", "notion-secret")
-    monkeypatch.setenv("JIRA_TOKEN", "jira-secret")
+def test_load_config_rejects_legacy_integrations_field(tmp_path: Path) -> None:
     config = _base_config(api_key="plain-key")
-    config["integrations"] = {
-        "notion": {
-            "token": "${NOTION_TOKEN}",
-            "auth": {"type": "bearer"},
-            "default_headers": {"Notion-Version": "2026-03-11"},
-        },
-        "jira": {
-            "token": "${JIRA_TOKEN}",
-            "auth": {"type": "header", "header": "X-API-Key"},
-            "default_headers": {"Accept": "application/json"},
-        },
-    }
+    config["integrations"] = {}
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
 
-    loaded = load_config(config_path)
-
-    assert loaded["integrations"] == {
-        "notion": {
-            "token": "notion-secret",
-            "auth": {"type": "bearer"},
-            "default_headers": {"Notion-Version": "2026-03-11"},
-        },
-        "jira": {
-            "token": "jira-secret",
-            "auth": {"type": "header", "header": "X-API-Key", "prefix": ""},
-            "default_headers": {"Accept": "application/json"},
-        },
-    }
-
-
-def test_load_config_rejects_invalid_integration_config(tmp_path: Path) -> None:
-    config = _base_config(api_key="plain-key")
-    config["integrations"] = {"bad provider": {"token": "x"}}
-    config_path = tmp_path / "config.yaml"
-    _write_config(config_path, config)
-
-    with pytest.raises(ConfigError, match="integrations keys"):
-        load_config(config_path)
-
-    config["integrations"] = {"jira": {"token": "x", "auth": {"type": "header"}}}
-    _write_config(config_path, config)
-    with pytest.raises(ConfigError, match=r"integrations\.jira\.auth\.header"):
+    with pytest.raises(ConfigError, match=r"integrations is no longer supported"):
         load_config(config_path)
 
 
@@ -354,6 +345,10 @@ def test_fire_sanitized_skills_match_loaded_config_defaults(tmp_path: Path) -> N
     fire_payload = _sanitize_agent_config_for_mmds(loaded)
 
     assert fire_payload["skills"] == loaded["skills"]
+    assert fire_payload["web_search"] == loaded["web_search"]
+    assert fire_payload["web_search"]["max_results"] == 10
+    assert "api_key" not in fire_payload["web_search"]
+    assert "integrations" not in fire_payload
 
 
 def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> None:

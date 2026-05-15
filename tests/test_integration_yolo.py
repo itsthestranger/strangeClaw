@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+import requests
+
+import session
+from adapters.session_persistence import persist_done_event
 from agent.llm import LLMResponse, ToolCall
 from agent.tools import Tools
 from sandbox.yolo import YoloSandbox
@@ -91,6 +96,17 @@ def _collect_until_done(
             sandbox.send({"type": "user_reply", **clarify_replies.pop(0)})
         if event["type"] == "done":
             return events
+
+
+def _unwrap_data(text: str) -> dict[str, Any]:
+    prefix = "--- BEGIN DATA ---\n"
+    suffix = "\n--- END DATA ---"
+    assert text.startswith(prefix)
+    assert text.endswith(suffix)
+    payload = text[len(prefix) : -len(suffix)]
+    loaded = json.loads(payload)
+    assert isinstance(loaded, dict)
+    return loaded
 
 
 def test_yolo_integration_success_path() -> None:
@@ -393,3 +409,173 @@ def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> Non
     assert done_event["type"] == "done"
     assert done_event["success"] is True
     assert done_event["reply"] == "autonomous done"
+
+
+def test_yolo_integration_missing_notion_credentials_denial_no_retry(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr("sandbox.yolo.load_secrets", lambda: {})
+    llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["create notion page"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="http_request",
+                    args={
+                        "integration": "notion",
+                        "method": "POST",
+                        "url": "https://api.notion.com/v1/pages",
+                        "headers": {},
+                        "body": "{\"parent\":{\"data_source_id\":\"abc\"}}",
+                    },
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="agent_done",
+                    args={"reply": "Notion integration is not configured; cannot continue."},
+                ),
+                usage=None,
+            ),
+        ]
+    )
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
+    sandbox.run(_task())
+    try:
+        events = _collect_until_done(sandbox)
+    finally:
+        sandbox.stop()
+
+    http_actions = [
+        event
+        for event in events
+        if event["type"] == "action" and event["tool"] == "http_request"
+    ]
+    assert len(http_actions) == 1
+    denial_payload = _unwrap_data(http_actions[0]["result"]["stdout"])
+    assert denial_payload["error"] == "policy_denied"
+    assert denial_payload["integration"] == "notion"
+    assert denial_payload["requested_method"] == "POST"
+    assert denial_payload["requested_url"] == "https://api.notion.com/v1/pages"
+    assert "not found in secrets.yaml" in denial_payload["reason"]
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    assert "not configured" in done_event["reply"].lower()
+
+
+def test_yolo_integration_broker_redaction_propagates_to_events_and_persistence(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "sandbox.yolo.load_secrets",
+        lambda: {
+            "notion": {
+                "name": "notion",
+                "auth_type": "bearer",
+                "token": "notion-secret-token",
+                "allowed_hosts": ["api.notion.com"],
+                "allowed_methods": ["POST"],
+                "allowed_paths": ["/v1/*"],
+                "protected_headers": ["Authorization"],
+                "default_headers": {},
+                "max_response_bytes": 4096,
+                "rate_limit": None,
+            }
+        },
+    )
+    llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["call notion"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="http_request",
+                    args={
+                        "integration": "notion",
+                        "method": "POST",
+                        "url": "https://api.notion.com/v1/pages",
+                        "headers": {},
+                        "body": '{"title":"x"}',
+                    },
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "finished"}),
+                usage=None,
+            ),
+        ]
+    )
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: llm,
+        agent_config=_agent_config(),
+    )
+
+    class _EchoResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        encoding = "utf-8"
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+            _ = chunk_size
+            return [self._body.encode("utf-8")]
+
+    def _fake_request(*args: object, **kwargs: object) -> _EchoResponse:
+        _ = args
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        authorization = str(headers.get("Authorization", ""))
+        return _EchoResponse(f'{{"echo":"{authorization}"}}')
+
+    sandbox.run(
+        {
+            "type": "task",
+            "text": "integration task",
+            "session_id": "sess-redaction",
+            "approval_mode": "auto",
+        }
+    )
+    try:
+        with patch.object(requests.Session, "request", side_effect=_fake_request):
+            events = _collect_until_done(sandbox)
+    finally:
+        sandbox.stop()
+
+    action_events = [
+        event
+        for event in events
+        if event["type"] == "action" and event["tool"] == "http_request"
+    ]
+    assert len(action_events) == 1
+    action_event = action_events[0]
+    action_payload = _unwrap_data(action_event["result"]["stdout"])
+    rendered_action = json.dumps(action_payload, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered_action
+    assert "[REDACTED]" in rendered_action
+
+    done_event = events[-1]
+    assert done_event["type"] == "done"
+    rendered_state = json.dumps(done_event["state"], ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered_state
+
+    persist_done_event(session_id="sess-redaction", done_event=done_event)
+    session_dir = session.create("sess-redaction")
+    state_on_disk = session.load(session_dir)
+    assert isinstance(state_on_disk, dict)
+    rendered_persisted = json.dumps(state_on_disk, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered_persisted
