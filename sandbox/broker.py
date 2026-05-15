@@ -24,6 +24,7 @@ _DEFAULT_WEB_FETCH_MAX_CHARS = 20000
 _WEB_FETCH_BODY_MULTIPLIER = 4
 _MAX_REDIRECT_HOPS = 5
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_PUBLIC_ALLOWED_SCHEMES = {"http", "https"}
 
 
 @dataclass
@@ -203,11 +204,21 @@ class RequestBroker:
 
     def _ssrf_check(self, url: str) -> PolicyResult:
         parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in _PUBLIC_ALLOWED_SCHEMES:
+            label = scheme or "<none>"
+            return PolicyResult(
+                allowed=False,
+                reason=f"unsupported URL scheme '{label}' for public URL policy",
+            )
+
         hostname = parsed.hostname
         if not hostname:
             return PolicyResult(allowed=False, reason="DNS resolution failed for <unknown>")
 
         try:
+            # DNS rebinding remains possible between resolution and connect; this
+            # helper is a best-effort policy gate and not DNS pinning.
             infos = socket.getaddrinfo(hostname, None)
         except socket.gaierror:
             return PolicyResult(allowed=False, reason=f"DNS resolution failed for {hostname}")
@@ -221,10 +232,11 @@ class RequestBroker:
                 ip_obj = ipaddress.ip_address(ip_text)
             except ValueError:
                 continue
-            if self._is_reserved_ip(ip_obj):
+            normalized_ip = self._normalize_public_ip(ip_obj)
+            if self._is_blocked_public_ip(normalized_ip):
                 return PolicyResult(
                     allowed=False,
-                    reason=f"SSRF: {hostname} resolves to reserved address {ip_text}",
+                    reason=f"SSRF: {hostname} resolves to blocked address {normalized_ip}",
                 )
 
         return PolicyResult(allowed=True, reason=None)
@@ -238,6 +250,7 @@ class RequestBroker:
         max_bytes: int,
     ) -> dict[str, Any]:
         session = requests.Session()
+        session.trust_env = False
         try:
             response = session.request(
                 method=method,
@@ -335,17 +348,22 @@ class RequestBroker:
             current_url = next_url
 
     @staticmethod
-    def _is_reserved_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        reserved_ranges = (
-            ipaddress.ip_network("10.0.0.0/8"),
-            ipaddress.ip_network("172.16.0.0/12"),
-            ipaddress.ip_network("192.168.0.0/16"),
-            ipaddress.ip_network("127.0.0.0/8"),
-            ipaddress.ip_network("169.254.0.0/16"),
-            ipaddress.ip_network("::1/128"),
-            ipaddress.ip_network("fc00::/7"),
+    def _normalize_public_ip(
+        ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+            return ip_obj.ipv4_mapped
+        return ip_obj
+
+    @staticmethod
+    def _is_blocked_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return bool(
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
         )
-        return any(ip_obj in net for net in reserved_ranges)
 
     def _handle_http_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         integration = payload.get("integration")

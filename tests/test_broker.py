@@ -185,6 +185,23 @@ def _fake_getaddrinfo(ip: str) -> list[tuple[object, object, object, object, tup
     return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
 
 
+def _fake_getaddrinfo_v6(
+    ip: str,
+) -> list[tuple[object, object, object, object, tuple[str, int, int, int]]]:
+    return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, 0, 0, 0))]
+
+
+def test_ssrf_check_denies_unsupported_scheme() -> None:
+    broker = _broker()
+
+    result = broker._ssrf_check("ftp://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="unsupported URL scheme 'ftp' for public URL policy",
+    )
+
+
 def test_ssrf_check_denies_10_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
     monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("10.1.2.3"))
@@ -193,7 +210,7 @@ def test_ssrf_check_denies_10_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 10.1.2.3",
+        reason="SSRF: example.com resolves to blocked address 10.1.2.3",
     )
 
 
@@ -209,7 +226,7 @@ def test_ssrf_check_denies_172_16_slash_12(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 172.16.12.34",
+        reason="SSRF: example.com resolves to blocked address 172.16.12.34",
     )
 
 
@@ -225,7 +242,7 @@ def test_ssrf_check_denies_192_168_slash_16(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 192.168.55.9",
+        reason="SSRF: example.com resolves to blocked address 192.168.55.9",
     )
 
 
@@ -241,7 +258,7 @@ def test_ssrf_check_denies_127_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 127.0.0.1",
+        reason="SSRF: example.com resolves to blocked address 127.0.0.1",
     )
 
 
@@ -257,35 +274,135 @@ def test_ssrf_check_denies_169_254_slash_16(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 169.254.22.7",
+        reason="SSRF: example.com resolves to blocked address 169.254.22.7",
+    )
+
+
+def test_ssrf_check_denies_ipv4_unspecified(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("0.0.0.0"))
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address 0.0.0.0",
+    )
+
+
+def test_ssrf_check_denies_ipv4_multicast(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo("224.0.0.1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address 224.0.0.1",
     )
 
 
 def test_ssrf_check_denies_ipv6_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
-    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("::1"))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo_v6("::1"))
 
     result = broker._ssrf_check("https://example.com/path")
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address ::1",
+        reason="SSRF: example.com resolves to blocked address ::1",
     )
 
 
-def test_ssrf_check_denies_ipv6_fc00(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ssrf_check_denies_ipv6_unique_local(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
-        lambda host, port: _fake_getaddrinfo("fc00::1234"),
+        lambda host, port: _fake_getaddrinfo_v6("fc00::1234"),
     )
 
     result = broker._ssrf_check("https://example.com/path")
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address fc00::1234",
+        reason="SSRF: example.com resolves to blocked address fc00::1234",
+    )
+
+
+def test_ssrf_check_denies_ipv6_link_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("fe80::1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address fe80::1",
+    )
+
+
+def test_ssrf_check_denies_ipv6_multicast(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("ff02::1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address ff02::1",
+    )
+
+
+def test_ssrf_check_denies_ipv6_unspecified(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo_v6("::"))
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address ::",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mapped_ipv6", "expected_ipv4"),
+    [
+        ("::ffff:127.0.0.1", "127.0.0.1"),
+        ("::ffff:10.0.0.1", "10.0.0.1"),
+        ("::ffff:169.254.1.1", "169.254.1.1"),
+    ],
+)
+def test_ssrf_check_denies_ipv4_mapped_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+    mapped_ipv6: str,
+    expected_ipv4: str,
+) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6(mapped_ipv6),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason=f"SSRF: example.com resolves to blocked address {expected_ipv4}",
     )
 
 
@@ -295,6 +412,19 @@ def test_ssrf_check_allows_public_ip(monkeypatch: pytest.MonkeyPatch) -> None:
         socket,
         "getaddrinfo",
         lambda host, port: _fake_getaddrinfo("93.184.216.34"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(allowed=True, reason=None)
+
+
+def test_ssrf_check_allows_public_ipv6(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("2606:2800:220:1:248:1893:25c8:1946"),
     )
 
     result = broker._ssrf_check("https://example.com/path")
@@ -371,6 +501,20 @@ def test_execute_returns_structured_error_on_request_exception() -> None:
         "error": "ConnectionError",
         "detail": "connection failed",
     }
+
+
+def test_execute_disables_env_proxy_inheritance() -> None:
+    broker = _broker()
+
+    def _fake_request(session: requests.Session, *args: object, **kwargs: object) -> _FakeResponse:
+        _ = args, kwargs
+        assert session.trust_env is False
+        return _FakeResponse()
+
+    with patch.object(requests.Session, "request", autospec=True, side_effect=_fake_request):
+        result = broker._execute("GET", "https://example.com/data", {}, None, 1024)
+
+    assert result["success"] is True
 
 
 class _FakeResponse:
@@ -711,6 +855,34 @@ def test_handle_http_request_public_policy_disabled_denial() -> None:
     assert result["success"] is False
     assert result["error"] == "policy_denied"
     assert "public requests disabled" in str(result.get("reason", ""))
+
+
+def test_handle_http_request_public_policy_denies_unsupported_scheme() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "ftp://public.example.com/data",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "unsupported URL scheme" in str(result.get("reason", ""))
+
+
+def test_handle_web_fetch_denies_unsupported_scheme() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_fetch", "url": "file:///etc/passwd"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "unsupported URL scheme" in str(result.get("reason", ""))
 
 
 def test_handle_http_request_path_denied_and_no_token_leak() -> None:
@@ -1153,6 +1325,35 @@ def test_handle_http_request_public_redirect_to_loopback_is_denied(
     assert result["success"] is False
     assert result["error"] == "policy_denied"
     assert "SSRF" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_public_redirect_to_unsupported_scheme_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(monkeypatch, {"public.example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/start",
+        status=302,
+        headers={"Location": "ftp://public.example.com/private"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/start",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "unsupported URL scheme" in str(result.get("reason", ""))
     assert len(responses.calls) == 1
 
 
