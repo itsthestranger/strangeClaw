@@ -693,6 +693,112 @@ def test_handle_unknown_action() -> None:
     assert result == {"success": False, "error": "unknown action: nope"}
 
 
+@responses.activate
+def test_handle_http_request_missing_url_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "http_request", "method": "GET"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.url must be a non-empty string",
+    }
+    assert len(responses.calls) == 0
+
+
+def test_handle_http_request_malformed_headers_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/data",
+            "headers": {"Accept": 123},
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.headers must contain only string keys and values",
+    }
+
+
+def test_handle_http_request_non_string_body_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "POST",
+            "url": "https://public.example.com/data",
+            "body": {"x": 1},
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.body must be a string or null",
+    }
+
+
+def test_handle_http_request_invalid_request_does_not_leak_credentials() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/data",
+            "headers": {"Authorization": 123},
+        }
+    )
+
+    rendered = json.dumps(result, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "search-secret-token" not in rendered
+    assert "hidden-token" not in rendered
+
+
+def test_handle_web_fetch_missing_url_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_fetch"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_fetch.url must be a non-empty string",
+    }
+
+
+def test_handle_web_search_missing_query_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_search"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_search.query must be a non-empty string",
+    }
+
+
+def test_handle_web_search_invalid_max_results_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_search", "query": "test", "max_results": "abc"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_search.max_results must be a positive integer",
+    }
+
+
 def test_handle_wraps_internal_handler_exception_with_redacted_envelope() -> None:
     creds = _credentials()
     secret = str(creds["notion"]["token"])

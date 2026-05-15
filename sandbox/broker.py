@@ -485,10 +485,12 @@ class RequestBroker:
         )
 
     def _handle_http_request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        integration = payload.get("integration")
-        method, url, model_headers, body = _parse_http_request_payload(payload)
+        parsed = _parse_http_request_payload(payload)
+        if isinstance(parsed, dict):
+            return parsed
+        integration, method, url, model_headers, body = parsed
 
-        if isinstance(integration, str) and integration:
+        if integration:
             policy = self._policies.get(integration)
             if policy is None:
                 reason = f"integration '{integration}' not found in secrets.yaml"
@@ -692,7 +694,10 @@ class RequestBroker:
         return guard
 
     def _handle_web_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        url = str(payload.get("url", ""))
+        parsed = _parse_web_fetch_payload(payload)
+        if isinstance(parsed, dict):
+            return parsed
+        url = parsed
         max_chars = self._web_fetch_max_chars()
         execute_result = self._execute_public_request(
             policy=self._build_public_policy({}),
@@ -761,13 +766,10 @@ class RequestBroker:
             reason = "web_search integration not configured in secrets.yaml"
             return self._deny("_web_search", "GET", endpoint, reason)
 
-        query = str(payload.get("query", "")).strip()
-        if not query:
-            return {"success": False, "error": "invalid_request", "reason": "query is required"}
-
-        max_results = _to_positive_int(payload.get("max_results"))
-        if max_results is None:
-            max_results = self._web_search_max_results()
+        parsed = _parse_web_search_payload(payload, self._web_search_max_results())
+        if isinstance(parsed, dict):
+            return parsed
+        query, max_results = parsed
 
         search_format = self._web_search_format()
         if search_format == "brave":
@@ -990,23 +992,78 @@ def _to_int(value: Any) -> int | None:
 
 def _parse_http_request_payload(
     payload: dict[str, Any],
-) -> tuple[str, str, dict[str, str], str | None]:
-    method = str(payload.get("method", "GET")).upper()
-    url = str(payload.get("url", ""))
-    model_headers = _normalize_headers(payload.get("headers"))
+) -> tuple[str | None, str, str, dict[str, str], str | None] | dict[str, Any]:
+    method_raw = payload.get("method")
+    if not isinstance(method_raw, str) or not method_raw.strip():
+        return _invalid_request("http_request.method must be a non-empty string")
+    method = method_raw.strip().upper()
+
+    url_raw = payload.get("url")
+    if not isinstance(url_raw, str) or not url_raw.strip():
+        return _invalid_request("http_request.url must be a non-empty string")
+    url = url_raw.strip()
+
+    integration_raw = payload.get("integration")
+    integration: str | None
+    if integration_raw is None:
+        integration = None
+    elif isinstance(integration_raw, str):
+        integration = integration_raw.strip() or None
+    else:
+        return _invalid_request("http_request.integration must be a string or null")
+
+    headers_raw = payload.get("headers", {})
+    if headers_raw is None:
+        headers_raw = {}
+    model_headers, headers_error = _normalize_headers(headers_raw)
+    if headers_error is not None:
+        return _invalid_request(headers_error)
+
     body_raw = payload.get("body")
-    body = body_raw if isinstance(body_raw, str) or body_raw is None else str(body_raw)
-    return method, url, model_headers, body
+    if body_raw is not None and not isinstance(body_raw, str):
+        return _invalid_request("http_request.body must be a string or null")
+
+    return integration, method, url, model_headers, body_raw
 
 
-def _normalize_headers(value: Any) -> dict[str, str]:
+def _parse_web_fetch_payload(payload: dict[str, Any]) -> str | dict[str, Any]:
+    url_raw = payload.get("url")
+    if not isinstance(url_raw, str) or not url_raw.strip():
+        return _invalid_request("web_fetch.url must be a non-empty string")
+    return url_raw.strip()
+
+
+def _parse_web_search_payload(
+    payload: dict[str, Any],
+    default_max_results: int,
+) -> tuple[str, int] | dict[str, Any]:
+    query_raw = payload.get("query")
+    if not isinstance(query_raw, str) or not query_raw.strip():
+        return _invalid_request("web_search.query must be a non-empty string")
+    query = query_raw.strip()
+
+    max_results_raw = payload.get("max_results")
+    if max_results_raw is None:
+        return query, default_max_results
+    max_results = _to_positive_int(max_results_raw)
+    if max_results is None:
+        return _invalid_request("web_search.max_results must be a positive integer")
+    return query, max_results
+
+
+def _normalize_headers(value: Any) -> tuple[dict[str, str], str | None]:
     if not isinstance(value, dict):
-        return {}
+        return {}, "http_request.headers must be an object when provided"
     normalized: dict[str, str] = {}
     for key, item in value.items():
-        if isinstance(key, str) and isinstance(item, str):
-            normalized[key] = item
-    return normalized
+        if not isinstance(key, str) or not isinstance(item, str):
+            return {}, "http_request.headers must contain only string keys and values"
+        normalized[key] = item
+    return normalized, None
+
+
+def _invalid_request(reason: str) -> dict[str, Any]:
+    return {"success": False, "error": "invalid_request", "reason": reason}
 
 
 def _normalize_content_type(raw: str) -> str:
