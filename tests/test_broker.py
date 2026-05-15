@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 from collections.abc import Callable
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -690,6 +691,39 @@ def test_handle_unknown_action() -> None:
     result = broker.handle({"action": "nope"})
 
     assert result == {"success": False, "error": "unknown action: nope"}
+
+
+def test_handle_wraps_internal_handler_exception_with_redacted_envelope() -> None:
+    creds = _credentials()
+    secret = str(creds["notion"]["token"])
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    def _explode(payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        raise RuntimeError(f"upstream exploded with token={secret}")
+
+    broker._handlers["explode"] = _explode  # noqa: SLF001
+
+    result = broker.handle({"action": "explode"})
+
+    assert result["success"] is False
+    assert result["error"] == "internal_error"
+    detail = str(result.get("detail", ""))
+    assert secret not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_handle_rejects_missing_success_envelope_for_handler_result() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    broker._handlers["bad_payload"] = lambda payload: {"echo": payload}  # noqa: SLF001
+
+    result = broker.handle({"action": "bad_payload", "x": 1})
+
+    assert result == {
+        "success": False,
+        "error": "internal_error",
+        "detail": "invalid broker response: missing success envelope",
+    }
 
 
 def test_handle_list_integrations_skips_invalid_policy_records() -> None:

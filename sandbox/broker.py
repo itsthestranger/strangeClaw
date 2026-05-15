@@ -200,12 +200,30 @@ class RequestBroker:
         if handler is None:
             result = {"success": False, "error": f"unknown action: {action_raw}"}
         else:
-            result = handler(payload)
+            try:
+                result = handler(payload)
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "success": False,
+                    "error": "internal_error",
+                    "detail": str(exc),
+                }
 
         redacted = self._redact_value(result)
-        if isinstance(redacted, dict):
+        if not isinstance(redacted, dict):
+            return {
+                "success": False,
+                "error": "internal_error",
+                "detail": "invalid broker response",
+            }
+        success_raw = redacted.get("success")
+        if isinstance(success_raw, bool):
             return redacted
-        return {"success": False, "error": "internal_error", "detail": "invalid broker response"}
+        return {
+            "success": False,
+            "error": "internal_error",
+            "detail": "invalid broker response: missing success envelope",
+        }
 
     def _validate(
         self,
