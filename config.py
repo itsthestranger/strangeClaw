@@ -10,8 +10,6 @@ from typing import Any, cast
 
 import yaml
 
-from agent.http_auth import validate_integrations_config
-
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 LOGGER = logging.getLogger(__name__)
@@ -129,14 +127,23 @@ def _validate_required_fields(config: dict[str, Any], source_path: Path) -> None
 
 
 def _validate_optional_fields(config: dict[str, Any]) -> None:
+    _validate_legacy_integrations_field(config)
     _validate_llm_optional_fields(config)
     _validate_tools_optional_fields(config)
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
     _validate_skills_optional_fields(config)
-    _validate_integrations_optional_fields(config)
     _validate_firecracker_optional_fields(config)
     _validate_session_journal_optional_fields(config)
+
+
+def _validate_legacy_integrations_field(config: dict[str, Any]) -> None:
+    if "integrations" not in config:
+        return
+    raise ConfigError(
+        "Config field integrations is no longer supported. "
+        "Move external API credentials to ~/.strangeclaw/secrets.yaml."
+    )
 
 
 def _validate_llm_optional_fields(config: dict[str, Any]) -> None:
@@ -193,7 +200,6 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         config["web_search"] = {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
-            "api_key": "",
             "max_results": 10,
         }
         web_search = config["web_search"]
@@ -213,15 +219,16 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
         raise ConfigError("Config field web_search.format must be either 'brave' or 'searxng'.")
     web_search["format"] = normalized_format
 
-    api_key = web_search.get("api_key", "")
-    if not isinstance(api_key, str):
-        raise ConfigError("Config field web_search.api_key must be a string.")
-    web_search["api_key"] = api_key
-    if normalized_format == "brave" and not api_key.strip():
-        LOGGER.warning(
-            "web_search.format is brave but web_search.api_key is empty. "
-            "Brave requests will fail until an API key is set."
-        )
+    if "api_key" in web_search:
+        api_key = web_search.get("api_key")
+        if not isinstance(api_key, str):
+            raise ConfigError("Config field web_search.api_key must be a string when provided.")
+        if api_key.strip():
+            raise ConfigError(
+                "web_search.api_key is no longer supported. Move search credentials to "
+                "~/.strangeclaw/secrets.yaml under credentials._web_search.token."
+            )
+        web_search.pop("api_key", None)
 
     max_results_raw = web_search.get("max_results", 10)
     if isinstance(max_results_raw, bool):
@@ -278,13 +285,6 @@ def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
     if max_file_chars <= 0:
         raise ConfigError("Config field skills.max_file_chars must be greater than zero.")
     skills["max_file_chars"] = max_file_chars
-
-
-def _validate_integrations_optional_fields(config: dict[str, Any]) -> None:
-    try:
-        config["integrations"] = validate_integrations_config(config.get("integrations"))
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
 
 
 def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:

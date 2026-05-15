@@ -261,7 +261,8 @@ SearXNG local setup note:
 - For local SearXNG without authentication, keep the `_web_search` entry in
   `secrets.yaml` so the broker knows the allowed host and policy. The current
   secrets loader requires a non-empty `token`, so use a non-secret placeholder
-  value if your SearXNG instance does not need one.
+  value if your SearXNG instance does not need one (for example
+  `"unused-local-searxng-token"`).
 - In SearXNG's `settings.yml`, allow JSON output or requests with
   `format=json` will be rejected. The relevant setting is:
   ```yaml
@@ -292,6 +293,9 @@ The broker executes the call only if `~/.strangeclaw/secrets.yaml` contains a
 matching `credentials.github` entry. It validates method, host, path, protected
 headers, response size, and rate limits before injecting the credential. The
 model never sees token values.
+As a deliberate security decision, integration auth supports only `bearer` and
+`header` modes. Query-string credential injection (`auth_type: query`) is not
+supported.
 
 A skill without a matching credentials entry is inert at execution time. For
 example, the `notion` skill can teach the model Notion API shapes, but Notion

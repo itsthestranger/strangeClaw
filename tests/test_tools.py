@@ -118,6 +118,17 @@ def test_tools_web_search_handles_host_service_error() -> None:
     assert result.stderr == "broker down"
 
 
+def test_tools_web_search_rejects_missing_success_envelope() -> None:
+    broker = _RecordingBroker({"results": [{"title": "A", "url": "u", "snippet": "s"}]})
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "llm"}))
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "invalid broker response for web_search: missing success envelope."
+
+
 def test_tools_web_fetch_calls_broker_with_expected_payload() -> None:
     broker = _RecordingBroker(
         {
@@ -149,6 +160,17 @@ def test_tools_web_fetch_handles_host_service_error() -> None:
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr == "timeout"
+
+
+def test_tools_web_fetch_rejects_missing_success_envelope() -> None:
+    broker = _RecordingBroker({"url": "https://example.com", "text": "hello"})
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == "invalid broker response for web_fetch: missing success envelope."
 
 
 def test_tools_http_request_schema_includes_integration_description() -> None:
@@ -202,9 +224,8 @@ def test_tools_http_request_calls_broker_with_expected_payload() -> None:
     ]
     payload = _unwrap_data(result.stdout)
     assert payload["status_code"] == 201
-    wrapped_body = payload["body"]
-    assert isinstance(wrapped_body, str)
-    assert wrapped_body.startswith("--- BEGIN DATA ---\n")
+    assert payload["body"] == '{"ok":true}'
+    assert _wrapper_count(result.stdout) == 1
 
 
 def test_tools_http_request_broker_denial_returns_wrapped_payload() -> None:
@@ -229,6 +250,63 @@ def test_tools_http_request_broker_denial_returns_wrapped_payload() -> None:
     assert result.stderr == ""
     payload = _unwrap_data(result.stdout)
     assert payload["error"] == "policy_denied"
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_web_search_output_uses_single_data_wrapper() -> None:
+    broker = _RecordingBroker({"success": True, "results": []})
+    tools = Tools(config={"web_search": {"max_results": 10}}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_search", args={"query": "test"}))
+
+    assert result.exit_code == 0
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_web_fetch_output_uses_single_data_wrapper() -> None:
+    broker = _RecordingBroker(
+        {
+            "success": True,
+            "url": "https://example.com",
+            "status_code": 200,
+            "content_type": "text/plain",
+            "text": "hello",
+            "truncated": False,
+        }
+    )
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
+
+    assert result.exit_code == 0
+    assert _wrapper_count(result.stdout) == 1
+
+
+def test_tools_http_request_body_preserves_raw_broker_value() -> None:
+    broker = _RecordingBroker(
+        {
+            "success": True,
+            "status_code": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": "raw-upstream-body",
+            "truncated": False,
+        }
+    )
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(
+        ToolCall(
+            tool="http_request",
+            args={"method": "GET", "url": "https://api.example.com"},
+        )
+    )
+
+    assert result.exit_code == 0
+    payload = _unwrap_data(result.stdout)
+    assert payload["body"] == "raw-upstream-body"
+    assert isinstance(payload["body"], str)
+    assert not payload["body"].startswith("--- BEGIN DATA ---")
+    assert _wrapper_count(result.stdout) == 1
 
 
 def test_tools_http_request_invalid_method_rejected() -> None:
@@ -260,15 +338,30 @@ def test_tools_http_request_handles_host_service_error() -> None:
     assert result.stderr == "offline"
 
 
-def test_tools_warns_when_web_search_api_key_present(caplog: pytest.LogCaptureFixture) -> None:
+def test_tools_http_request_rejects_missing_success_envelope() -> None:
+    broker = _RecordingBroker({"status_code": 200, "body": "ok", "headers": {}, "truncated": False})
+    tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
+
+    result = tools.execute(
+        ToolCall(tool="http_request", args={"method": "GET", "url": "https://api.example.com"})
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert (
+        result.stderr
+        == "invalid broker response for http_request: missing success envelope."
+    )
+
+
+def test_tools_does_not_emit_legacy_web_search_key_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level("WARNING")
 
-    _ = Tools(config={"web_search": {"api_key": "legacy-key"}})
+    _ = Tools(config={"web_search": {"api_key": ""}})
 
-    assert (
-        "web_search.api_key in config.yaml is deprecated and ignored. "
-        "Move it to secrets.yaml under credentials._web_search.token."
-    ) in caplog.text
+    assert "web_search.api_key" not in caplog.text
 
 
 def _unwrap_data(text: str) -> dict[str, Any]:
@@ -280,3 +373,7 @@ def _unwrap_data(text: str) -> dict[str, Any]:
     loaded = json.loads(payload)
     assert isinstance(loaded, dict)
     return loaded
+
+
+def _wrapper_count(text: str) -> int:
+    return text.count("--- BEGIN DATA ---")

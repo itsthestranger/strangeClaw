@@ -1835,7 +1835,6 @@ def _coerce_agent_config_template(
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
-                "api_key": "",
                 "max_results": 10,
             },
             "web_fetch": {"max_chars": 20000},
@@ -1874,10 +1873,27 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         }
 
     web_search_raw = config.get("web_search")
-    web_search: dict[str, str]
+    web_search: dict[str, Any]
     if isinstance(web_search_raw, Mapping):
         endpoint_value = web_search_raw.get("endpoint")
         format_value = web_search_raw.get("format")
+        max_results_value = web_search_raw.get("max_results", 10)
+        if isinstance(max_results_value, bool):
+            max_results = 10
+        elif isinstance(max_results_value, int):
+            max_results = max_results_value if max_results_value > 0 else 10
+        elif isinstance(max_results_value, float):
+            candidate = int(max_results_value)
+            max_results = candidate if candidate > 0 else 10
+        elif isinstance(max_results_value, str):
+            try:
+                candidate = int(max_results_value)
+            except ValueError:
+                max_results = 10
+            else:
+                max_results = candidate if candidate > 0 else 10
+        else:
+            max_results = 10
         web_search = {
             "endpoint": (
                 endpoint_value
@@ -1889,11 +1905,13 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
                 if isinstance(format_value, str) and format_value.strip()
                 else "brave"
             ),
+            "max_results": max_results,
         }
     else:
         web_search = {
             "endpoint": "https://api.search.brave.com/res/v1/web/search",
             "format": "brave",
+            "max_results": 10,
         }
 
     web_fetch_raw = config.get("web_fetch")

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import socket
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -10,7 +13,7 @@ import requests
 import responses
 
 from agent.broker_client import BrokerClient
-from sandbox.broker import PolicyResult, RequestBroker
+from sandbox.broker import Policy, PolicyResult, RequestBroker
 from sandbox.host_services import HostServiceServer
 
 
@@ -18,14 +21,22 @@ def _broker() -> RequestBroker:
     return RequestBroker(credentials={}, config={})
 
 
-def _policy() -> dict[str, object]:
-    return {
-        "name": "notion",
-        "allowed_methods": ["GET"],
-        "allowed_hosts": ["api.notion.com"],
-        "allowed_paths": ["/v1/*"],
-        "protected_headers": ["Authorization"],
-    }
+def _policy() -> Policy:
+    return Policy(
+        name="notion",
+        auth_type="bearer",
+        token="notion-secret-token",
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.notion.com",),
+        allowed_paths=("/v1/*",),
+        allowed_schemes=("https",),
+        protected_headers=("Authorization",),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
 
 def _broker_config() -> dict[str, object]:
@@ -55,6 +66,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["api.notion.com"],
             "allowed_methods": ["GET", "POST"],
             "allowed_paths": ["/v1/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {"Notion-Version": "2022-06-28"},
             "max_response_bytes": 4096,
@@ -68,6 +80,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["search.example.com"],
             "allowed_methods": ["GET"],
             "allowed_paths": ["/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {},
             "max_response_bytes": 4096,
@@ -80,6 +93,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["internal.example.com"],
             "allowed_methods": ["GET"],
             "allowed_paths": ["/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {},
             "max_response_bytes": 4096,
@@ -176,6 +190,23 @@ def _fake_getaddrinfo(ip: str) -> list[tuple[object, object, object, object, tup
     return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
 
 
+def _fake_getaddrinfo_v6(
+    ip: str,
+) -> list[tuple[object, object, object, object, tuple[str, int, int, int]]]:
+    return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, 0, 0, 0))]
+
+
+def test_ssrf_check_denies_unsupported_scheme() -> None:
+    broker = _broker()
+
+    result = broker._ssrf_check("ftp://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="unsupported URL scheme 'ftp' for public URL policy",
+    )
+
+
 def test_ssrf_check_denies_10_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
     monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("10.1.2.3"))
@@ -184,7 +215,7 @@ def test_ssrf_check_denies_10_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 10.1.2.3",
+        reason="SSRF: example.com resolves to blocked address 10.1.2.3",
     )
 
 
@@ -200,7 +231,7 @@ def test_ssrf_check_denies_172_16_slash_12(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 172.16.12.34",
+        reason="SSRF: example.com resolves to blocked address 172.16.12.34",
     )
 
 
@@ -216,7 +247,7 @@ def test_ssrf_check_denies_192_168_slash_16(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 192.168.55.9",
+        reason="SSRF: example.com resolves to blocked address 192.168.55.9",
     )
 
 
@@ -232,7 +263,7 @@ def test_ssrf_check_denies_127_slash_8(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 127.0.0.1",
+        reason="SSRF: example.com resolves to blocked address 127.0.0.1",
     )
 
 
@@ -248,35 +279,135 @@ def test_ssrf_check_denies_169_254_slash_16(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address 169.254.22.7",
+        reason="SSRF: example.com resolves to blocked address 169.254.22.7",
+    )
+
+
+def test_ssrf_check_denies_ipv4_unspecified(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("0.0.0.0"))
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address 0.0.0.0",
+    )
+
+
+def test_ssrf_check_denies_ipv4_multicast(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo("224.0.0.1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address 224.0.0.1",
     )
 
 
 def test_ssrf_check_denies_ipv6_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
-    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo("::1"))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo_v6("::1"))
 
     result = broker._ssrf_check("https://example.com/path")
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address ::1",
+        reason="SSRF: example.com resolves to blocked address ::1",
     )
 
 
-def test_ssrf_check_denies_ipv6_fc00(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ssrf_check_denies_ipv6_unique_local(monkeypatch: pytest.MonkeyPatch) -> None:
     broker = _broker()
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
-        lambda host, port: _fake_getaddrinfo("fc00::1234"),
+        lambda host, port: _fake_getaddrinfo_v6("fc00::1234"),
     )
 
     result = broker._ssrf_check("https://example.com/path")
 
     assert result == PolicyResult(
         allowed=False,
-        reason="SSRF: example.com resolves to reserved address fc00::1234",
+        reason="SSRF: example.com resolves to blocked address fc00::1234",
+    )
+
+
+def test_ssrf_check_denies_ipv6_link_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("fe80::1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address fe80::1",
+    )
+
+
+def test_ssrf_check_denies_ipv6_multicast(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("ff02::1"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address ff02::1",
+    )
+
+
+def test_ssrf_check_denies_ipv6_unspecified(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port: _fake_getaddrinfo_v6("::"))
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason="SSRF: example.com resolves to blocked address ::",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mapped_ipv6", "expected_ipv4"),
+    [
+        ("::ffff:127.0.0.1", "127.0.0.1"),
+        ("::ffff:10.0.0.1", "10.0.0.1"),
+        ("::ffff:169.254.1.1", "169.254.1.1"),
+    ],
+)
+def test_ssrf_check_denies_ipv4_mapped_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+    mapped_ipv6: str,
+    expected_ipv4: str,
+) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6(mapped_ipv6),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(
+        allowed=False,
+        reason=f"SSRF: example.com resolves to blocked address {expected_ipv4}",
     )
 
 
@@ -286,6 +417,19 @@ def test_ssrf_check_allows_public_ip(monkeypatch: pytest.MonkeyPatch) -> None:
         socket,
         "getaddrinfo",
         lambda host, port: _fake_getaddrinfo("93.184.216.34"),
+    )
+
+    result = broker._ssrf_check("https://example.com/path")
+
+    assert result == PolicyResult(allowed=True, reason=None)
+
+
+def test_ssrf_check_allows_public_ipv6(monkeypatch: pytest.MonkeyPatch) -> None:
+    broker = _broker()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port: _fake_getaddrinfo_v6("2606:2800:220:1:248:1893:25c8:1946"),
     )
 
     result = broker._ssrf_check("https://example.com/path")
@@ -322,6 +466,7 @@ def test_execute_returns_status_headers_body_without_truncation() -> None:
 
     result = broker._execute("GET", "https://example.com/data", {"X-Test": "1"}, None, 1024)
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["headers"]["Content-Type"] == "text/plain"
     assert result["body"] == "hello world"
@@ -341,6 +486,7 @@ def test_execute_truncates_when_body_exceeds_max_bytes() -> None:
 
     result = broker._execute("GET", "https://example.com/long", {}, None, 5)
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["body"] == "abcde"
     assert result["truncated"] is True
@@ -362,6 +508,20 @@ def test_execute_returns_structured_error_on_request_exception() -> None:
     }
 
 
+def test_execute_disables_env_proxy_inheritance() -> None:
+    broker = _broker()
+
+    def _fake_request(session: requests.Session, *args: object, **kwargs: object) -> _FakeResponse:
+        _ = args, kwargs
+        assert session.trust_env is False
+        return _FakeResponse()
+
+    with patch.object(requests.Session, "request", autospec=True, side_effect=_fake_request):
+        result = broker._execute("GET", "https://example.com/data", {}, None, 1024)
+
+    assert result["success"] is True
+
+
 class _FakeResponse:
     status_code = 200
     headers = {"Content-Type": "text/plain"}
@@ -377,12 +537,21 @@ def test_inject_bearer_captures_outbound_header_key_and_no_token_in_logs(
 ) -> None:
     broker = _broker()
     token = "token-bearer-secret"
-    policy = {
-        "name": "notion",
-        "auth_type": "bearer",
-        "token": token,
-        "default_headers": {"X-Default": "yes"},
-    }
+    policy = Policy(
+        name="notion",
+        auth_type="bearer",
+        token=token,
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.notion.com",),
+        allowed_paths=("/*",),
+        allowed_schemes=("https",),
+        protected_headers=("Authorization",),
+        default_headers={"X-Default": "yes"},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -410,12 +579,21 @@ def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
 ) -> None:
     broker = _broker()
     token = "token-header-secret"
-    policy = {
-        "name": "github",
-        "auth_type": "header",
-        "header_name": "X-API-Key",
-        "token": token,
-    }
+    policy = Policy(
+        name="github",
+        auth_type="header",
+        token=token,
+        header_name="X-API-Key",
+        allowed_methods=("GET",),
+        allowed_hosts=("api.github.com",),
+        allowed_paths=("/*",),
+        allowed_schemes=("https",),
+        protected_headers=("Authorization", "X-API-Key"),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -436,17 +614,26 @@ def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
     assert token not in caplog.text
 
 
-def test_inject_query_appends_token_param_and_no_token_in_logs(
+def test_inject_unknown_auth_type_does_not_inject_token_or_modify_url(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     broker = _broker()
-    token = "token-query-secret"
-    policy = {
-        "name": "search",
-        "auth_type": "query",
-        "query_param": "api_key",
-        "token": token,
-    }
+    token = "token-unknown-secret"
+    policy = Policy(
+        name="search",
+        auth_type="unsupported",
+        token=token,
+        header_name="Authorization",
+        allowed_methods=("GET",),
+        allowed_hosts=("search.example.com",),
+        allowed_paths=("/*",),
+        allowed_schemes=("https",),
+        protected_headers=("Authorization",),
+        default_headers={},
+        max_response_bytes=4096,
+        rate_limit_requests=None,
+        rate_limit_period_seconds=None,
+    )
 
     captured: dict[str, object] = {}
 
@@ -466,9 +653,12 @@ def test_inject_query_appends_token_param_and_no_token_in_logs(
         broker._execute("GET", final_url, final_headers, None, 1024)
 
     outbound_url = captured["url"]
+    outbound_headers = captured["headers"]
     assert isinstance(outbound_url, str)
-    assert "api_key=" in outbound_url
-    assert outbound_url.startswith("https://example.com/search?")
+    assert outbound_url == "https://example.com/search?q=test"
+    assert isinstance(outbound_headers, dict)
+    assert "X-Client" in outbound_headers
+    assert "Authorization" not in outbound_headers
     assert token not in caplog.text
 
 
@@ -480,12 +670,271 @@ def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _mapped_dns(
+    monkeypatch: pytest.MonkeyPatch,
+    mapping: dict[str, str],
+) -> None:
+    def _resolver(
+        host: str,
+        port: object,
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        _ = port
+        ip = mapping.get(host, "93.184.216.34")
+        return _fake_getaddrinfo(ip)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _resolver)
+
+
 def test_handle_unknown_action() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
 
     result = broker.handle({"action": "nope"})
 
     assert result == {"success": False, "error": "unknown action: nope"}
+
+
+@responses.activate
+def test_handle_http_request_missing_url_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "http_request", "method": "GET"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.url must be a non-empty string",
+    }
+    assert len(responses.calls) == 0
+
+
+def test_handle_http_request_malformed_headers_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/data",
+            "headers": {"Accept": 123},
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.headers must contain only string keys and values",
+    }
+
+
+def test_handle_http_request_non_string_body_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "POST",
+            "url": "https://public.example.com/data",
+            "body": {"x": 1},
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "http_request.body must be a string or null",
+    }
+
+
+def test_handle_http_request_invalid_request_does_not_leak_credentials() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/data",
+            "headers": {"Authorization": 123},
+        }
+    )
+
+    rendered = json.dumps(result, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "search-secret-token" not in rendered
+    assert "hidden-token" not in rendered
+
+
+def test_handle_web_fetch_missing_url_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_fetch"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_fetch.url must be a non-empty string",
+    }
+
+
+def test_handle_web_search_missing_query_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_search"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_search.query must be a non-empty string",
+    }
+
+
+def test_handle_web_search_invalid_max_results_returns_invalid_request() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_search", "query": "test", "max_results": "abc"})
+
+    assert result == {
+        "success": False,
+        "error": "invalid_request",
+        "reason": "web_search.max_results must be a positive integer",
+    }
+
+
+def test_handle_wraps_internal_handler_exception_with_redacted_envelope() -> None:
+    creds = _credentials()
+    secret = str(creds["notion"]["token"])
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    def _explode(payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        raise RuntimeError(f"upstream exploded with token={secret}")
+
+    broker._handlers["explode"] = _explode  # noqa: SLF001
+
+    result = broker.handle({"action": "explode"})
+
+    assert result["success"] is False
+    assert result["error"] == "internal_error"
+    detail = str(result.get("detail", ""))
+    assert secret not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_handle_rejects_missing_success_envelope_for_handler_result() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    broker._handlers["bad_payload"] = lambda payload: {"echo": payload}  # noqa: SLF001
+
+    result = broker.handle({"action": "bad_payload", "x": 1})
+
+    assert result == {
+        "success": False,
+        "error": "internal_error",
+        "detail": "invalid broker response: missing success envelope",
+    }
+
+
+def test_handle_list_integrations_skips_invalid_policy_records() -> None:
+    credentials = _credentials()
+    credentials["broken"] = {
+        "name": "broken",
+        "auth_type": "query",
+        "token": "ignored",
+        "allowed_hosts": ["api.invalid.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/*"],
+        "allowed_schemes": ["https"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=credentials, config=_broker_config())
+
+    listed = broker.handle({"action": "list_integrations"})
+    denied = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "broken",
+            "method": "GET",
+            "url": "https://api.invalid.local/v1/check",
+        }
+    )
+
+    assert listed == {"success": True, "integrations": ["notion"]}
+    assert denied["success"] is False
+    assert denied["error"] == "policy_denied"
+    assert "not found in secrets.yaml" in str(denied.get("reason", ""))
+
+
+@responses.activate
+def test_handle_http_request_public_policy_custom_allowed_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _public_dns(monkeypatch)
+    config = _broker_config()
+    config["broker"] = {
+        "public_policy": {
+            "enabled": True,
+            "allowed_methods": ["GET", "POST"],
+            "max_response_bytes": 4096,
+        }
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+    responses.add(
+        responses.POST,
+        "https://public.example.com/submit",
+        body='{"ok":true}',
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "POST",
+            "url": "https://public.example.com/submit",
+            "headers": {"Content-Type": "application/json"},
+            "body": '{"x":1}',
+        }
+    )
+
+    assert result["success"] is True
+    assert result["status_code"] == 200
+
+
+def test_execute_policy_request_helper_denies_disallowed_redirect_host() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    policy = broker._policies["notion"]
+
+    def _fake_execute_with_redirects(
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: str | None,
+        max_bytes: int,
+        redirect_guard: Callable[[str, str], dict[str, object] | None] | None,
+    ) -> dict[str, object]:
+        _ = (method, url, headers, body, max_bytes)
+        assert redirect_guard is not None
+        denied = redirect_guard("https://evil.example.com/v1/pages", "GET")
+        assert denied is not None
+        return denied
+
+    with patch.object(broker, "_execute_with_redirects", side_effect=_fake_execute_with_redirects):
+        result = broker._execute_policy_request(
+            policy=policy,
+            integration_name="notion",
+            method="GET",
+            url="https://api.notion.com/v1/pages",
+            model_headers={},
+            body=None,
+        )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert result["integration"] == "notion"
+    assert result["requested_method"] == "GET"
+    assert result["requested_url"] == "https://evil.example.com/v1/pages"
 
 
 @responses.activate
@@ -510,8 +959,56 @@ def test_handle_http_request_named_integration_success() -> None:
         }
     )
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["truncated"] is False
+
+
+def test_handle_http_request_named_integration_denies_http_by_default() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "http://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+
+
+@responses.activate
+def test_handle_http_request_named_integration_allows_http_when_explicit() -> None:
+    creds = _credentials()
+    creds["notion"]["allowed_schemes"] = ["http"]
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+    responses.add(
+        responses.GET,
+        "http://api.notion.com/v1/pages",
+        json={"ok": True},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "http://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is True
+    assert result["status_code"] == 200
 
 
 @responses.activate
@@ -536,6 +1033,7 @@ def test_handle_http_request_public_policy_success(monkeypatch: pytest.MonkeyPat
         }
     )
 
+    assert result["success"] is True
     assert result["status_code"] == 200
     assert result["body"] == "hello"
 
@@ -552,6 +1050,34 @@ def test_handle_http_request_public_policy_disabled_denial() -> None:
     assert result["success"] is False
     assert result["error"] == "policy_denied"
     assert "public requests disabled" in str(result.get("reason", ""))
+
+
+def test_handle_http_request_public_policy_denies_unsupported_scheme() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "ftp://public.example.com/data",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+
+
+def test_handle_web_fetch_denies_unsupported_scheme() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle({"action": "web_fetch", "url": "file:///etc/passwd"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "unsupported URL scheme" in str(result.get("reason", ""))
 
 
 def test_handle_http_request_path_denied_and_no_token_leak() -> None:
@@ -575,6 +1101,142 @@ def test_handle_http_request_path_denied_and_no_token_leak() -> None:
         rendered = str(value)
         for token in secret_tokens:
             assert token not in rendered
+
+
+def test_handle_http_request_redacts_reflected_bearer_token() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    class _EchoResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        encoding = "utf-8"
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+            _ = chunk_size
+            return [self._body.encode("utf-8")]
+
+    def _fake_request(*args: object, **kwargs: object) -> _EchoResponse:
+        _ = args
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        auth = str(headers.get("Authorization", ""))
+        return _EchoResponse(f'{{"echo":"{auth}"}}')
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "notion",
+                "method": "POST",
+                "url": "https://api.notion.com/v1/pages",
+                "headers": {},
+                "body": '{"title":"x"}',
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_handle_http_request_redacts_reflected_custom_header_token() -> None:
+    creds = _credentials()
+    creds["custom"] = {
+        "name": "custom",
+        "auth_type": "header",
+        "header_name": "X-API-Key",
+        "token": "custom-header-secret-token",
+        "allowed_hosts": ["api.custom.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/v1/*"],
+        "allowed_schemes": ["https"],
+        "protected_headers": ["Authorization", "X-API-Key"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    class _EchoResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        encoding = "utf-8"
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def iter_content(self, chunk_size: int = 8192) -> list[bytes]:
+            _ = chunk_size
+            return [self._body.encode("utf-8")]
+
+    def _fake_request(*args: object, **kwargs: object) -> _EchoResponse:
+        _ = args
+        headers = kwargs.get("headers")
+        assert isinstance(headers, dict)
+        token_header = str(headers.get("X-API-Key", ""))
+        return _EchoResponse(f'{{"echo":"{token_header}"}}')
+
+    with patch.object(requests.Session, "request", side_effect=_fake_request):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "custom",
+                "method": "GET",
+                "url": "https://api.custom.local/v1/check",
+                "headers": {},
+                "body": None,
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "custom-header-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_handle_http_request_redacts_token_in_exception_detail() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    with patch.object(
+        requests.Session,
+        "request",
+        side_effect=requests.ConnectionError("upstream echoed notion-secret-token"),
+    ):
+        result = broker.handle(
+            {
+                "action": "http_request",
+                "integration": "notion",
+                "method": "GET",
+                "url": "https://api.notion.com/v1/pages",
+                "headers": {},
+                "body": None,
+            }
+        )
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "notion-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
+
+
+@responses.activate
+def test_handle_web_fetch_redacts_token_in_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/page",
+        body="token leak search-secret-token in content",
+        status=200,
+        headers={"Content-Type": "text/plain"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/page"})
+
+    rendered = json.dumps(result, ensure_ascii=True, sort_keys=True)
+    assert "search-secret-token" not in rendered
+    assert "[REDACTED]" in rendered
 
 
 @responses.activate
@@ -715,6 +1377,232 @@ def test_handle_web_search_normalizes_searxng() -> None:
     }
 
 
+@responses.activate
+def test_handle_web_search_denies_allowed_hosts_mismatch() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://wrong.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 0
+
+
+@responses.activate
+def test_handle_web_search_denies_allowed_paths_mismatch() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "https://search.example.com/private",
+        "format": "brave",
+        "max_results": 10,
+    }
+    credentials = _credentials()
+    credentials["_web_search"] = {
+        **credentials["_web_search"],
+        "allowed_paths": ["/search"],
+    }
+    broker = RequestBroker(credentials=credentials, config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_paths" in str(result.get("reason", ""))
+    assert len(responses.calls) == 0
+
+
+def test_handle_web_search_denies_http_by_default() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "http://search.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+
+
+@responses.activate
+def test_handle_web_search_allows_http_when_explicit() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "http://search.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    creds = _credentials()
+    creds["_web_search"]["allowed_schemes"] = ["http"]
+    broker = RequestBroker(credentials=creds, config=config)
+    responses.add(
+        responses.GET,
+        "http://search.example.com/search",
+        json={
+            "web": {
+                "results": [
+                    {"title": "A", "url": "https://a.example", "description": "Snippet A"},
+                ]
+            }
+        },
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result == {
+        "success": True,
+        "results": [
+            {"title": "A", "url": "https://a.example", "snippet": "Snippet A"},
+        ],
+    }
+
+
+def test_handle_http_request_header_auth_auto_protects_header_name() -> None:
+    creds = _credentials()
+    creds["custom"] = {
+        "auth_type": "header",
+        "header_name": "X-API-Key",
+        "token": "custom-token",
+        "allowed_hosts": ["api.custom.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/v1/*"],
+        "allowed_schemes": ["https"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "custom",
+            "method": "GET",
+            "url": "https://api.custom.local/v1/check",
+            "headers": {"X-API-Key": "model-value"},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "X-API-Key" in str(result.get("reason", ""))
+
+
+def test_broker_logs_invalid_policy_records_without_token_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    creds = _credentials()
+    secret = "should-not-leak-in-logs"
+    creds["bad"] = {
+        "auth_type": "header",
+        "token": secret,
+        "allowed_hosts": ["api.bad.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/*"],
+        "allowed_schemes": ["gopher"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+
+    with caplog.at_level("WARNING"):
+        broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    result = broker.handle({"action": "list_integrations"})
+    assert result == {"success": True, "integrations": ["notion"]}
+    assert "skipping integration 'bad'" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_web_search_header_name_is_auto_protected_in_normalized_policy() -> None:
+    creds = _credentials()
+    creds["_web_search"] = {
+        **creds["_web_search"],
+        "header_name": "X-Subscription-Token",
+        "protected_headers": ["Authorization"],
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    policy = broker._policies["_web_search"]
+    assert policy.header_name == "X-Subscription-Token"
+    assert "X-Subscription-Token" in policy.protected_headers
+
+
+@responses.activate
+def test_handle_web_search_redirect_to_disallowed_host_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        status=302,
+        headers={"Location": "https://evil.example.com/search"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+    request_headers = responses.calls[0].request.headers
+    assert "X-Subscription-Token" in request_headers
+
+
+@responses.activate
+def test_redirect_denials_match_between_http_request_and_web_search() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+    responses.add(
+        responses.GET,
+        "https://search.example.com/search",
+        status=302,
+        headers={"Location": "https://evil.example.com/search"},
+    )
+
+    http_result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+    search_result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert http_result["success"] is False
+    assert search_result["success"] is False
+    assert http_result["error"] == "policy_denied"
+    assert search_result["error"] == "policy_denied"
+    assert http_result["requested_method"] == "GET"
+    assert search_result["requested_method"] == "GET"
+    assert http_result["integration"] == "notion"
+    assert search_result["integration"] == "_web_search"
+    assert "allowed_hosts" in str(http_result.get("reason", ""))
+    assert "allowed_hosts" in str(search_result.get("reason", ""))
+
+
 def test_handle_list_integrations_via_host_service_registration() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
     server = HostServiceServer()
@@ -724,3 +1612,269 @@ def test_handle_list_integrations_via_host_service_registration() -> None:
     result = client.call("broker", {"action": "list_integrations"})
 
     assert result == {"success": True, "integrations": ["notion"]}
+
+
+@responses.activate
+def test_handle_http_request_public_redirect_to_loopback_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(
+        monkeypatch,
+        {
+            "public.example.com": "93.184.216.34",
+            "127.0.0.1": "127.0.0.1",
+        },
+    )
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/start",
+        status=302,
+        headers={"Location": "http://127.0.0.1/private"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/start",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "SSRF" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_public_redirect_to_unsupported_scheme_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(monkeypatch, {"public.example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/start",
+        status=302,
+        headers={"Location": "ftp://public.example.com/private"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/start",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_web_fetch_redirect_to_reserved_address_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(
+        monkeypatch,
+        {
+            "example.com": "93.184.216.34",
+            "192.168.1.10": "192.168.1.10",
+        },
+    )
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/start",
+        status=302,
+        headers={"Location": "http://192.168.1.10/internal"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/start"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "SSRF" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_to_disallowed_host_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_hosts" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_to_disallowed_path_is_denied() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://api.notion.com/admin"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_paths" in str(result.get("reason", ""))
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_handle_http_request_named_integration_no_credential_forward_to_disallowed_redirect_host(
+) -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://evil.example.com/v1/pages"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert len(responses.calls) == 1
+    first_request_headers = responses.calls[0].request.headers
+    assert "Authorization" in first_request_headers
+
+
+@responses.activate
+def test_handle_http_request_named_integration_redirect_within_policy_succeeds() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages",
+        status=302,
+        headers={"Location": "https://api.notion.com/v1/pages/next"},
+    )
+    responses.add(
+        responses.GET,
+        "https://api.notion.com/v1/pages/next",
+        json={"ok": True},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "https://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["status_code"] == 200
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_handle_http_request_redirect_loop_returns_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(monkeypatch, {"public.example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r1",
+        status=302,
+        headers={"Location": "https://public.example.com/r2"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r2",
+        status=302,
+        headers={"Location": "https://public.example.com/r3"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r3",
+        status=302,
+        headers={"Location": "https://public.example.com/r4"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r4",
+        status=302,
+        headers={"Location": "https://public.example.com/r5"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r5",
+        status=302,
+        headers={"Location": "https://public.example.com/r6"},
+    )
+    responses.add(
+        responses.GET,
+        "https://public.example.com/r6",
+        status=302,
+        headers={"Location": "https://public.example.com/r7"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "method": "GET",
+            "url": "https://public.example.com/r1",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result == {
+        "success": False,
+        "error": "too_many_redirects",
+        "detail": "redirect limit exceeded (5) for https://public.example.com/r1",
+    }
+    assert len(responses.calls) == 6
