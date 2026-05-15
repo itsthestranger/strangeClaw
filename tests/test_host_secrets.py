@@ -54,6 +54,7 @@ def test_load_secrets_valid_record_applies_defaults(tmp_path: Path) -> None:
             "allowed_hosts": ["api.notion.com"],
             "allowed_methods": ["GET"],
             "allowed_paths": ["/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {},
             "max_response_bytes": 524288,
@@ -193,3 +194,72 @@ def test_load_secrets_accepts_web_search_placeholder_token(tmp_path: Path) -> No
 
     assert loaded["_web_search"]["token"] == "unused-local-searxng-token"
     assert loaded["_web_search"]["allowed_hosts"] == ["localhost", "127.0.0.1"]
+
+
+def test_load_secrets_defaults_allowed_schemes_to_https(tmp_path: Path) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "github": {
+                    "auth_type": "bearer",
+                    "token": "gh-secret",
+                    "allowed_hosts": ["api.github.com"],
+                }
+            }
+        },
+    )
+
+    loaded = load_secrets(str(secrets_path))
+
+    assert loaded["github"]["allowed_schemes"] == ["https"]
+
+
+def test_load_secrets_rejects_invalid_allowed_schemes(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "bad": {
+                    "auth_type": "bearer",
+                    "token": "token",
+                    "allowed_hosts": ["api.example.com"],
+                    "allowed_schemes": ["ftp"],
+                }
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        loaded = load_secrets(str(secrets_path))
+
+    assert loaded == {}
+    assert "allowed_schemes must contain only: http, https" in caplog.text
+
+
+def test_load_secrets_header_auth_auto_protects_header_name(tmp_path: Path) -> None:
+    secrets_path = tmp_path / "secrets.yaml"
+    _write_yaml(
+        secrets_path,
+        {
+            "credentials": {
+                "custom": {
+                    "auth_type": "header",
+                    "token": "custom-secret",
+                    "header_name": "X-Api-Key",
+                    "allowed_hosts": ["api.example.com"],
+                    "protected_headers": ["Authorization"],
+                }
+            }
+        },
+    )
+
+    loaded = load_secrets(str(secrets_path))
+
+    assert loaded["custom"]["header_name"] == "X-Api-Key"
+    assert loaded["custom"]["protected_headers"] == ["Authorization", "X-Api-Key"]

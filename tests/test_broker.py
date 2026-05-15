@@ -29,6 +29,7 @@ def _policy() -> Policy:
         allowed_methods=("GET",),
         allowed_hosts=("api.notion.com",),
         allowed_paths=("/v1/*",),
+        allowed_schemes=("https",),
         protected_headers=("Authorization",),
         default_headers={},
         max_response_bytes=4096,
@@ -64,6 +65,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["api.notion.com"],
             "allowed_methods": ["GET", "POST"],
             "allowed_paths": ["/v1/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {"Notion-Version": "2022-06-28"},
             "max_response_bytes": 4096,
@@ -77,6 +79,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["search.example.com"],
             "allowed_methods": ["GET"],
             "allowed_paths": ["/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {},
             "max_response_bytes": 4096,
@@ -89,6 +92,7 @@ def _credentials() -> dict[str, dict[str, object]]:
             "allowed_hosts": ["internal.example.com"],
             "allowed_methods": ["GET"],
             "allowed_paths": ["/*"],
+            "allowed_schemes": ["https"],
             "protected_headers": ["Authorization"],
             "default_headers": {},
             "max_response_bytes": 4096,
@@ -540,6 +544,7 @@ def test_inject_bearer_captures_outbound_header_key_and_no_token_in_logs(
         allowed_methods=("GET",),
         allowed_hosts=("api.notion.com",),
         allowed_paths=("/*",),
+        allowed_schemes=("https",),
         protected_headers=("Authorization",),
         default_headers={"X-Default": "yes"},
         max_response_bytes=4096,
@@ -581,6 +586,7 @@ def test_inject_custom_header_captures_outbound_header_key_and_no_token_in_logs(
         allowed_methods=("GET",),
         allowed_hosts=("api.github.com",),
         allowed_paths=("/*",),
+        allowed_schemes=("https",),
         protected_headers=("Authorization", "X-API-Key"),
         default_headers={},
         max_response_bytes=4096,
@@ -620,6 +626,7 @@ def test_inject_unknown_auth_type_does_not_inject_token_or_modify_url(
         allowed_methods=("GET",),
         allowed_hosts=("search.example.com",),
         allowed_paths=("/*",),
+        allowed_schemes=("https",),
         protected_headers=("Authorization",),
         default_headers={},
         max_response_bytes=4096,
@@ -694,6 +701,7 @@ def test_handle_list_integrations_skips_invalid_policy_records() -> None:
         "allowed_hosts": ["api.invalid.local"],
         "allowed_methods": ["GET"],
         "allowed_paths": ["/*"],
+        "allowed_schemes": ["https"],
         "protected_headers": ["Authorization"],
         "default_headers": {},
         "max_response_bytes": 4096,
@@ -816,6 +824,53 @@ def test_handle_http_request_named_integration_success() -> None:
     assert result["truncated"] is False
 
 
+def test_handle_http_request_named_integration_denies_http_by_default() -> None:
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "http://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+
+
+@responses.activate
+def test_handle_http_request_named_integration_allows_http_when_explicit() -> None:
+    creds = _credentials()
+    creds["notion"]["allowed_schemes"] = ["http"]
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+    responses.add(
+        responses.GET,
+        "http://api.notion.com/v1/pages",
+        json={"ok": True},
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "notion",
+            "method": "GET",
+            "url": "http://api.notion.com/v1/pages",
+            "headers": {},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is True
+    assert result["status_code"] == 200
+
+
 @responses.activate
 def test_handle_http_request_public_policy_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _public_dns(monkeypatch)
@@ -872,7 +927,7 @@ def test_handle_http_request_public_policy_denies_unsupported_scheme() -> None:
 
     assert result["success"] is False
     assert result["error"] == "policy_denied"
-    assert "unsupported URL scheme" in str(result.get("reason", ""))
+    assert "allowed_schemes" in str(result.get("reason", ""))
 
 
 def test_handle_web_fetch_denies_unsupported_scheme() -> None:
@@ -957,6 +1012,7 @@ def test_handle_http_request_redacts_reflected_custom_header_token() -> None:
         "allowed_hosts": ["api.custom.local"],
         "allowed_methods": ["GET"],
         "allowed_paths": ["/v1/*"],
+        "allowed_schemes": ["https"],
         "protected_headers": ["Authorization", "X-API-Key"],
         "default_headers": {},
         "max_response_bytes": 4096,
@@ -1222,6 +1278,131 @@ def test_handle_web_search_denies_allowed_paths_mismatch() -> None:
     assert len(responses.calls) == 0
 
 
+def test_handle_web_search_denies_http_by_default() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "http://search.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    broker = RequestBroker(credentials=_credentials(), config=config)
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "allowed_schemes" in str(result.get("reason", ""))
+
+
+@responses.activate
+def test_handle_web_search_allows_http_when_explicit() -> None:
+    config = _broker_config()
+    config["web_search"] = {
+        "endpoint": "http://search.example.com/search",
+        "format": "brave",
+        "max_results": 10,
+    }
+    creds = _credentials()
+    creds["_web_search"]["allowed_schemes"] = ["http"]
+    broker = RequestBroker(credentials=creds, config=config)
+    responses.add(
+        responses.GET,
+        "http://search.example.com/search",
+        json={
+            "web": {
+                "results": [
+                    {"title": "A", "url": "https://a.example", "description": "Snippet A"},
+                ]
+            }
+        },
+        status=200,
+        headers={"Content-Type": "application/json"},
+    )
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result == {
+        "success": True,
+        "results": [
+            {"title": "A", "url": "https://a.example", "snippet": "Snippet A"},
+        ],
+    }
+
+
+def test_handle_http_request_header_auth_auto_protects_header_name() -> None:
+    creds = _credentials()
+    creds["custom"] = {
+        "auth_type": "header",
+        "header_name": "X-API-Key",
+        "token": "custom-token",
+        "allowed_hosts": ["api.custom.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/v1/*"],
+        "allowed_schemes": ["https"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    result = broker.handle(
+        {
+            "action": "http_request",
+            "integration": "custom",
+            "method": "GET",
+            "url": "https://api.custom.local/v1/check",
+            "headers": {"X-API-Key": "model-value"},
+            "body": None,
+        }
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "X-API-Key" in str(result.get("reason", ""))
+
+
+def test_broker_logs_invalid_policy_records_without_token_leak(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    creds = _credentials()
+    secret = "should-not-leak-in-logs"
+    creds["bad"] = {
+        "auth_type": "header",
+        "token": secret,
+        "allowed_hosts": ["api.bad.local"],
+        "allowed_methods": ["GET"],
+        "allowed_paths": ["/*"],
+        "allowed_schemes": ["gopher"],
+        "protected_headers": ["Authorization"],
+        "default_headers": {},
+        "max_response_bytes": 4096,
+        "rate_limit": None,
+    }
+
+    with caplog.at_level("WARNING"):
+        broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    result = broker.handle({"action": "list_integrations"})
+    assert result == {"success": True, "integrations": ["notion"]}
+    assert "skipping integration 'bad'" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_web_search_header_name_is_auto_protected_in_normalized_policy() -> None:
+    creds = _credentials()
+    creds["_web_search"] = {
+        **creds["_web_search"],
+        "header_name": "X-Subscription-Token",
+        "protected_headers": ["Authorization"],
+    }
+    broker = RequestBroker(credentials=creds, config=_broker_config())
+
+    policy = broker._policies["_web_search"]
+    assert policy.header_name == "X-Subscription-Token"
+    assert "X-Subscription-Token" in policy.protected_headers
+
+
 @responses.activate
 def test_handle_web_search_redirect_to_disallowed_host_is_denied() -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
@@ -1353,7 +1534,7 @@ def test_handle_http_request_public_redirect_to_unsupported_scheme_is_denied(
 
     assert result["success"] is False
     assert result["error"] == "policy_denied"
-    assert "unsupported URL scheme" in str(result.get("reason", ""))
+    assert "allowed_schemes" in str(result.get("reason", ""))
     assert len(responses.calls) == 1
 
 

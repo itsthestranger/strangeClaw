@@ -48,11 +48,87 @@ class Policy:
     allowed_hosts: tuple[str, ...]
     allowed_methods: tuple[str, ...]
     allowed_paths: tuple[str, ...]
+    allowed_schemes: tuple[str, ...]
     protected_headers: tuple[str, ...]
     default_headers: dict[str, str]
     max_response_bytes: int
     rate_limit_requests: int | None
     rate_limit_period_seconds: float | None
+
+    @classmethod
+    def from_record(cls, name: str, record: dict[str, Any]) -> Policy:
+        auth_type_raw = record.get("auth_type")
+        if not isinstance(auth_type_raw, str):
+            raise ValueError("auth_type must be a string")
+        auth_type = auth_type_raw.strip().lower()
+        if auth_type not in {"bearer", "header"}:
+            raise ValueError("auth_type must be one of: bearer, header")
+
+        token_raw = record.get("token")
+        if not isinstance(token_raw, str) or not token_raw:
+            raise ValueError("token must be a non-empty string")
+
+        allowed_hosts = _as_string_tuple(record.get("allowed_hosts"), "allowed_hosts")
+        allowed_methods_values = _as_string_tuple(record.get("allowed_methods"), "allowed_methods")
+        allowed_methods = tuple(item.upper() for item in allowed_methods_values)
+        allowed_paths = _as_string_tuple(record.get("allowed_paths"), "allowed_paths")
+        allowed_schemes_values = _as_string_tuple(
+            record.get("allowed_schemes", ["https"]),
+            "allowed_schemes",
+        )
+        allowed_schemes = tuple(_normalize_allowed_scheme(item) for item in allowed_schemes_values)
+        protected_headers_values = _as_string_tuple(
+            record.get("protected_headers"),
+            "protected_headers",
+        )
+
+        default_headers_raw = record.get("default_headers")
+        if not isinstance(default_headers_raw, dict):
+            raise ValueError("default_headers must be a mapping")
+        default_headers: dict[str, str] = {}
+        for key, value in default_headers_raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("default_headers must be a mapping of string keys and values")
+            default_headers[key] = value
+
+        max_response_bytes = _to_positive_int(record.get("max_response_bytes"))
+        if max_response_bytes is None:
+            raise ValueError("max_response_bytes must be a positive integer")
+
+        rate_limit = record.get("rate_limit")
+        rate_limit_requests: int | None = None
+        rate_limit_period_seconds: float | None = None
+        if isinstance(rate_limit, dict):
+            rate_limit_requests = _to_positive_int(rate_limit.get("requests"))
+            rate_limit_period_seconds = _to_positive_float(rate_limit.get("per_seconds"))
+
+        header_name = "Authorization"
+        if auth_type == "header":
+            header_name_raw = record.get("header_name", "Authorization")
+            if not isinstance(header_name_raw, str) or not header_name_raw.strip():
+                raise ValueError("header_name must be a non-empty string for header auth")
+            header_name = header_name_raw.strip()
+
+        protected_headers = _ensure_protected_header(
+            protected_headers_values,
+            header_name if auth_type == "header" else None,
+        )
+
+        return Policy(
+            name=name,
+            auth_type=auth_type,
+            token=token_raw,
+            header_name=header_name,
+            allowed_hosts=allowed_hosts,
+            allowed_methods=allowed_methods,
+            allowed_paths=allowed_paths,
+            allowed_schemes=allowed_schemes,
+            protected_headers=protected_headers,
+            default_headers=default_headers,
+            max_response_bytes=max_response_bytes,
+            rate_limit_requests=rate_limit_requests,
+            rate_limit_period_seconds=rate_limit_period_seconds,
+        )
 
 
 class _TokenBucket:
@@ -92,8 +168,19 @@ class RequestBroker:
         }
         self._rate_limiters: dict[str, _TokenBucket] = {}
         for integration, policy in credentials.items():
-            normalized = _normalize_policy(integration, policy)
-            if normalized is None:
+            if not isinstance(integration, str):
+                LOGGER.warning(
+                    "skipping integration %r: integration name must be a string",
+                    integration,
+                )
+                continue
+            if not isinstance(policy, dict):
+                LOGGER.warning("skipping integration '%s': record must be a mapping", integration)
+                continue
+            try:
+                normalized = Policy.from_record(integration, policy)
+            except ValueError as exc:
+                LOGGER.warning("skipping integration '%s': %s", integration, exc)
                 continue
             self._policies[integration] = normalized
             if (
@@ -129,6 +216,17 @@ class RequestBroker:
     ) -> PolicyResult:
         integration = policy.name
         method_upper = method.upper()
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in policy.allowed_schemes:
+            return PolicyResult(
+                allowed=False,
+                reason=(
+                    f"scheme {scheme or '<none>'} not in allowed_schemes "
+                    f"{list(policy.allowed_schemes)} for integration '{integration}'"
+                ),
+            )
+
         if method_upper not in policy.allowed_methods:
             return PolicyResult(
                 allowed=False,
@@ -138,7 +236,6 @@ class RequestBroker:
                 ),
             )
 
-        parsed = urlparse(url)
         host = parsed.hostname or ""
         if not any(fnmatch(host, pattern) for pattern in policy.allowed_hosts):
             return PolicyResult(
@@ -745,6 +842,7 @@ class RequestBroker:
             allowed_hosts=("*",),
             allowed_methods=allowed_methods,
             allowed_paths=("/*",),
+            allowed_schemes=("http", "https"),
             protected_headers=("Authorization",),
             default_headers={},
             max_response_bytes=max_response_bytes,
@@ -801,87 +899,35 @@ def _collect_credential_tokens(credentials: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(tokens, key=len, reverse=True))
 
 
-def _normalize_policy(name: str, raw_policy: Any) -> Policy | None:
-    if not isinstance(raw_policy, dict):
-        return None
-
-    auth_type_raw = raw_policy.get("auth_type")
-    if not isinstance(auth_type_raw, str):
-        return None
-    auth_type = auth_type_raw.strip().lower()
-    if auth_type not in {"bearer", "header"}:
-        return None
-
-    token_raw = raw_policy.get("token")
-    if not isinstance(token_raw, str):
-        return None
-
-    allowed_hosts = _normalize_string_tuple(raw_policy.get("allowed_hosts"))
-    allowed_methods = _normalize_string_tuple(raw_policy.get("allowed_methods"))
-    allowed_paths = _normalize_string_tuple(raw_policy.get("allowed_paths"))
-    protected_headers = _normalize_string_tuple(raw_policy.get("protected_headers"))
-    if (
-        allowed_hosts is None
-        or allowed_methods is None
-        or allowed_paths is None
-        or protected_headers is None
-    ):
-        return None
-
-    normalized_methods = tuple(item.upper() for item in allowed_methods)
-
-    default_headers_raw = raw_policy.get("default_headers")
-    if not isinstance(default_headers_raw, dict):
-        return None
-    default_headers: dict[str, str] = {}
-    for key, value in default_headers_raw.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            return None
-        default_headers[key] = value
-
-    max_response_bytes = _to_positive_int(raw_policy.get("max_response_bytes"))
-    if max_response_bytes is None:
-        return None
-
-    rate_limit = raw_policy.get("rate_limit")
-    rate_limit_requests: int | None = None
-    rate_limit_period_seconds: float | None = None
-    if isinstance(rate_limit, dict):
-        rate_limit_requests = _to_positive_int(rate_limit.get("requests"))
-        rate_limit_period_seconds = _to_positive_float(rate_limit.get("per_seconds"))
-
-    header_name = "Authorization"
-    if auth_type == "header":
-        header_name_raw = raw_policy.get("header_name", "Authorization")
-        if not isinstance(header_name_raw, str) or not header_name_raw.strip():
-            return None
-        header_name = header_name_raw.strip()
-
-    return Policy(
-        name=name,
-        auth_type=auth_type,
-        token=token_raw,
-        header_name=header_name,
-        allowed_hosts=allowed_hosts,
-        allowed_methods=normalized_methods,
-        allowed_paths=allowed_paths,
-        protected_headers=protected_headers,
-        default_headers=default_headers,
-        max_response_bytes=max_response_bytes,
-        rate_limit_requests=rate_limit_requests,
-        rate_limit_period_seconds=rate_limit_period_seconds,
-    )
-
-
-def _normalize_string_tuple(value: Any) -> tuple[str, ...] | None:
+def _as_string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
-        return None
+        raise ValueError(f"{field_name} must be a non-empty list of strings")
     items: list[str] = []
     for item in value:
         if not isinstance(item, str) or not item.strip():
-            return None
+            raise ValueError(f"{field_name} must be a non-empty list of strings")
         items.append(item.strip())
     return tuple(items)
+
+
+def _normalize_allowed_scheme(raw: str) -> str:
+    lowered = raw.lower()
+    if lowered not in {"http", "https"}:
+        raise ValueError("allowed_schemes must contain only: http, https")
+    return lowered
+
+
+def _ensure_protected_header(
+    protected_headers: tuple[str, ...],
+    required_header: str | None,
+) -> tuple[str, ...]:
+    normalized = list(protected_headers)
+    if required_header is None:
+        return tuple(normalized)
+    protected_lower = {name.lower() for name in normalized}
+    if required_header.lower() not in protected_lower:
+        normalized.append(required_header)
+    return tuple(normalized)
 
 
 def _redact_string(value: str, tokens: tuple[str, ...]) -> str:

@@ -11,6 +11,7 @@ import yaml
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SECRETS_PATH = Path.home() / ".strangeclaw" / "secrets.yaml"
 _VALID_AUTH_TYPES = {"bearer", "header"}
+_VALID_ALLOWED_SCHEMES = {"http", "https"}
 
 
 def load_secrets(path: str | None = None) -> dict[str, dict[str, Any]]:
@@ -94,6 +95,18 @@ def _normalize_record(record: Any) -> tuple[dict[str, Any], str | None]:
     if isinstance(allowed_paths, str):
         return {}, allowed_paths
 
+    allowed_schemes_any = record.get("allowed_schemes", ["https"])
+    allowed_schemes = _validate_non_empty_string_list(allowed_schemes_any, "allowed_schemes")
+    if isinstance(allowed_schemes, str):
+        return {}, allowed_schemes
+    normalized_schemes: list[str] = []
+    for scheme in allowed_schemes:
+        lowered = scheme.lower()
+        if lowered not in _VALID_ALLOWED_SCHEMES:
+            return {}, "allowed_schemes must contain only: http, https"
+        if lowered not in normalized_schemes:
+            normalized_schemes.append(lowered)
+
     protected_headers_any = record.get("protected_headers", ["Authorization"])
     protected_headers = _validate_non_empty_string_list(protected_headers_any, "protected_headers")
     if isinstance(protected_headers, str):
@@ -130,17 +143,26 @@ def _normalize_record(record: Any) -> tuple[dict[str, Any], str | None]:
         "allowed_hosts": allowed_hosts,
         "allowed_methods": normalized_methods,
         "allowed_paths": allowed_paths,
+        "allowed_schemes": normalized_schemes,
         "protected_headers": protected_headers,
         "default_headers": default_headers,
         "max_response_bytes": max_response_bytes,
         "rate_limit": rate_limit,
     }
 
+    header_name = "Authorization"
     if "header_name" in record:
-        header_name = record["header_name"]
-        if not isinstance(header_name, str) or not header_name.strip():
+        header_name_any = record["header_name"]
+        if not isinstance(header_name_any, str) or not header_name_any.strip():
             return {}, "header_name must be a non-empty string when provided"
-        normalized["header_name"] = header_name.strip()
+        header_name = header_name_any.strip()
+    if normalized_auth_type == "header":
+        normalized["header_name"] = header_name
+        protected_lower = {value.lower() for value in protected_headers}
+        if header_name.lower() not in protected_lower:
+            normalized["protected_headers"] = [*protected_headers, header_name]
+    elif "header_name" in record:
+        normalized["header_name"] = header_name
 
     if "query_param" in record:
         return {}, "query_param is not supported; use bearer/header auth with host policy"
