@@ -849,6 +849,89 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
     assert cid_manager.released == [52]
 
 
+def test_fire_sandbox_start_send_task_stop_lifecycle(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'],
+            )
+        ]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    assert sandbox.is_running() is False
+    sandbox.start()
+    assert sandbox.is_running() is True
+    assert tap_manager.create_calls == ["default"]
+    assert socket_factory.sockets[0].sent == [b"CONNECT 5000\n"]
+
+    sandbox.send_task(
+        {
+            "type": "task",
+            "text": "hello",
+            "session_id": "sess-1",
+            "approval_mode": "review",
+            "llm": {"model": "ignored", "api_key": "ignored"},
+        }
+    )
+    sent_payloads = socket_factory.sockets[0].sent
+    assert b'"type":"task"' in sent_payloads[1]
+    assert b'"llm"' not in sent_payloads[1]
+
+    sandbox.stop()
+    sandbox.stop()
+    assert sandbox.is_running() is False
+    assert iptables_manager.cleaned is True
+    assert tap_manager.destroyed == [_build_allocation().tap_name]
+
+
+def test_fire_sandbox_send_task_requires_running_vm(tmp_path: Path) -> None:
+    sandbox = FireSandbox(
+        firecracker_config=_build_firecracker_config(tmp_path),
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        install_exit_handlers=False,
+    )
+
+    with pytest.raises(RuntimeError, match="FireSandbox is not running"):
+        sandbox.send_task(
+            {
+                "type": "task",
+                "text": "hello",
+                "session_id": "sess-1",
+                "approval_mode": "review",
+            }
+        )
+
+
 def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     command_runner = _CopyingCommandRunner()

@@ -98,3 +98,39 @@ def test_yolo_sandbox_receive_returns_none_on_timeout() -> None:
     assert timeout_event is None
 
     sandbox.stop()
+
+
+def test_yolo_sandbox_lifecycle_send_task_starts_fresh_runtime() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["first"]}', action=None, usage=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "one"})),
+            LLMResponse(text='{"steps":["second"]}', action=None, usage=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "two"})),
+        ]
+    )
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+        agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
+    )
+
+    assert sandbox.is_running() is False
+    sandbox.start()
+    assert sandbox.is_running() is True
+
+    sandbox.send_task(_task_event(approval_mode="auto"))
+    assert sandbox.receive(timeout_seconds=2.0)["role"] == "plan"  # type: ignore[index]
+    done_one = sandbox.receive(timeout_seconds=2.0)
+    assert done_one is not None
+    assert done_one["reply"] == "one"
+
+    sandbox.send_task({**_task_event(approval_mode="auto"), "text": "say bye"})
+    assert sandbox.receive(timeout_seconds=2.0)["role"] == "plan"  # type: ignore[index]
+    done_two = sandbox.receive(timeout_seconds=2.0)
+    assert done_two is not None
+    assert done_two["reply"] == "two"
+
+    sandbox.stop()
+    sandbox.stop()
+    assert sandbox.is_running() is False
