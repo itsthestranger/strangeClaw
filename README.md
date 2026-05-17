@@ -98,39 +98,21 @@ sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
 
 ## Fire Mode Behavior (Current)
 
-- Fire mode is currently per-task ephemeral: each task boots a fresh microVM,
-  runs until `done`, then tears down.
-- Follow-up tasks reuse host-side persisted state, not a still-running guest VM.
+- Fire mode is session-persistent: the first task in a session boots a microVM,
+  and follow-up tasks in that same session reuse the same running VM.
+- Files and installed tooling inside the guest persist across tasks in the same
+  session.
+- Idle Fire sessions are reaped by timeout (`firecracker.session_idle_timeout_seconds`,
+  default `1800`; set `0` to disable reaping).
 - `--resume` is intentionally rejected in Fire mode.
 
-## Local LLMs In Fire Mode (Opt-In)
+## Local LLMs In Fire Mode
 
-By default, Fire mode blocks guest-to-host traffic.
-To use a host-local LLM server (Ollama/LM Studio), opt in with:
-
-```yaml
-llm:
-  model: lm_studio/your-model-id
-  api_key: ""
-  api_base: "http://localhost:1235/v1"
-
-firecracker:
-  host_expose:
-    enabled: true
-    ports: [1235]
-```
-
-Notes:
-- In Fire mode, `localhost` / `127.0.0.1` in `llm.api_base` is rewritten to the
-  TAP gateway IP before being sent to the guest.
-- Enabling `host_expose` weakens isolation; read the security analysis in
-  `strangeclaw_spec.md` §13 before using it.
-
-LM Studio loopback gotcha:
-- If LM Studio listens only on `127.0.0.1:1234`, expose a host proxy port:
-  ```bash
-  socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
-  ```
+Until the host-side LLM proxy lands (planned in milestone C8), Fire guests can
+only reach local/self-hosted model endpoints that are already reachable over the
+guest's normal NAT path (for example, a non-loopback host or network endpoint).
+Host-loopback-only endpoints (such as `127.0.0.1`) are not reachable from Fire
+mode.
 
 
 ## Features
@@ -148,7 +130,6 @@ LM Studio loopback gotcha:
 - Session persistence (`state.json`) plus output file export.
 - Optional redacted session event journal (`events.jsonl`).
 - Optional Firecracker runtime log artifact export to session outputs.
-- Optional Fire-mode local LLM routing via `firecracker.host_expose`.
 - Host-side request broker for `web_search`, `web_fetch`, and `http_request`
   so external API credentials stay out of the sandbox.
 

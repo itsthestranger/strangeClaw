@@ -96,19 +96,6 @@ firecracker:
   boot_timeout: 30
   tap_subnet_base: "172.16.0.0"
 
-  # Optional host port exposure for Fire mode local LLM use.
-  # Disabled by default for stronger isolation.
-  host_expose:
-    enabled: false
-    ports: []                    # e.g. [11434] (Ollama), [1235] (LM Studio proxy)
-
-    # LM Studio note:
-    # If LM Studio listens only on 127.0.0.1:1234, the Fire guest cannot
-    # reach it directly. Run a proxy in a separate terminal, then expose
-    # that proxy port:
-    #   socat TCP-LISTEN:1235,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1234
-    # and set llm.api_base: http://localhost:1235/v1
-
   # Optional Firecracker runtime log export (host-side diagnostics artifact).
   # Writes a sanitized tail to:
   # ~/.strangeclaw/sessions/<session_id>/outputs/system/firecracker.log.tail.txt

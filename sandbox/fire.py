@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol, cast
-from urllib.parse import urlsplit, urlunsplit
 
 from agent.broker_client import HostServiceError
 from agent.protocol import decode_event, encode_event
@@ -47,7 +46,6 @@ _CID_MIN = 3
 _CID_MAX = 4294967294
 _CID_RETRY_ATTEMPTS = 10
 _DEFAULT_CID_LOCK_PATH = Path("~/.strangeclaw/firecracker_cids.json").expanduser()
-_LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1"}
 _DEFAULT_LOG_EXPORT_MAX_BYTES = 32 * 1024
 _LOG_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -95,8 +93,6 @@ class FirecrackerConfig:
     mem_mb: int
     host_iface: str | None
     boot_timeout: float
-    host_expose_enabled: bool = False
-    host_expose_ports: tuple[int, ...] = ()
     log_export_enabled: bool = False
     log_export_max_bytes: int = _DEFAULT_LOG_EXPORT_MAX_BYTES
 
@@ -129,7 +125,6 @@ class FirecrackerConfig:
             "firecracker.boot_timeout",
         )
         host_iface = _validate_host_iface(fire_section.get("host_iface"))
-        host_expose_enabled, host_expose_ports = _parse_host_expose(fire_section)
         log_export_enabled, log_export_max_bytes = _parse_log_export(fire_section)
 
         return cls(
@@ -140,8 +135,6 @@ class FirecrackerConfig:
             mem_mb=mem_mb,
             host_iface=host_iface,
             boot_timeout=boot_timeout,
-            host_expose_enabled=host_expose_enabled,
-            host_expose_ports=host_expose_ports,
             log_export_enabled=log_export_enabled,
             log_export_max_bytes=log_export_max_bytes,
         )
@@ -212,15 +205,11 @@ class FirewallManagerLike(Protocol):
     def apply(
         self,
         allocation: TapNetworkAllocation,
-        *,
-        host_expose_ports: tuple[int, ...] = (),
     ) -> None: ...
 
     def cleanup(
         self,
         allocation: TapNetworkAllocation,
-        *,
-        host_expose_ports: tuple[int, ...] = (),
     ) -> None: ...
 
 
@@ -494,8 +483,6 @@ class IptablesManager:
     def apply(
         self,
         allocation: TapNetworkAllocation,
-        *,
-        host_expose_ports: tuple[int, ...] = (),
     ) -> None:
         """Apply per-session firewall/NAT rules and shared conntrack rule."""
         _validate_iptables_context(allocation)
@@ -528,22 +515,6 @@ class IptablesManager:
                 "ACCEPT",
             ]
         )
-        for port in host_expose_ports:
-            self._run_checked(
-                [
-                    "iptables",
-                    "-I",
-                    "INPUT",
-                    "-i",
-                    allocation.tap_name,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(port),
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
         self._run_checked(
             [
                 "iptables",
@@ -559,27 +530,9 @@ class IptablesManager:
     def cleanup(
         self,
         allocation: TapNetworkAllocation,
-        *,
-        host_expose_ports: tuple[int, ...] = (),
     ) -> None:
         """Best-effort teardown for per-session rules. Never raises."""
         _validate_iptables_context(allocation)
-        for port in host_expose_ports:
-            self._run_unchecked(
-                [
-                    "iptables",
-                    "-D",
-                    "INPUT",
-                    "-i",
-                    allocation.tap_name,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(port),
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
         self._run_unchecked(
             [
                 "iptables",
@@ -1036,7 +989,6 @@ class FireSandbox:
             self._start_session_id = sanitize_session_id(str(session_id))
         session_id = sanitize_session_id(self._start_session_id)
         self._session_id = session_id
-        host_expose_ports = self._host_expose_ports()
 
         try:
             credentials = load_secrets()
@@ -1052,19 +1004,7 @@ class FireSandbox:
             self._prepare_runtime_paths(session_id=session_id)
             self._copy_rootfs()
             self._allocation = self._tap_manager.create(session_id=session_id)
-            if self._firecracker_config.host_expose_enabled and not host_expose_ports:
-                LOGGER.warning(
-                    "firecracker.host_expose is enabled but ports is empty; "
-                    "guest-to-host exposure remains disabled."
-                )
-            if host_expose_ports:
-                LOGGER.info(
-                    "firecracker.host_expose enabled for ports %s on TAP %s. "
-                    "Review strangeclaw spec section 13 for security trade-offs.",
-                    list(host_expose_ports),
-                    self._allocation.tap_name,
-                )
-            self._iptables_manager.apply(self._allocation, host_expose_ports=host_expose_ports)
+            self._iptables_manager.apply(self._allocation)
             self._guest_cid = self._cid_manager.allocate()
             self._launch_firecracker()
             self._wait_for_api_socket(timeout_seconds=_DEFAULT_API_SOCKET_WAIT_SECONDS)
@@ -1154,12 +1094,7 @@ class FireSandbox:
                 self._host_service_server = None
             if self._allocation is not None:
                 allocation = self._allocation
-                host_expose_ports = self._host_expose_ports()
-                self._safe_teardown_step(
-                    lambda: self._iptables_manager.cleanup(
-                        allocation, host_expose_ports=host_expose_ports
-                    )
-                )
+                self._safe_teardown_step(lambda: self._iptables_manager.cleanup(allocation))
                 self._safe_teardown_step(lambda: self._tap_manager.destroy(allocation.tap_name))
                 self._allocation = None
             if self._guest_cid is not None:
@@ -1263,42 +1198,8 @@ class FireSandbox:
         except Exception:
             return
 
-    def _host_expose_ports(self) -> tuple[int, ...]:
-        if not self._firecracker_config.host_expose_enabled:
-            return ()
-        return self._firecracker_config.host_expose_ports
-
     def _prepare_agent_config_for_fire(self) -> dict[str, Any]:
-        if self._allocation is None:
-            raise RuntimeError("TAP allocation was not initialized.")
-
-        payload = _sanitize_agent_config_for_mmds(self._agent_config_template)
-        llm_payload = payload["llm"]
-        api_base = _extract_llm_api_base(llm_payload)
-        if api_base is None or not _is_localhost_api_base(api_base):
-            return payload
-
-        if not self._firecracker_config.host_expose_enabled:
-            LOGGER.warning(
-                "Local LLM configured (api_base=%s) but host_expose is disabled. "
-                "The Fire guest cannot reach this endpoint. "
-                "Either enable host_expose (review strangeclaw spec section 13 first) "
-                "or use a cloud provider.",
-                api_base,
-            )
-            return payload
-
-        rewritten = _rewrite_api_base_host(api_base, self._allocation.tap_ip)
-        llm_payload["api_base"] = rewritten
-
-        provider_settings = llm_payload.get("provider_settings")
-        if provider_settings is None:
-            llm_payload["provider_settings"] = {"api_base": rewritten}
-        elif isinstance(provider_settings, Mapping):
-            provider_copy = dict(provider_settings)
-            provider_copy["api_base"] = rewritten
-            llm_payload["provider_settings"] = provider_copy
-        return payload
+        return _sanitize_agent_config_for_mmds(self._agent_config_template)
 
     def _prepare_runtime_paths(self, *, session_id: str) -> None:
         self._session_temp_dir = Path(
@@ -1666,44 +1567,6 @@ def _validate_host_iface(value: Any) -> str | None:
     return stripped
 
 
-def _parse_host_expose(fire_section: Mapping[str, Any]) -> tuple[bool, tuple[int, ...]]:
-    raw = fire_section.get("host_expose")
-    if raw is None:
-        return False, ()
-    if not isinstance(raw, Mapping):
-        raise FirecrackerConfigError("Config field firecracker.host_expose must be a mapping.")
-
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise FirecrackerConfigError(
-            "Config field firecracker.host_expose.enabled must be a boolean."
-        )
-
-    ports_raw = raw.get("ports", [])
-    if not isinstance(ports_raw, list):
-        raise FirecrackerConfigError("Config field firecracker.host_expose.ports must be a list.")
-
-    ports: list[int] = []
-    seen: set[int] = set()
-    for index, item in enumerate(ports_raw):
-        if isinstance(item, bool) or not isinstance(item, int):
-            raise FirecrackerConfigError(
-                "Config field firecracker.host_expose.ports must contain integers "
-                f"in range 1..65535 (invalid at index {index})."
-            )
-        if item < 1 or item > 65535:
-            raise FirecrackerConfigError(
-                "Config field firecracker.host_expose.ports must contain integers "
-                f"in range 1..65535 (invalid value {item} at index {index})."
-            )
-        if item in seen:
-            continue
-        seen.add(item)
-        ports.append(item)
-
-    return enabled, tuple(ports)
-
-
 def _parse_log_export(fire_section: Mapping[str, Any]) -> tuple[bool, int]:
     raw = fire_section.get("log_export")
     if raw is None:
@@ -2052,47 +1915,6 @@ def _parse_link_name(line: str) -> str | None:
         return None
     raw_name = match.group(1)
     return raw_name.split("@", 1)[0]
-
-
-def _extract_llm_api_base(llm: Mapping[str, Any]) -> str | None:
-    api_base = llm.get("api_base")
-    if isinstance(api_base, str) and api_base.strip():
-        return api_base.strip()
-
-    provider_settings = llm.get("provider_settings")
-    if isinstance(provider_settings, Mapping):
-        provider_api_base = provider_settings.get("api_base")
-        if isinstance(provider_api_base, str) and provider_api_base.strip():
-            return provider_api_base.strip()
-    return None
-
-
-def _is_localhost_api_base(api_base: str) -> bool:
-    parsed = urlsplit(api_base)
-    hostname = parsed.hostname
-    if hostname is None:
-        return False
-    return hostname.lower() in _LOCAL_LLM_HOSTS
-
-
-def _rewrite_api_base_host(api_base: str, new_host: str) -> str:
-    parsed = urlsplit(api_base)
-    if not parsed.netloc:
-        return api_base
-
-    userinfo = ""
-    if parsed.username is not None:
-        userinfo = parsed.username
-        if parsed.password is not None:
-            userinfo += f":{parsed.password}"
-        userinfo += "@"
-
-    if parsed.port is not None:
-        new_netloc = f"{userinfo}{new_host}:{parsed.port}"
-    else:
-        new_netloc = f"{userinfo}{new_host}"
-
-    return urlunsplit((parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def _validate_iptables_context(allocation: TapNetworkAllocation) -> None:

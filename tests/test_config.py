@@ -119,7 +119,6 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     }
     assert loaded["web_fetch"] == {"max_chars": 20000}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
-    assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
     assert loaded["firecracker"]["session_idle_timeout_seconds"] == 1800
@@ -168,16 +167,6 @@ def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_load_config_rejects_invalid_host_expose_ports(tmp_path: Path) -> None:
-    config = _base_config(api_key="plain-key")
-    config["firecracker"]["host_expose"] = {"enabled": True, "ports": [11434, 70000]}
-    config_path = tmp_path / "config.yaml"
-    _write_config(config_path, config)
-
-    with pytest.raises(ConfigError, match=r"host_expose\.ports"):
-        load_config(config_path)
-
-
 def test_load_config_rejects_invalid_fire_log_export_fields(tmp_path: Path) -> None:
     config = _base_config(api_key="plain-key")
     config["firecracker"]["log_export"] = {"enabled": "yes", "max_bytes": "huge"}
@@ -215,22 +204,6 @@ def test_load_config_rejects_invalid_fire_session_idle_timeout_seconds(
 
     with pytest.raises(ConfigError, match=r"session_idle_timeout_seconds"):
         load_config(config_path)
-
-
-def test_load_config_warns_when_host_expose_enabled_without_ports(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    config = _base_config(api_key="plain-key")
-    config["firecracker"]["host_expose"] = {"enabled": True, "ports": []}
-    config_path = tmp_path / "config.yaml"
-    _write_config(config_path, config)
-
-    with caplog.at_level("WARNING"):
-        loaded = load_config(config_path)
-
-    assert loaded["firecracker"]["host_expose"] == {"enabled": True, "ports": []}
-    assert "enabled but no ports were configured" in caplog.text
 
 
 def test_load_config_warns_on_unknown_tool_names(
