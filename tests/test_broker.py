@@ -48,7 +48,7 @@ def _broker_config() -> dict[str, object]:
                 "max_response_bytes": 4096,
             }
         },
-        "web_fetch": {"max_chars": 20000},
+        "web_fetch": {"max_response_bytes": 4096},
         "web_search": {
             "endpoint": "https://search.example.com/search",
             "format": "brave",
@@ -1281,32 +1281,49 @@ def test_handle_http_request_rate_limited_on_n_plus_one(monkeypatch: pytest.Monk
 
 
 @responses.activate
-def test_handle_web_fetch_html_runs_trafilatura(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_web_fetch_returns_raw_html_body(monkeypatch: pytest.MonkeyPatch) -> None:
     _public_dns(monkeypatch)
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    html_body = "<html><body><article>Main text</article></body></html>"
     responses.add(
         responses.GET,
         "https://example.com/page",
-        body="<html><body><article>Main text</article></body></html>",
+        body=html_body,
         status=200,
         headers={"Content-Type": "text/html; charset=utf-8"},
-    )
-
-    class _Meta:
-        title = "Sample"
-
-    monkeypatch.setattr("sandbox.broker.trafilatura.extract", lambda *args, **kwargs: "MAIN")
-    monkeypatch.setattr(
-        "sandbox.broker.trafilatura.extract_metadata",
-        lambda *args, **kwargs: _Meta(),
     )
 
     result = broker.handle({"action": "web_fetch", "url": "https://example.com/page"})
 
     assert result["success"] is True
-    assert result["content_type"] == "text/html"
-    assert result["title"] == "Sample"
-    assert result["text"] == "MAIN"
+    assert result["status_code"] == 200
+    assert isinstance(result["headers"], dict)
+    assert result["body"] == html_body
+    assert result["truncated"] is False
+    assert "text" not in result
+    assert "content_type" not in result
+    assert "title" not in result
+
+
+@responses.activate
+def test_handle_web_fetch_truncates_to_max_response_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _public_dns(monkeypatch)
+    config = _broker_config()
+    config["web_fetch"] = {"max_response_bytes": 8}
+    broker = RequestBroker(credentials=_credentials(), config=config)
+    responses.add(
+        responses.GET,
+        "https://example.com/page",
+        body="0123456789abcdef",
+        status=200,
+        headers={"Content-Type": "text/plain"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/page"})
+
+    assert result["success"] is True
+    assert result["body"] == "01234567"
+    assert result["truncated"] is True
 
 
 @responses.activate

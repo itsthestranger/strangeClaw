@@ -180,7 +180,10 @@ class Tools:
     def _web_fetch_schema() -> dict[str, Any]:
         return {
             "name": "web_fetch",
-            "description": "Fetch a URL and extract readable content.",
+            "description": (
+                "Fetch a URL and return the HTTP response "
+                "(status, headers, decoded text body, truncation flag)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

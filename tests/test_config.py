@@ -117,7 +117,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
         "format": "brave",
         "max_results": 10,
     }
-    assert loaded["web_fetch"] == {"max_chars": 20000}
+    assert loaded["web_fetch"] == {"max_response_bytes": 524288}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -289,13 +289,26 @@ def test_load_config_accepts_empty_legacy_web_search_api_key_and_strips_it(tmp_p
     }
 
 
-def test_load_config_rejects_invalid_web_fetch_max_chars(tmp_path: Path) -> None:
+def test_load_config_rejects_legacy_web_fetch_max_chars(tmp_path: Path) -> None:
     config = _base_config(api_key="plain-key")
-    config["web_fetch"] = {"max_chars": 0}
+    config["web_fetch"] = {"max_chars": 20000}
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, config)
 
-    with pytest.raises(ConfigError, match=r"web_fetch\.max_chars"):
+    with pytest.raises(
+        ConfigError,
+        match=r"web_fetch\.max_chars has been removed.*max_response_bytes",
+    ):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_web_fetch_max_response_bytes(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["web_fetch"] = {"max_response_bytes": 0}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"web_fetch\.max_response_bytes"):
         load_config(config_path)
 
 

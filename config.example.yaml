@@ -42,7 +42,7 @@ llm:
 tools:
   shell: true                   # High risk: command execution
   web_search: true              # Low risk: search endpoint queries
-  web_fetch: true               # Low risk: URL retrieval/extraction
+  web_fetch: true               # Low risk: URL retrieval (raw HTTP response)
   http_request: true            # Medium risk: arbitrary HTTP API calls
 
 web_search:
@@ -54,7 +54,7 @@ web_search:
   max_results: 10
 
 web_fetch:
-  max_chars: 20000              # truncate extracted text (~5k tokens)
+  max_response_bytes: 524288    # cap response body size in bytes (old key max_chars removed)
 
 broker:
   public_policy:

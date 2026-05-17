@@ -245,21 +245,29 @@ def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:
 def _validate_web_fetch_optional_fields(config: dict[str, Any]) -> None:
     web_fetch = config.get("web_fetch")
     if web_fetch is None:
-        config["web_fetch"] = {"max_chars": 20000}
+        config["web_fetch"] = {"max_response_bytes": 524288}
         return
     if not isinstance(web_fetch, dict):
         raise ConfigError("Config field web_fetch must be a mapping.")
 
-    max_chars_raw = web_fetch.get("max_chars", 20000)
-    if isinstance(max_chars_raw, bool):
-        raise ConfigError("Config field web_fetch.max_chars must be an integer.")
+    if "max_chars" in web_fetch:
+        raise ConfigError(
+            "Config field web_fetch.max_chars has been removed. Use "
+            "web_fetch.max_response_bytes instead."
+        )
+
+    max_response_bytes_raw = web_fetch.get("max_response_bytes", 524288)
+    if isinstance(max_response_bytes_raw, bool):
+        raise ConfigError("Config field web_fetch.max_response_bytes must be an integer.")
     try:
-        max_chars = int(max_chars_raw)
+        max_response_bytes = int(max_response_bytes_raw)
     except (TypeError, ValueError) as exc:
-        raise ConfigError("Config field web_fetch.max_chars must be an integer.") from exc
-    if max_chars <= 0:
-        raise ConfigError("Config field web_fetch.max_chars must be greater than zero.")
-    web_fetch["max_chars"] = max_chars
+        raise ConfigError("Config field web_fetch.max_response_bytes must be an integer.") from exc
+    if max_response_bytes <= 0:
+        raise ConfigError(
+            "Config field web_fetch.max_response_bytes must be greater than zero."
+        )
+    web_fetch["max_response_bytes"] = max_response_bytes
 
 
 def _validate_skills_optional_fields(config: dict[str, Any]) -> None:

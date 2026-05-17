@@ -14,14 +14,12 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
-import trafilatura
 
 from host_secrets import list_integration_names
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_PUBLIC_MAX_RESPONSE_BYTES = 524288
-_DEFAULT_WEB_FETCH_MAX_CHARS = 20000
-_WEB_FETCH_BODY_MULTIPLIER = 4
+_DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES = 524288
 _MAX_REDIRECT_HOPS = 5
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _PUBLIC_ALLOWED_SCHEMES = {"http", "https"}
@@ -698,66 +696,18 @@ class RequestBroker:
         if isinstance(parsed, dict):
             return parsed
         url = parsed
-        max_chars = self._web_fetch_max_chars()
-        execute_result = self._execute_public_request(
+        return self._execute_public_request(
             policy=self._build_public_policy({}),
             integration_name="_web_fetch",
             method="GET",
             url=url,
             model_headers={},
             body=None,
-            max_bytes=max_chars * _WEB_FETCH_BODY_MULTIPLIER,
+            max_bytes=self._web_fetch_max_response_bytes(),
             enforce_validation=False,
             enforce_initial_ssrf=True,
             enforce_redirect_ssrf=True,
         )
-        if execute_result.get("success") is False:
-            return execute_result
-
-        headers = execute_result.get("headers")
-        content_type = _normalize_content_type(
-            str(headers.get("Content-Type", "")) if isinstance(headers, dict) else ""
-        )
-        body_text = str(execute_result.get("body", ""))
-        body_bytes = body_text.encode("utf-8", errors="replace")
-        status_code = int(execute_result.get("status_code", 0))
-
-        title: str | None = None
-        if content_type == "text/html":
-            extracted = trafilatura.extract(body_text, include_links=True, include_tables=True)
-            metadata = trafilatura.extract_metadata(body_text)
-            maybe_title_raw: Any = None
-            if metadata is not None:
-                try:
-                    maybe_title_raw = metadata.title
-                except AttributeError:
-                    maybe_title_raw = None
-            if isinstance(maybe_title_raw, str):
-                maybe_title = maybe_title_raw.strip()
-                if maybe_title:
-                    title = maybe_title
-            text = extracted if isinstance(extracted, str) and extracted.strip() else body_text
-        elif content_type in {"text/plain", "application/json", "text/xml", "application/xml"}:
-            text = body_text
-        elif content_type == "application/pdf":
-            text = (
-                f"PDF document, {len(body_bytes)} bytes. "
-                "Use the shell tool with pdftotext to extract content."
-            )
-        else:
-            display_type = content_type or "application/octet-stream"
-            text = f"Binary content ({display_type}), {len(body_bytes)} bytes. No text extracted."
-
-        truncated_text, text_truncated = _truncate_text(text, max_chars)
-        return {
-            "success": True,
-            "url": url,
-            "status_code": status_code,
-            "content_type": content_type,
-            "title": title,
-            "text": truncated_text,
-            "truncated": bool(execute_result.get("truncated", False) or text_truncated),
-        }
 
     def _handle_web_search(self, payload: dict[str, Any]) -> dict[str, Any]:
         policy = self._policies.get("_web_search")
@@ -870,13 +820,13 @@ class RequestBroker:
             rate_limit_period_seconds=None,
         )
 
-    def _web_fetch_max_chars(self) -> int:
+    def _web_fetch_max_response_bytes(self) -> int:
         section = self._config.get("web_fetch")
         if not isinstance(section, dict):
-            return _DEFAULT_WEB_FETCH_MAX_CHARS
-        value = _to_positive_int(section.get("max_chars"))
+            return _DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES
+        value = _to_positive_int(section.get("max_response_bytes"))
         if value is None:
-            return _DEFAULT_WEB_FETCH_MAX_CHARS
+            return _DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES
         return value
 
     def _web_search_endpoint(self) -> str:
@@ -1064,20 +1014,6 @@ def _normalize_headers(value: Any) -> tuple[dict[str, str], str | None]:
 
 def _invalid_request(reason: str) -> dict[str, Any]:
     return {"success": False, "error": "invalid_request", "reason": reason}
-
-
-def _normalize_content_type(raw: str) -> str:
-    lowered = raw.lower().strip()
-    if ";" in lowered:
-        lowered = lowered.split(";", 1)[0].strip()
-    return lowered
-
-
-def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
-    if len(text) <= limit:
-        return text, False
-    notice = f"\n\n[... truncated, original {len(text)} chars ...]"
-    return text[:limit] + notice, True
 
 
 def _normalize_brave_results(payload: dict[str, Any], max_results: int) -> list[dict[str, str]]:

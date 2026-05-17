@@ -1725,7 +1725,7 @@ def _coerce_agent_config_template(
                 "format": "brave",
                 "max_results": 10,
             },
-            "web_fetch": {"max_chars": 20000},
+            "web_fetch": {"max_response_bytes": 524288},
             "skills": {"directory": "./skills", "max_file_chars": 20000},
             "approval_mode": "review",
             "max_iterations": 50,
@@ -1808,7 +1808,7 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         web_fetch = dict(web_fetch_raw)
     else:
         web_fetch = {}
-    web_fetch.setdefault("max_chars", 20000)
+    web_fetch.setdefault("max_response_bytes", 524288)
 
     skills_raw = config.get("skills")
     skills: dict[str, Any]

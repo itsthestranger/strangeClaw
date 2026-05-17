@@ -133,10 +133,9 @@ def test_tools_web_fetch_calls_broker_with_expected_payload() -> None:
     broker = _RecordingBroker(
         {
             "success": True,
-            "url": "https://example.com",
             "status_code": 200,
-            "content_type": "text/plain",
-            "text": "hello",
+            "headers": {"Content-Type": "text/plain"},
+            "body": "hello",
             "truncated": False,
         }
     )
@@ -149,7 +148,7 @@ def test_tools_web_fetch_calls_broker_with_expected_payload() -> None:
         ("broker", {"action": "web_fetch", "url": "https://example.com"})
     ]
     payload = _unwrap_data(result.stdout)
-    assert payload["text"] == "hello"
+    assert payload["body"] == "hello"
 
 
 def test_tools_web_fetch_handles_host_service_error() -> None:
@@ -163,7 +162,7 @@ def test_tools_web_fetch_handles_host_service_error() -> None:
 
 
 def test_tools_web_fetch_rejects_missing_success_envelope() -> None:
-    broker = _RecordingBroker({"url": "https://example.com", "text": "hello"})
+    broker = _RecordingBroker({"status_code": 200, "body": "hello"})
     tools = Tools(config={}, broker=broker)  # type: ignore[arg-type]
 
     result = tools.execute(ToolCall(tool="web_fetch", args={"url": "https://example.com"}))
@@ -267,10 +266,9 @@ def test_tools_web_fetch_output_uses_single_data_wrapper() -> None:
     broker = _RecordingBroker(
         {
             "success": True,
-            "url": "https://example.com",
             "status_code": 200,
-            "content_type": "text/plain",
-            "text": "hello",
+            "headers": {"Content-Type": "text/plain"},
+            "body": "hello",
             "truncated": False,
         }
     )

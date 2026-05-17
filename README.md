@@ -152,8 +152,11 @@ disabled in `config.yaml`, and are the permission boundary:
 
 - `shell`: run shell commands. High risk.
 - `web_search`: search via the host broker. Low risk.
-- `web_fetch`: fetch and extract public URL content via the host broker. Low risk.
+- `web_fetch`: fetch a public URL response via the host broker. Low risk.
 - `http_request`: make structured HTTP/API calls via the host broker. Medium risk.
+
+`web_fetch` performance note:
+The broker now returns raw HTTP response data (`status_code`, `headers`, `body`, `truncated`) without host-side content extraction. This reduces host-side complexity and parser attack surface, but HTML-heavy pages can increase token usage and response latency. For web-heavy workflows, prefer optional guest-side parsing steps (for example via `shell`) before summarization.
 
 Skills are instructions and workflow context. A skill is a directory under
 `skills/` with a `SKILL.md` file using YAML frontmatter, plus optional
