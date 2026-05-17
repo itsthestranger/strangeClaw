@@ -122,6 +122,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["firecracker"]["host_expose"] == {"enabled": False, "ports": []}
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
+    assert loaded["firecracker"]["session_idle_timeout_seconds"] == 1800
     assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
 
 
@@ -201,6 +202,18 @@ def test_load_config_rejects_invalid_fire_lifecycle_status_messages(
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"lifecycle_status_messages"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_fire_session_idle_timeout_seconds(
+    tmp_path: Path,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["firecracker"]["session_idle_timeout_seconds"] = -1
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"session_idle_timeout_seconds"):
         load_config(config_path)
 
 

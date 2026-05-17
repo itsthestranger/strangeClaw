@@ -43,9 +43,17 @@ class Coordinator:
         max_active_sessions: int | None = None,
         session_journal: dict[str, Any] | None = None,
         fire_lifecycle_status_messages: bool = True,
+        session_idle_timeout_seconds: int = 1800,
+        _idle_reaper_interval_seconds: float = 60.0,
     ) -> None:
         if max_active_sessions is not None and max_active_sessions <= 0:
             raise ValueError("max_active_sessions must be positive when set.")
+        if isinstance(session_idle_timeout_seconds, bool):
+            raise ValueError("session_idle_timeout_seconds must be a non-negative integer.")
+        if session_idle_timeout_seconds < 0:
+            raise ValueError("session_idle_timeout_seconds must be a non-negative integer.")
+        if _idle_reaper_interval_seconds <= 0:
+            raise ValueError("_idle_reaper_interval_seconds must be greater than zero.")
         self._sandbox_factory = sandbox_factory
         self._approval_mode = approval_mode
         self._llm_config = dict(llm_config) if llm_config is not None else None
@@ -54,8 +62,17 @@ class Coordinator:
         self._journal_enabled = bool(journal.get("enabled", False))
         self._journal_max_bytes = int(journal.get("max_bytes", 1 * 1024 * 1024))
         self._fire_lifecycle_status_messages = bool(fire_lifecycle_status_messages)
+        self._session_idle_timeout_seconds = session_idle_timeout_seconds
+        self._idle_reaper_interval_seconds = _idle_reaper_interval_seconds
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionRecord] = {}
+        self._idle_reaper_stop = threading.Event()
+        self._idle_reaper_thread = threading.Thread(
+            target=self._run_idle_reaper,
+            name="coordinator-idle-reaper",
+            daemon=True,
+        )
+        self._idle_reaper_thread.start()
 
     def seed_state(self, *, session_id: str, state: dict[str, Any]) -> None:
         """Seed stored state for a session (used by resume flows)."""
@@ -195,6 +212,7 @@ class Coordinator:
 
     def stop_all(self) -> None:
         """Stop all session workers."""
+        self._idle_reaper_stop.set()
         workers: list[_SessionWorker] = []
         sandboxes: list[Any] = []
         with self._lock:
@@ -214,6 +232,7 @@ class Coordinator:
                 sandbox.stop()
             except Exception:
                 pass
+        self._idle_reaper_thread.join(timeout=2.0)
 
     def _active_session_count_locked(self) -> int:
         count = 0
@@ -280,6 +299,45 @@ class Coordinator:
             if record is not None:
                 record.worker = None
                 record.pending_role = None
+
+    def _run_idle_reaper(self) -> None:
+        while not self._idle_reaper_stop.wait(self._idle_reaper_interval_seconds):
+            timeout_seconds = self._session_idle_timeout_seconds
+            if timeout_seconds == 0:
+                continue
+
+            now = time.monotonic()
+            sandboxes_to_stop: list[Any] = []
+            with self._lock:
+                for record in self._sessions.values():
+                    sandbox = record.sandbox
+                    if sandbox is None:
+                        continue
+
+                    worker = record.worker
+                    if worker is not None and worker.is_running():
+                        continue
+
+                    completed_at = record.last_task_completed_at
+                    if completed_at is None:
+                        continue
+                    if now - completed_at <= timeout_seconds:
+                        continue
+
+                    if not sandbox.is_running():
+                        record.sandbox = None
+                        record.last_task_completed_at = None
+                        continue
+
+                    record.sandbox = None
+                    record.last_task_completed_at = None
+                    sandboxes_to_stop.append(sandbox)
+
+            for sandbox in sandboxes_to_stop:
+                try:
+                    sandbox.stop()
+                except Exception:
+                    pass
 
 
 class _SessionWorker:

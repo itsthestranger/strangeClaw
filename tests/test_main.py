@@ -94,6 +94,7 @@ class FakeCoordinator:
         max_active_sessions: int | None = None,
         session_journal: dict[str, Any] | None = None,
         fire_lifecycle_status_messages: bool = True,
+        session_idle_timeout_seconds: int = 1800,
     ) -> None:
         self.sandbox_factory = sandbox_factory
         self.approval_mode = approval_mode
@@ -101,6 +102,7 @@ class FakeCoordinator:
         self.max_active_sessions = max_active_sessions
         self.session_journal = session_journal
         self.fire_lifecycle_status_messages = fire_lifecycle_status_messages
+        self.session_idle_timeout_seconds = session_idle_timeout_seconds
         self.seed_calls: list[tuple[str, dict[str, Any]]] = []
         self.stop_session_calls: list[str] = []
         self.stop_all_called = False
@@ -198,6 +200,7 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator
     assert coordinator.fire_lifecycle_status_messages is True
+    assert coordinator.session_idle_timeout_seconds == 1800
     assert adapter.run_called is True
 
 

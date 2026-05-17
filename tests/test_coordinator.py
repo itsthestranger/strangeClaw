@@ -164,9 +164,14 @@ def test_coordinator_worker_exit_does_not_stop_session_sandbox(
     assert _wait_until(lambda: sandbox.send_task_calls == 1)
     assert _wait_until(lambda: sandbox.stop_calls == 0)
     assert sandbox.is_running() is True
+    coordinator.stop_all()
 
 
-def test_coordinator_stop_session_stops_session_sandbox() -> None:
+def test_coordinator_stop_session_stops_session_sandbox(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     sandbox = FakeSandbox(events=[])
     coordinator = Coordinator(
         sandbox_factory=lambda: sandbox,
@@ -181,6 +186,7 @@ def test_coordinator_stop_session_stops_session_sandbox() -> None:
     coordinator.stop_session(session_id="sess-1")
     assert sandbox.stop_calls == 1
     assert sandbox.is_running() is False
+    coordinator.stop_all()
 
 
 def test_coordinator_starts_fresh_sandbox_after_stop_session(
@@ -217,12 +223,18 @@ def test_coordinator_starts_fresh_sandbox_after_stop_session(
         llm_config={"model": "x", "api_key": "k"},
     )
 
-    assert coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None) == "started"
+    assert (
+        coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None)
+        == "started"
+    )
     assert _wait_until(lambda: first.send_task_calls == 1)
     coordinator.stop_session(session_id="sess-1")
     assert first.stop_calls == 1
 
-    assert coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None) == "started"
+    assert (
+        coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+        == "started"
+    )
     assert _wait_until(lambda: second.send_task_calls == 1)
     assert second.start_calls == 1
 
@@ -261,7 +273,10 @@ def test_coordinator_restarts_sandbox_when_not_running_between_tasks(
         llm_config={"model": "x", "api_key": "k"},
     )
 
-    assert coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None) == "started"
+    assert (
+        coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None)
+        == "started"
+    )
     assert _wait_until(lambda: first.send_task_calls == 1)
     first._running = False
 
@@ -273,6 +288,180 @@ def test_coordinator_restarts_sandbox_when_not_running_between_tasks(
             time.sleep(0.01)
     assert status == "started"
     assert _wait_until(lambda: second.send_task_calls == 1)
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+    coordinator.stop_all()
+
+
+def test_coordinator_reaps_idle_session_sandbox_after_timeout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {"type": "done", "success": True, "reply": "ok", "state": {"goal": "g"}, "files": []}
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=1,
+        _idle_reaper_interval_seconds=0.02,
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: sandbox.send_task_calls == 1)
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+    with coordinator._lock:  # type: ignore[attr-defined]
+        coordinator._sessions["sess-1"].last_task_completed_at = time.monotonic() - 5.0  # type: ignore[attr-defined]
+
+    assert _wait_until(lambda: sandbox.stop_calls == 1)
+    assert sandbox.is_running() is False
+    coordinator.stop_all()
+
+
+def test_coordinator_timeout_zero_disables_idle_reaper(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {"type": "done", "success": True, "reply": "ok", "state": {"goal": "g"}, "files": []}
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=0,
+        _idle_reaper_interval_seconds=0.02,
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: sandbox.send_task_calls == 1)
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+    with coordinator._lock:  # type: ignore[attr-defined]
+        coordinator._sessions["sess-1"].last_task_completed_at = time.monotonic() - 5.0  # type: ignore[attr-defined]
+
+    time.sleep(0.1)
+    assert sandbox.stop_calls == 0
+    assert sandbox.is_running() is True
+    coordinator.stop_all()
+
+
+def test_coordinator_reaper_preserves_latest_state_across_vm_restart(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {
+                    "goal": "g",
+                    "plan": {"steps": ["old"]},
+                    "history": [{"type": "action"}],
+                },
+                "files": [],
+            }
+        ]
+    )
+    second = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=1,
+        _idle_reaper_interval_seconds=0.02,
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: first.send_task_calls == 1)
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+    with coordinator._lock:  # type: ignore[attr-defined]
+        coordinator._sessions["sess-1"].last_task_completed_at = time.monotonic() - 5.0  # type: ignore[attr-defined]
+    assert _wait_until(lambda: first.stop_calls == 1)
+
+    status = "busy"
+    deadline = time.monotonic() + 2.0
+    while status == "busy" and time.monotonic() < deadline:
+        status = coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+        if status == "busy":
+            time.sleep(0.01)
+    assert status == "started"
+    assert _wait_until(lambda: second.send_task_calls == 1)
+    second_task = second.started_tasks[0]
+    assert second_task["state"] == {"goal": "g", "history": [{"type": "action"}]}
+    assert "plan" not in second_task["state"]
+    coordinator.stop_all()
+
+
+def test_coordinator_reaper_does_not_stop_sandbox_with_active_worker() -> None:
+    sandbox = FakeSandbox(events=[{"type": "message", "role": "status", "content": "working"}])
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=1,
+        _idle_reaper_interval_seconds=0.02,
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+        == "started"
+    )
+    with coordinator._lock:  # type: ignore[attr-defined]
+        coordinator._sessions["sess-1"].last_task_completed_at = time.monotonic() - 5.0  # type: ignore[attr-defined]
+
+    time.sleep(0.1)
+    assert sandbox.stop_calls == 0
+    coordinator.stop_all()
+
+
+def test_coordinator_stop_all_joins_idle_reaper_thread() -> None:
+    coordinator = Coordinator(
+        sandbox_factory=lambda: FakeSandbox(events=[]),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=1,
+        _idle_reaper_interval_seconds=0.02,
+    )
+    assert coordinator._idle_reaper_thread.is_alive() is True  # type: ignore[attr-defined]
+    coordinator.stop_all()
+    assert coordinator._idle_reaper_thread.is_alive() is False  # type: ignore[attr-defined]
 
 
 def test_coordinator_reports_busy_for_running_session() -> None:
@@ -385,7 +574,9 @@ def test_coordinator_emits_fire_lifecycle_status_messages(tmp_path: Path, monkey
         for event in seen_events
         if event.get("type") == "message" and event.get("role") == "status"
     ]
-    assert [event.get("content") for event in statuses] == ["Firecracker sandbox started successfully."]
+    assert [event.get("content") for event in statuses] == [
+        "Firecracker sandbox started successfully."
+    ]
     assert seen_events[-1].get("type") == "done"
     assert sandbox.stop_calls == 0
 
