@@ -53,9 +53,34 @@ class YoloSandbox:
         self._agent_thread: threading.Thread | None = None
         self._thread_error: Exception | None = None
         self._host_service_server: HostServiceServer | None = None
+        self._started = False
 
     def run(self, task: dict[str, Any]) -> None:
-        """Start an agent run for a task."""
+        """Compatibility wrapper: start the sandbox and send one task."""
+        self.start()
+        self.send_task(task)
+
+    def start(self) -> None:
+        """Start the sandbox lifecycle.
+
+        Yolo has no persistent isolation boundary. The per-task runtime is
+        created by send_task(), but this shim lets coordinators use the same
+        lifecycle interface for all sandbox types.
+        """
+        self._started = True
+
+    def is_running(self) -> bool:
+        """Return whether the Yolo sandbox lifecycle is active and healthy."""
+        if not self._started:
+            return False
+        if self._thread_error is not None:
+            return False
+        return True
+
+    def send_task(self, task: dict[str, Any]) -> None:
+        """Start a fresh in-process agent runtime for one task."""
+        if not self._started:
+            self.start()
         self._cleanup_inactive_runtime()
         if self._agent_thread is not None and self._agent_thread.is_alive():
             self._agent_thread.join(timeout=0.2)
@@ -106,13 +131,11 @@ class YoloSandbox:
 
     def stop(self) -> None:
         """Stop the agent run."""
-        if self._host_transport is None:
-            return
-
-        try:
-            self._host_transport.send({"type": "stop"})
-        except Exception:
-            pass
+        if self._host_transport is not None:
+            try:
+                self._host_transport.send({"type": "stop"})
+            except Exception:
+                pass
 
         if self._agent_thread is not None:
             self._agent_thread.join(timeout=2.0)
@@ -128,6 +151,7 @@ class YoloSandbox:
         if self._host_service_server is not None:
             self._host_service_server.stop()
         self._host_service_server = None
+        self._started = False
 
     def _cleanup_inactive_runtime(self) -> None:
         if self._agent_thread is not None and self._agent_thread.is_alive():

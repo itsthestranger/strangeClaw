@@ -192,7 +192,7 @@ class Agent:
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._broker = broker
         self._tools = Tools(self._agent_config or {}, broker=broker)
-        self._integrations = self._load_integrations()
+        self._integrations: list[str] = []
         self._execution_action_surface = _build_execution_action_surface(
             self._tools.schema()
         )
@@ -223,9 +223,21 @@ class Agent:
         task_event = self._wait_for_task_event()
         if task_event is None:
             return
+        self._run_task(task_event)
 
+    def run_forever(self) -> None:
+        """Run tasks from transport input until a stop event arrives while idle."""
+        while True:
+            task_event = self._wait_for_task_event()
+            if task_event is None:
+                return
+            self._run_task(task_event)
+
+    def _run_task(self, task_event: dict[str, Any]) -> None:
+        """Run one task event using this agent instance."""
         goal = task_event["text"]
         approval_mode = task_event["approval_mode"]
+        self._integrations = self._load_integrations()
         llm_config = self._resolve_llm_config(task_event)
         self._llm = self._llm_factory(llm_config)
         self._history_summary = None
@@ -1061,7 +1073,7 @@ def main(argv: list[str] | None = None) -> None:
             allow_task_llm=False,
             broker=broker,
         )
-        agent.run()
+        agent.run_forever()
     finally:
         transport.close()
 

@@ -125,6 +125,24 @@ def _fire_lifecycle_status_messages_enabled(config: dict[str, Any]) -> bool:
     return value
 
 
+def _session_idle_timeout_seconds(config: dict[str, Any]) -> int:
+    fire_cfg = config.get("firecracker", {})
+    if not isinstance(fire_cfg, dict):
+        raise ValueError("Config field firecracker must be a mapping.")
+    raw_value = fire_cfg.get("session_idle_timeout_seconds", 1800)
+    if isinstance(raw_value, bool):
+        raise ValueError(
+            "Config field firecracker.session_idle_timeout_seconds must be an integer."
+        )
+    value = int(raw_value)
+    if value < 0:
+        raise ValueError(
+            "Config field firecracker.session_idle_timeout_seconds "
+            "must be greater than or equal to zero."
+        )
+    return value
+
+
 def _build_adapter(
     *,
     adapter_name: str,
@@ -211,6 +229,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
         session_journal=_session_journal_config(config),
         fire_lifecycle_status_messages=_fire_lifecycle_status_messages_enabled(config),
+        session_idle_timeout_seconds=_session_idle_timeout_seconds(config),
     )
     created: list[tuple[str, CLIAdapter | TelegramAdapter]] = []
     for adapter_name in enabled_adapters:

@@ -369,6 +369,24 @@ def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:
         )
     firecracker_section["lifecycle_status_messages"] = lifecycle_status_messages
 
+    timeout_raw = firecracker_section.get("session_idle_timeout_seconds", 1800)
+    if isinstance(timeout_raw, bool):
+        raise ConfigError(
+            "Config field firecracker.session_idle_timeout_seconds must be an integer."
+        )
+    try:
+        timeout = int(timeout_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field firecracker.session_idle_timeout_seconds must be an integer."
+        ) from exc
+    if timeout < 0:
+        raise ConfigError(
+            "Config field firecracker.session_idle_timeout_seconds "
+            "must be greater than or equal to zero."
+        )
+    firecracker_section["session_idle_timeout_seconds"] = timeout
+
 
 def _validate_session_journal_optional_fields(config: dict[str, Any]) -> None:
     journal_section = config.get("session_journal")

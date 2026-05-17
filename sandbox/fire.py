@@ -1003,6 +1003,7 @@ class FireSandbox:
         self._atexit_registered = False
         self._previous_signal_handlers: dict[int, Any] = {}
         self._credentials: dict[str, Any] = {}
+        self._start_session_id = "default"
         if self._install_exit_handlers:
             self._register_exit_handlers()
 
@@ -1016,16 +1017,25 @@ class FireSandbox:
         self.stop()
 
     def run(self, task: dict[str, Any]) -> None:
-        """Start an agent run for a task."""
-        if self._process is not None and self._process.poll() is None:
+        """Compatibility wrapper: start the VM and send one task."""
+        session_id = sanitize_session_id(str(task.get("session_id", "")))
+        self._start_session_id = session_id
+        self.start()
+        self.send_task(task)
+
+    def start(self, session_id: str | None = None) -> None:
+        """Boot the Firecracker VM and wait for the guest agent to be ready."""
+        if self.is_running():
             raise RuntimeError("FireSandbox is already running.")
+        if self._process is not None:
+            self.stop()
         if self._install_exit_handlers and not self._atexit_registered:
             self._register_exit_handlers()
 
-        session_id = sanitize_session_id(str(task.get("session_id", "")))
+        if session_id is not None:
+            self._start_session_id = sanitize_session_id(str(session_id))
+        session_id = sanitize_session_id(self._start_session_id)
         self._session_id = session_id
-        task_event = dict(task)
-        task_event.pop("llm", None)
         host_expose_ports = self._host_expose_ports()
 
         try:
@@ -1068,13 +1078,28 @@ class FireSandbox:
                 raise VMBootError(
                     "Did not receive agent_ready after successful vsock CONNECT handshake."
                 )
-            self.send(task_event)
         except Exception as exc:
             diagnostics = self._build_boot_diagnostics()
             self.stop()
             if isinstance(exc, VMBootError):
                 raise VMBootError(f"{exc}{diagnostics}") from exc
             raise VMBootError(f"Failed to start FireSandbox: {exc}{diagnostics}") from exc
+
+    def is_running(self) -> bool:
+        """Return whether the VM process and guest event stream are active."""
+        return bool(
+            self._process is not None
+            and self._process.poll() is None
+            and self._vsock_conn is not None
+        )
+
+    def send_task(self, task: dict[str, Any]) -> None:
+        """Send a task event to an already-running guest agent."""
+        if not self.is_running():
+            raise RuntimeError("FireSandbox is not running.")
+        task_event = dict(task)
+        task_event.pop("llm", None)
+        self.send(task_event)
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event to the agent."""

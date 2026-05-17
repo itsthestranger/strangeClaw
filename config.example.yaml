@@ -119,6 +119,7 @@ firecracker:
   # Emit Fire lifecycle status messages into adapter output.
   # Applies to host-side status events such as sandbox start/teardown.
   lifecycle_status_messages: true
+  session_idle_timeout_seconds: 1800  # 0 disables idle VM reaping
 
 telegram:
   token: ""

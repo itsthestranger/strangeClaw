@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -26,6 +27,8 @@ class _SessionRecord:
     pending_role: ReplyRole | None = None
     latest_state: dict[str, Any] | None = None
     sink: EventSink | None = None
+    sandbox: Any | None = None
+    last_task_completed_at: float | None = None
 
 
 class Coordinator:
@@ -40,9 +43,17 @@ class Coordinator:
         max_active_sessions: int | None = None,
         session_journal: dict[str, Any] | None = None,
         fire_lifecycle_status_messages: bool = True,
+        session_idle_timeout_seconds: int = 1800,
+        _idle_reaper_interval_seconds: float = 60.0,
     ) -> None:
         if max_active_sessions is not None and max_active_sessions <= 0:
             raise ValueError("max_active_sessions must be positive when set.")
+        if isinstance(session_idle_timeout_seconds, bool):
+            raise ValueError("session_idle_timeout_seconds must be a non-negative integer.")
+        if session_idle_timeout_seconds < 0:
+            raise ValueError("session_idle_timeout_seconds must be a non-negative integer.")
+        if _idle_reaper_interval_seconds <= 0:
+            raise ValueError("_idle_reaper_interval_seconds must be greater than zero.")
         self._sandbox_factory = sandbox_factory
         self._approval_mode = approval_mode
         self._llm_config = dict(llm_config) if llm_config is not None else None
@@ -51,8 +62,17 @@ class Coordinator:
         self._journal_enabled = bool(journal.get("enabled", False))
         self._journal_max_bytes = int(journal.get("max_bytes", 1 * 1024 * 1024))
         self._fire_lifecycle_status_messages = bool(fire_lifecycle_status_messages)
+        self._session_idle_timeout_seconds = session_idle_timeout_seconds
+        self._idle_reaper_interval_seconds = _idle_reaper_interval_seconds
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionRecord] = {}
+        self._idle_reaper_stop = threading.Event()
+        self._idle_reaper_thread = threading.Thread(
+            target=self._run_idle_reaper,
+            name="coordinator-idle-reaper",
+            daemon=True,
+        )
+        self._idle_reaper_thread.start()
 
     def seed_state(self, *, session_id: str, state: dict[str, Any]) -> None:
         """Seed stored state for a session (used by resume flows)."""
@@ -71,6 +91,7 @@ class Coordinator:
         if not text.strip():
             raise ValueError("Task text cannot be empty.")
 
+        start_error: Exception | None = None
         with self._lock:
             record = self._sessions.setdefault(session_id, _SessionRecord())
             if record.worker is not None and record.worker.is_running():
@@ -99,19 +120,47 @@ class Coordinator:
             def on_error(error: Exception, *, sid: str = session_id) -> None:
                 self._handle_worker_error(session_id=sid, error=error)
 
-            worker = _SessionWorker(
-                sandbox=self._sandbox_factory(),
-                task_event=task,
-                on_event=on_event,
-                on_exit=on_exit,
-                on_error=on_error,
-                fire_lifecycle_status_messages=self._fire_lifecycle_status_messages,
-            )
-            record.worker = worker
-            record.pending_role = None
             record.sink = sink
-            worker.start()
+            sandbox_started = False
+            sandbox = record.sandbox
+            try:
+                if sandbox is None or not sandbox.is_running():
+                    sandbox = self._sandbox_factory()
+                    sandbox.start()
+                    sandbox_started = True
+                    record.sandbox = sandbox
+
+                sandbox.send_task(task)
+
+                worker = _SessionWorker(
+                    sandbox=sandbox,
+                    task_event=task,
+                    on_event=on_event,
+                    on_exit=on_exit,
+                    on_error=on_error,
+                    fire_lifecycle_status_messages=self._fire_lifecycle_status_messages,
+                    sandbox_started_for_task=sandbox_started,
+                )
+                record.worker = worker
+                record.pending_role = None
+                worker.start()
+                return "started"
+            except Exception as exc:
+                start_error = exc
+                if sandbox_started and sandbox is not None:
+                    try:
+                        sandbox.stop()
+                    except Exception:
+                        pass
+                    if record.sandbox is sandbox:
+                        record.sandbox = None
+                record.worker = None
+                record.pending_role = None
+
+        if start_error is not None:
+            self._handle_worker_error(session_id=session_id, error=start_error)
             return "started"
+        return "started"
 
     def pending_role(self, *, session_id: str) -> ReplyRole | None:
         """Return current pending reply role for a session, if any."""
@@ -143,22 +192,47 @@ class Coordinator:
     def stop_session(self, *, session_id: str) -> None:
         """Stop a single session worker if active."""
         worker: _SessionWorker | None = None
+        sandbox: Any | None = None
         with self._lock:
             record = self._sessions.get(session_id)
             if record is not None:
                 worker = record.worker
+                sandbox = record.sandbox
+                record.pending_role = None
+                record.worker = None
+                record.sandbox = None
+                record.last_task_completed_at = None
         if worker is not None:
             worker.stop()
+        if sandbox is not None:
+            try:
+                sandbox.stop()
+            except Exception:
+                pass
 
     def stop_all(self) -> None:
         """Stop all session workers."""
+        self._idle_reaper_stop.set()
         workers: list[_SessionWorker] = []
+        sandboxes: list[Any] = []
         with self._lock:
             for record in self._sessions.values():
                 if record.worker is not None:
                     workers.append(record.worker)
+                    record.worker = None
+                if record.sandbox is not None:
+                    sandboxes.append(record.sandbox)
+                    record.sandbox = None
+                record.pending_role = None
+                record.last_task_completed_at = None
         for worker in workers:
             worker.stop()
+        for sandbox in sandboxes:
+            try:
+                sandbox.stop()
+            except Exception:
+                pass
+        self._idle_reaper_thread.join(timeout=2.0)
 
     def _active_session_count_locked(self) -> int:
         count = 0
@@ -188,6 +262,7 @@ class Coordinator:
                 state = persist_done_event(session_id=session_id, done_event=event)
                 if isinstance(state, dict):
                     record.latest_state = state
+                record.last_task_completed_at = time.monotonic()
             sink = record.sink
 
         if sink is None:
@@ -225,6 +300,45 @@ class Coordinator:
                 record.worker = None
                 record.pending_role = None
 
+    def _run_idle_reaper(self) -> None:
+        while not self._idle_reaper_stop.wait(self._idle_reaper_interval_seconds):
+            timeout_seconds = self._session_idle_timeout_seconds
+            if timeout_seconds == 0:
+                continue
+
+            now = time.monotonic()
+            sandboxes_to_stop: list[Any] = []
+            with self._lock:
+                for record in self._sessions.values():
+                    sandbox = record.sandbox
+                    if sandbox is None:
+                        continue
+
+                    worker = record.worker
+                    if worker is not None and worker.is_running():
+                        continue
+
+                    completed_at = record.last_task_completed_at
+                    if completed_at is None:
+                        continue
+                    if now - completed_at <= timeout_seconds:
+                        continue
+
+                    if not sandbox.is_running():
+                        record.sandbox = None
+                        record.last_task_completed_at = None
+                        continue
+
+                    record.sandbox = None
+                    record.last_task_completed_at = None
+                    sandboxes_to_stop.append(sandbox)
+
+            for sandbox in sandboxes_to_stop:
+                try:
+                    sandbox.stop()
+                except Exception:
+                    pass
+
 
 class _SessionWorker:
     """One active agent run bound to one sandbox and one session."""
@@ -238,6 +352,7 @@ class _SessionWorker:
         on_exit: Callable[[], None],
         on_error: Callable[[Exception], None],
         fire_lifecycle_status_messages: bool = True,
+        sandbox_started_for_task: bool = False,
     ) -> None:
         self._sandbox = sandbox
         self._task_event = task_event
@@ -245,6 +360,7 @@ class _SessionWorker:
         self._on_exit = on_exit
         self._on_error = on_error
         self._fire_lifecycle_status_messages = fire_lifecycle_status_messages
+        self._sandbox_started_for_task = sandbox_started_for_task
         self._reply_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -266,38 +382,17 @@ class _SessionWorker:
         except Exception:
             pass
         self._thread.join(timeout=2.0)
-        try:
-            self._sandbox.stop()
-        except Exception:
-            pass
 
     def _run(self) -> None:
-        sandbox_stopped = False
-
-        def stop_sandbox() -> bool:
-            nonlocal sandbox_stopped
-            if sandbox_stopped:
-                return True
-            try:
-                self._sandbox.stop()
-                sandbox_stopped = True
-                return True
-            except Exception:
-                return False
-
         try:
-            self._sandbox.run(self._task_event)
-            self._emit_fire_status_message("Firecracker sandbox started successfully.")
+            if self._sandbox_started_for_task:
+                self._emit_fire_status_message("Firecracker sandbox started successfully.")
             while not self._stop_event.is_set():
                 event = self._sandbox.receive(timeout_seconds=0.2)
                 if event is None:
                     continue
 
                 if event.get("type") == "done":
-                    if stop_sandbox():
-                        self._emit_fire_status_message(
-                            "Firecracker sandbox torn down successfully."
-                        )
                     self._on_event(event)
                     return
 
@@ -323,8 +418,6 @@ class _SessionWorker:
         except Exception as exc:
             self._on_error(exc)
         finally:
-            if not sandbox_stopped:
-                stop_sandbox()
             self._on_exit()
 
     def _wait_for_reply(self) -> dict[str, Any] | None:

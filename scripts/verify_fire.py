@@ -14,8 +14,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import load_config
-from sandbox.fire import FireSandbox, IptablesManager, TapDeviceManager, load_firecracker_config
+from config import load_config  # noqa: E402
+from sandbox.fire import (  # noqa: E402
+    FireSandbox,
+    IptablesManager,
+    TapDeviceManager,
+    load_firecracker_config,
+)
 
 CheckKind = Literal["network", "lifecycle", "all"]
 
