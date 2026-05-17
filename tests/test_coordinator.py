@@ -15,12 +15,23 @@ class FakeSandbox:
 
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = list(events)
-        self.started_task: dict[str, Any] | None = None
+        self.started_tasks: list[dict[str, Any]] = []
         self.sent: list[dict[str, Any]] = []
         self.stop_calls = 0
+        self.start_calls = 0
+        self.send_task_calls = 0
+        self._running = False
 
-    def run(self, task: dict[str, Any]) -> None:
-        self.started_task = task
+    def start(self) -> None:
+        self.start_calls += 1
+        self._running = True
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def send_task(self, task: dict[str, Any]) -> None:
+        self.send_task_calls += 1
+        self.started_tasks.append(task)
 
     def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
@@ -33,6 +44,7 @@ class FakeSandbox:
 
     def stop(self) -> None:
         self.stop_calls += 1
+        self._running = False
 
 
 class FireSandbox(FakeSandbox):
@@ -40,9 +52,9 @@ class FireSandbox(FakeSandbox):
 
 
 class FailingSandbox(FakeSandbox):
-    """Sandbox stub that fails on run()."""
+    """Sandbox stub that fails on send_task()."""
 
-    def run(self, task: dict[str, Any]) -> None:
+    def send_task(self, task: dict[str, Any]) -> None:
         del task
         raise RuntimeError("boom")
 
@@ -86,7 +98,7 @@ def test_coordinator_follow_up_uses_saved_state_without_plan(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    first = FakeSandbox(
+    sandbox = FakeSandbox(
         events=[
             {
                 "type": "done",
@@ -97,6 +109,92 @@ def test_coordinator_follow_up_uses_saved_state_without_plan(
                     "plan": {"steps": ["old"]},
                     "history": [{"type": "action"}],
                 },
+                "files": [],
+            }
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+    first_seen: list[dict[str, Any]] = []
+
+    status_one = coordinator.start_task(session_id="sess-1", text="first", sink=first_seen.append)
+    assert status_one == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in first_seen))
+
+    sandbox._events.append(
+        {
+            "type": "done",
+            "success": True,
+            "reply": "second",
+            "state": {"goal": "g2", "history": []},
+            "files": [],
+        }
+    )
+    status_two = coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+    assert status_two == "started"
+    assert _wait_until(lambda: len(sandbox.started_tasks) == 2)
+
+    assert sandbox.start_calls == 1
+    second_task = sandbox.started_tasks[1]
+    assert second_task["state"] == {"goal": "g", "history": [{"type": "action"}]}
+    assert "plan" not in second_task["state"]
+
+
+def test_coordinator_worker_exit_does_not_stop_session_sandbox(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {"type": "done", "success": True, "reply": "ok", "state": {"goal": "g"}, "files": []}
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    status = coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+    assert status == "started"
+    assert _wait_until(lambda: sandbox.send_task_calls == 1)
+    assert _wait_until(lambda: sandbox.stop_calls == 0)
+    assert sandbox.is_running() is True
+
+
+def test_coordinator_stop_session_stops_session_sandbox() -> None:
+    sandbox = FakeSandbox(events=[])
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    status = coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+    assert status == "started"
+    assert sandbox.is_running() is True
+
+    coordinator.stop_session(session_id="sess-1")
+    assert sandbox.stop_calls == 1
+    assert sandbox.is_running() is False
+
+
+def test_coordinator_starts_fresh_sandbox_after_stop_session(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g", "history": []},
                 "files": [],
             }
         ]
@@ -118,20 +216,63 @@ def test_coordinator_follow_up_uses_saved_state_without_plan(
         approval_mode="review",
         llm_config={"model": "x", "api_key": "k"},
     )
-    first_seen: list[dict[str, Any]] = []
 
-    status_one = coordinator.start_task(session_id="sess-1", text="first", sink=first_seen.append)
-    assert status_one == "started"
-    assert _wait_until(lambda: any(event.get("type") == "done" for event in first_seen))
+    assert coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None) == "started"
+    assert _wait_until(lambda: first.send_task_calls == 1)
+    coordinator.stop_session(session_id="sess-1")
+    assert first.stop_calls == 1
 
-    status_two = coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
-    assert status_two == "started"
-    assert _wait_until(lambda: second.stop_calls > 0)
+    assert coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None) == "started"
+    assert _wait_until(lambda: second.send_task_calls == 1)
+    assert second.start_calls == 1
 
-    assert first.started_task is not None
-    assert second.started_task is not None
-    assert second.started_task["state"] == {"goal": "g", "history": [{"type": "action"}]}
-    assert "plan" not in second.started_task["state"]
+
+def test_coordinator_restarts_sandbox_when_not_running_between_tasks(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    second = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    assert coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None) == "started"
+    assert _wait_until(lambda: first.send_task_calls == 1)
+    first._running = False
+
+    status = "busy"
+    deadline = time.monotonic() + 2.0
+    while status == "busy" and time.monotonic() < deadline:
+        status = coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+        if status == "busy":
+            time.sleep(0.01)
+    assert status == "started"
+    assert _wait_until(lambda: second.send_task_calls == 1)
 
 
 def test_coordinator_reports_busy_for_running_session() -> None:
@@ -244,12 +385,9 @@ def test_coordinator_emits_fire_lifecycle_status_messages(tmp_path: Path, monkey
         for event in seen_events
         if event.get("type") == "message" and event.get("role") == "status"
     ]
-    assert [event.get("content") for event in statuses] == [
-        "Firecracker sandbox started successfully.",
-        "Firecracker sandbox torn down successfully.",
-    ]
+    assert [event.get("content") for event in statuses] == ["Firecracker sandbox started successfully."]
     assert seen_events[-1].get("type") == "done"
-    assert sandbox.stop_calls == 1
+    assert sandbox.stop_calls == 0
 
 
 def test_coordinator_can_disable_fire_lifecycle_status_messages(
