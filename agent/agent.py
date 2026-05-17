@@ -223,7 +223,18 @@ class Agent:
         task_event = self._wait_for_task_event()
         if task_event is None:
             return
+        self._run_task(task_event)
 
+    def run_forever(self) -> None:
+        """Run tasks from transport input until a stop event arrives while idle."""
+        while True:
+            task_event = self._wait_for_task_event()
+            if task_event is None:
+                return
+            self._run_task(task_event)
+
+    def _run_task(self, task_event: dict[str, Any]) -> None:
+        """Run one task event using this agent instance."""
         goal = task_event["text"]
         approval_mode = task_event["approval_mode"]
         llm_config = self._resolve_llm_config(task_event)
@@ -1061,7 +1072,7 @@ def main(argv: list[str] | None = None) -> None:
             allow_task_llm=False,
             broker=broker,
         )
-        agent.run()
+        agent.run_forever()
     finally:
         transport.close()
 

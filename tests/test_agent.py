@@ -189,6 +189,140 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
     assert decoded == "artifact"
 
 
+def test_agent_run_forever_processes_sequential_tasks_with_clean_state(
+    tmp_path: Path,
+) -> None:
+    shared_file = tmp_path / "persistent.txt"
+    quoted_shared_file = shlex.quote(str(shared_file))
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["write file"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="shell",
+                    args={"command": f"printf hello > {quoted_shared_file}"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "first done"}),
+                usage=None,
+            ),
+            LLMResponse(text='{"steps":["read file"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(
+                    tool="shell",
+                    args={"command": f"cat {quoted_shared_file}"},
+                ),
+                usage=None,
+            ),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "second done"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=5,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run_forever)
+    worker.start()
+    host_transport.send({**_task_event(), "text": "write shared file"})
+    first_events = _collect_until_done(host_transport)
+    assert worker.is_alive()
+    assert first_events[-1]["reply"] == "first done"
+
+    host_transport.send({**_task_event(), "text": "read shared file"})
+    second_events = _collect_until_done(host_transport)
+    host_transport.send({"type": "stop"})
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    second_shell = next(
+        event
+        for event in second_events
+        if event.get("type") == "action" and event["tool"] == "shell"
+    )
+    assert second_shell["result"]["stdout"] == "hello"
+    assert second_events[-1]["reply"] == "second done"
+
+    second_task_first_execution = scripted_llm.calls[4]
+    payload = json.loads(second_task_first_execution["messages"][1]["content"])
+    assert payload["recent_history"] == []
+    assert payload["history_summary"] == ""
+
+
+def test_agent_run_forever_continues_after_max_iteration_done() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["too short"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="shell", args={"command": "printf first"}),
+                usage=None,
+            ),
+            LLMResponse(text='{"steps":["recover"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
+                usage=None,
+            ),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        max_iterations=1,
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run_forever)
+    worker.start()
+    host_transport.send({**_task_event(), "text": "hit max iteration"})
+    first_events = _collect_until_done(host_transport)
+    assert first_events[-1]["success"] is False
+    assert "iteration limit" in first_events[-1]["reply"].lower()
+    assert worker.is_alive()
+
+    host_transport.send({**_task_event(), "text": "second task"})
+    second_events = _collect_until_done(host_transport)
+    host_transport.send({"type": "stop"})
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert second_events[-1]["success"] is True
+    assert second_events[-1]["reply"] == "recovered"
+
+
+def test_agent_run_forever_stop_during_idle_exits() -> None:
+    scripted_llm = ScriptedLLM(responses=[])
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run_forever)
+    worker.start()
+    host_transport.send({"type": "stop"})
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+
+
 def test_agent_plan_rejection_replans_in_review_mode() -> None:
     scripted_llm = ScriptedLLM(
         responses=[
@@ -1289,8 +1423,8 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
         def __init__(self, **kwargs: Any) -> None:
             captured["agent_kwargs"] = kwargs
 
-        def run(self) -> None:
-            captured["ran"] = True
+        def run_forever(self) -> None:
+            captured["ran_forever"] = True
 
     monkeypatch.setattr(agent_module, "VsockTransport", FakeVsockTransport)
     monkeypatch.setattr(agent_module, "Agent", FakeAgent)
@@ -1307,7 +1441,7 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     )
 
     assert captured["guest_port"] == 5000
-    assert captured["ran"] is True
+    assert captured["ran_forever"] is True
     assert captured["closed"] is True
 
     kwargs = captured["agent_kwargs"]
