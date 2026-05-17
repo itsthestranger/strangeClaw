@@ -124,6 +124,7 @@ def test_yolo_sandbox_lifecycle_send_task_starts_fresh_runtime() -> None:
     done_one = sandbox.receive(timeout_seconds=2.0)
     assert done_one is not None
     assert done_one["reply"] == "one"
+    assert sandbox.is_running() is True
 
     sandbox.send_task({**_task_event(approval_mode="auto"), "text": "say bye"})
     assert sandbox.receive(timeout_seconds=2.0)["role"] == "plan"  # type: ignore[index]

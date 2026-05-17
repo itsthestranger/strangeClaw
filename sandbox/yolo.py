@@ -75,9 +75,7 @@ class YoloSandbox:
             return False
         if self._thread_error is not None:
             return False
-        if self._agent_thread is None:
-            return True
-        return self._agent_thread.is_alive()
+        return True
 
     def send_task(self, task: dict[str, Any]) -> None:
         """Start a fresh in-process agent runtime for one task."""
