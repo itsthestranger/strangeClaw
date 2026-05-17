@@ -131,13 +131,11 @@ class YoloSandbox:
 
     def stop(self) -> None:
         """Stop the agent run."""
-        if self._host_transport is None:
-            return
-
-        try:
-            self._host_transport.send({"type": "stop"})
-        except Exception:
-            pass
+        if self._host_transport is not None:
+            try:
+                self._host_transport.send({"type": "stop"})
+            except Exception:
+                pass
 
         if self._agent_thread is not None:
             self._agent_thread.join(timeout=2.0)

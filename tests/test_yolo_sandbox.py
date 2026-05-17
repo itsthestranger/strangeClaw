@@ -135,3 +135,18 @@ def test_yolo_sandbox_lifecycle_send_task_starts_fresh_runtime() -> None:
     sandbox.stop()
     sandbox.stop()
     assert sandbox.is_running() is False
+
+
+def test_yolo_sandbox_stop_after_start_without_task_marks_not_running() -> None:
+    sandbox = YoloSandbox(
+        skills_dir=str(_skills_root()),
+        llm_factory=lambda _: ScriptedLLM([]),
+        agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
+    )
+
+    assert sandbox.is_running() is False
+    sandbox.start()
+    assert sandbox.is_running() is True
+
+    sandbox.stop()
+    assert sandbox.is_running() is False
