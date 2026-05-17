@@ -192,7 +192,7 @@ class Agent:
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._broker = broker
         self._tools = Tools(self._agent_config or {}, broker=broker)
-        self._integrations = self._load_integrations()
+        self._integrations: list[str] = []
         self._execution_action_surface = _build_execution_action_surface(
             self._tools.schema()
         )
@@ -237,6 +237,7 @@ class Agent:
         """Run one task event using this agent instance."""
         goal = task_event["text"]
         approval_mode = task_event["approval_mode"]
+        self._integrations = self._load_integrations()
         llm_config = self._resolve_llm_config(task_event)
         self._llm = self._llm_factory(llm_config)
         self._history_summary = None
