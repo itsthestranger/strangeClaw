@@ -1076,7 +1076,15 @@ def _redirect_target_from_result(
     headers = result.get("headers")
     if not isinstance(headers, dict):
         return None
-    location_raw = headers.get("Location")
+    location_raw: str | None = None
+    for key, value in headers.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower() != "location":
+            continue
+        if isinstance(value, str):
+            location_raw = value
+        break
     if not isinstance(location_raw, str):
         return None
     location = location_raw.strip()

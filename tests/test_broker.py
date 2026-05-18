@@ -1631,9 +1631,11 @@ def test_handle_list_integrations_via_host_service_registration() -> None:
     assert result == {"success": True, "integrations": ["notion"]}
 
 
+@pytest.mark.parametrize("location_header_name", ["Location", "location"])
 @responses.activate
 def test_handle_http_request_public_redirect_to_loopback_is_denied(
     monkeypatch: pytest.MonkeyPatch,
+    location_header_name: str,
 ) -> None:
     _mapped_dns(
         monkeypatch,
@@ -1647,7 +1649,7 @@ def test_handle_http_request_public_redirect_to_loopback_is_denied(
         responses.GET,
         "https://public.example.com/start",
         status=302,
-        headers={"Location": "http://127.0.0.1/private"},
+        headers={location_header_name: "http://127.0.0.1/private"},
     )
 
     result = broker.handle(
@@ -1804,14 +1806,17 @@ def test_handle_http_request_named_integration_no_credential_forward_to_disallow
     assert "Authorization" in first_request_headers
 
 
+@pytest.mark.parametrize("location_header_name", ["Location", "location"])
 @responses.activate
-def test_handle_http_request_named_integration_redirect_within_policy_succeeds() -> None:
+def test_handle_http_request_named_integration_redirect_within_policy_succeeds(
+    location_header_name: str,
+) -> None:
     broker = RequestBroker(credentials=_credentials(), config=_broker_config())
     responses.add(
         responses.GET,
         "https://api.notion.com/v1/pages",
         status=302,
-        headers={"Location": "https://api.notion.com/v1/pages/next"},
+        headers={location_header_name: "https://api.notion.com/v1/pages/next"},
     )
     responses.add(
         responses.GET,
