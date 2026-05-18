@@ -126,7 +126,7 @@ class Coordinator:
             try:
                 if sandbox is None or not sandbox.is_running():
                     sandbox = self._sandbox_factory()
-                    sandbox.start()
+                    sandbox.start(session_id=session_id)
                     sandbox_started = True
                     record.sandbox = sandbox
 

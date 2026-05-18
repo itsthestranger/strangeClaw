@@ -60,13 +60,14 @@ class YoloSandbox:
         self.start()
         self.send_task(task)
 
-    def start(self) -> None:
+    def start(self, session_id: str | None = None) -> None:
         """Start the sandbox lifecycle.
 
         Yolo has no persistent isolation boundary. The per-task runtime is
         created by send_task(), but this shim lets coordinators use the same
         lifecycle interface for all sandbox types.
         """
+        del session_id
         self._started = True
 
     def is_running(self) -> bool:

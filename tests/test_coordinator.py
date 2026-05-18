@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from coordinator import Coordinator
+from sandbox.fire import tap_name_for_session
 
 
 class FakeSandbox:
@@ -16,14 +17,16 @@ class FakeSandbox:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = list(events)
         self.started_tasks: list[dict[str, Any]] = []
+        self.start_session_ids: list[str | None] = []
         self.sent: list[dict[str, Any]] = []
         self.stop_calls = 0
         self.start_calls = 0
         self.send_task_calls = 0
         self._running = False
 
-    def start(self) -> None:
+    def start(self, session_id: str | None = None) -> None:
         self.start_calls += 1
+        self.start_session_ids.append(session_id)
         self._running = True
 
     def is_running(self) -> bool:
@@ -91,6 +94,55 @@ def test_coordinator_routes_plan_reply_and_done(tmp_path: Path, monkeypatch: Any
     assert submitted is True
     assert _wait_until(lambda: any(event.get("type") == "done" for event in seen_events))
     assert sandbox.sent[-1] == {"type": "user_reply", "approved": True, "text": ""}
+    assert sandbox.start_session_ids == ["sess-1"]
+    coordinator.stop_all()
+
+
+def test_coordinator_passes_session_id_to_sandbox_start(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {"type": "done", "success": True, "reply": "ok", "state": {"goal": "g"}, "files": []}
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    status = coordinator.start_task(session_id="session-xyz", text="task", sink=lambda _: None)
+    assert status == "started"
+    assert _wait_until(lambda: sandbox.start_calls == 1)
+    assert sandbox.start_session_ids == ["session-xyz"]
+    coordinator.stop_all()
+
+
+def test_coordinator_concurrent_sessions_use_distinct_fire_identity() -> None:
+    first = FireSandbox(events=[{"type": "message", "role": "status", "content": "running"}])
+    second = FireSandbox(events=[{"type": "message", "role": "status", "content": "running"}])
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    status_one = coordinator.start_task(session_id="fire-a", text="first", sink=lambda _: None)
+    status_two = coordinator.start_task(session_id="fire-b", text="second", sink=lambda _: None)
+
+    assert status_one == "started"
+    assert status_two == "started"
+    assert _wait_until(lambda: first.start_calls == 1 and second.start_calls == 1)
+    assert first.start_session_ids == ["fire-a"]
+    assert second.start_session_ids == ["fire-b"]
+    assert tap_name_for_session(first.start_session_ids[0] or "") != tap_name_for_session(
+        second.start_session_ids[0] or ""
+    )
+    coordinator.stop_all()
 
 
 def test_coordinator_follow_up_uses_saved_state_without_plan(
