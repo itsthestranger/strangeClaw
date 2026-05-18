@@ -122,7 +122,29 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
     assert loaded["firecracker"]["session_idle_timeout_seconds"] == 1800
+    assert loaded["coordinator"] == {"max_active_sessions": 8}
     assert loaded["session_journal"] == {"enabled": False, "max_bytes": 1 * 1024 * 1024}
+
+
+def test_load_config_coordinator_override_max_active_sessions(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["coordinator"] = {"max_active_sessions": 3}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["coordinator"] == {"max_active_sessions": 3}
+
+
+def test_load_config_rejects_invalid_coordinator_max_active_sessions(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["coordinator"] = {"max_active_sessions": 0}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"coordinator\.max_active_sessions"):
+        load_config(config_path)
 
 
 def test_load_config_defaults_skills_section_when_missing(tmp_path: Path) -> None:

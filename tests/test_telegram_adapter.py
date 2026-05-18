@@ -225,7 +225,6 @@ def test_send_done_files_reports_upload_limit(monkeypatch: pytest.MonkeyPatch) -
         sandbox_factory=lambda: object(),
         token="token",
         limits=TelegramLimits(
-            max_active_sessions=8,
             max_output_total_bytes=5,
             max_output_file_bytes=5,
         ),

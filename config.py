@@ -129,6 +129,7 @@ def _validate_required_fields(config: dict[str, Any], source_path: Path) -> None
 def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_legacy_integrations_field(config)
     _validate_llm_optional_fields(config)
+    _validate_coordinator_optional_fields(config)
     _validate_tools_optional_fields(config)
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
@@ -161,6 +162,30 @@ def _validate_llm_optional_fields(config: dict[str, Any]) -> None:
     if not isinstance(api_base, str) or not api_base.strip():
         raise ConfigError("Config field llm.api_base must be a non-empty string or null.")
     llm_section["api_base"] = api_base.strip()
+
+
+def _validate_coordinator_optional_fields(config: dict[str, Any]) -> None:
+    coordinator_section = config.get("coordinator")
+    if coordinator_section is None:
+        config["coordinator"] = {"max_active_sessions": 8}
+        return
+    if not isinstance(coordinator_section, dict):
+        raise ConfigError("Config field coordinator must be a mapping.")
+
+    max_active_sessions_raw = coordinator_section.get("max_active_sessions", 8)
+    if isinstance(max_active_sessions_raw, bool):
+        raise ConfigError("Config field coordinator.max_active_sessions must be an integer.")
+    try:
+        max_active_sessions = int(max_active_sessions_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field coordinator.max_active_sessions must be an integer."
+        ) from exc
+    if max_active_sessions <= 0:
+        raise ConfigError(
+            "Config field coordinator.max_active_sessions must be greater than zero."
+        )
+    coordinator_section["max_active_sessions"] = max_active_sessions
 
 
 def _validate_tools_optional_fields(config: dict[str, Any]) -> None:

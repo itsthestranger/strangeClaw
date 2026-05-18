@@ -99,6 +99,7 @@ class Coordinator:
             if (
                 self._max_active_sessions is not None
                 and self._active_session_count_locked() >= self._max_active_sessions
+                and not self._record_counts_toward_capacity(record)
             ):
                 return "capacity"
 
@@ -237,9 +238,24 @@ class Coordinator:
     def _active_session_count_locked(self) -> int:
         count = 0
         for record in self._sessions.values():
-            if record.worker is not None and record.worker.is_running():
+            if self._record_counts_toward_capacity(record):
                 count += 1
         return count
+
+    def _record_counts_toward_capacity(self, record: _SessionRecord) -> bool:
+        worker = record.worker
+        if worker is not None and worker.is_running():
+            return True
+
+        sandbox = record.sandbox
+        if sandbox is None:
+            return False
+        if sandbox.__class__.__name__ != "FireSandbox":
+            return False
+        try:
+            return bool(sandbox.is_running())
+        except Exception:
+            return False
 
     def _handle_worker_event(self, *, session_id: str, event: dict[str, Any]) -> None:
         sink: EventSink | None = None

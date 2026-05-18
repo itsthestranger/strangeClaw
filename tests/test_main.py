@@ -142,11 +142,11 @@ def _config() -> dict[str, Any]:
         "skills": {"directory": "./skills"},
         "loop": {"max_iterations": 7},
         "context": {"token_budget": 1234, "summary_threshold": 9},
+        "coordinator": {"max_active_sessions": 8},
         "telegram": {
             "token": "bot-token",
             "local_mode": True,
             "allowed_chat_ids": [123],
-            "max_active_sessions": 8,
             "max_output_total_bytes": 50 * 1024 * 1024,
             "max_output_file_bytes": 10 * 1024 * 1024,
         },
@@ -199,6 +199,7 @@ def test_main_wires_config_to_sandbox_and_adapter(monkeypatch: pytest.MonkeyPatc
     assert adapter.approval_mode == "review"
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.coordinator is coordinator
+    assert coordinator.max_active_sessions == 8
     assert coordinator.fire_lifecycle_status_messages is True
     assert coordinator.session_idle_timeout_seconds == 1800
     assert adapter.run_called is True
@@ -391,9 +392,9 @@ def test_main_wires_telegram_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     assert adapter.llm_config == {"model": "x", "api_key": "k"}
     assert adapter.token == "bot-token"
     assert adapter.allowed_chat_ids == [123]
-    assert adapter.limits.max_active_sessions == 8
     assert adapter.session_id_prefix == ""
     assert adapter.coordinator is not None
+    assert adapter.coordinator.max_active_sessions == 8
     sandbox = adapter.sandbox_factory()
     assert sandbox._skills_dir == "./skills"  # noqa: SLF001
 

@@ -76,6 +76,9 @@ context:
 loop:
   max_iterations: 50
 
+coordinator:
+  max_active_sessions: 8       # global active-session cap (Fire counts active sandboxes)
+
 session_journal:
   enabled: false               # write per-session events.jsonl when true
   max_bytes: 1048576           # hard cap per session journal file (bytes)
@@ -115,6 +118,5 @@ telegram:
   # allowed_chat_ids:
   #   - 123456789
   #   - 987654321
-  max_active_sessions: 8
   max_output_total_bytes: 52428800
   max_output_file_bytes: 10485760

@@ -45,7 +45,6 @@ LOGGER = logging.getLogger(__name__)
 class TelegramLimits:
     """Operational safety limits for Telegram adapter runtime behavior."""
 
-    max_active_sessions: int = 8
     max_output_total_bytes: int = MAX_TELEGRAM_UPLOAD_BYTES
     max_output_file_bytes: int = 10 * 1024 * 1024
 
@@ -76,7 +75,6 @@ class TelegramAdapter:
             sandbox_factory=self._sandbox_factory,
             approval_mode=self._approval_mode,
             llm_config=self._llm_config,
-            max_active_sessions=self._limits.max_active_sessions,
         )
 
         self._application: Any | None = None

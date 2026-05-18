@@ -76,7 +76,6 @@ def _telegram_adapter_config(
         )
 
     limits = TelegramLimits(
-        max_active_sessions=int(telegram_cfg.get("max_active_sessions", 8)),
         max_output_total_bytes=int(telegram_cfg.get("max_output_total_bytes", 50 * 1024 * 1024)),
         max_output_file_bytes=int(telegram_cfg.get("max_output_file_bytes", 10 * 1024 * 1024)),
     )
@@ -90,18 +89,19 @@ def _telegram_adapter_config(
 
 
 def _coordinator_max_active_sessions(
-    *,
     config: dict[str, Any],
-    enabled_adapters: list[str],
 ) -> int | None:
-    if "telegram" not in enabled_adapters:
+    coordinator_cfg = config.get("coordinator")
+    if coordinator_cfg is None:
         return None
-    telegram_cfg = config.get("telegram", {})
-    if not isinstance(telegram_cfg, dict):
-        raise ValueError("Config field telegram must be a mapping.")
-    value = int(telegram_cfg.get("max_active_sessions", 8))
+    if not isinstance(coordinator_cfg, dict):
+        raise ValueError("Config field coordinator must be a mapping.")
+    value_raw = coordinator_cfg.get("max_active_sessions")
+    if value_raw is None:
+        return None
+    value = int(value_raw)
     if value <= 0:
-        raise ValueError("telegram.max_active_sessions must be greater than zero.")
+        raise ValueError("coordinator.max_active_sessions must be greater than zero.")
     return value
 
 
@@ -223,10 +223,7 @@ def main(argv: list[str] | None = None) -> None:
         sandbox_factory=sandbox_factory,
         approval_mode=str(config["approval_mode"]),
         llm_config=dict(config["llm"]),
-        max_active_sessions=_coordinator_max_active_sessions(
-            config=config,
-            enabled_adapters=enabled_adapters,
-        ),
+        max_active_sessions=_coordinator_max_active_sessions(config),
         session_journal=_session_journal_config(config),
         fire_lifecycle_status_messages=_fire_lifecycle_status_messages_enabled(config),
         session_idle_timeout_seconds=_session_idle_timeout_seconds(config),

@@ -531,6 +531,149 @@ def test_coordinator_reports_busy_for_running_session() -> None:
     coordinator.stop_all()
 
 
+def test_coordinator_capacity_counts_idle_fire_sandboxes(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g"},
+                "files": [],
+            }
+        ]
+    )
+    second = FireSandbox(events=[])
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        max_active_sessions=1,
+    )
+
+    assert (
+        coordinator.start_task(session_id="fire-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(
+        lambda: coordinator._sessions["fire-1"].worker is None  # type: ignore[attr-defined]
+    )
+    assert first.is_running() is True
+
+    assert (
+        coordinator.start_task(session_id="fire-2", text="second", sink=lambda _: None)
+        == "capacity"
+    )
+    assert second.start_calls == 0
+    coordinator.stop_all()
+
+
+def test_coordinator_capacity_allows_existing_fire_session_continuation(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g"},
+                "files": [],
+            }
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        max_active_sessions=1,
+    )
+
+    assert (
+        coordinator.start_task(session_id="fire-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(
+        lambda: coordinator._sessions["fire-1"].worker is None  # type: ignore[attr-defined]
+    )
+    assert sandbox.is_running() is True
+    sandbox._events.append(  # noqa: SLF001
+        {
+            "type": "done",
+            "success": True,
+            "reply": "second",
+            "state": {"goal": "g"},
+            "files": [],
+        }
+    )
+
+    assert (
+        coordinator.start_task(session_id="fire-1", text="follow-up", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: sandbox.send_task_calls == 2)
+    coordinator.stop_all()
+
+
+def test_coordinator_capacity_keeps_yolo_worker_based_semantics(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g"},
+                "files": [],
+            }
+        ]
+    )
+    second = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g"},
+                "files": [],
+            }
+        ]
+    )
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        max_active_sessions=1,
+    )
+
+    assert (
+        coordinator.start_task(session_id="yolo-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(
+        lambda: coordinator._sessions["yolo-1"].worker is None  # type: ignore[attr-defined]
+    )
+    assert first.is_running() is True
+
+    assert (
+        coordinator.start_task(session_id="yolo-2", text="second", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: second.send_task_calls == 1)
+    coordinator.stop_all()
+
+
 def test_coordinator_writes_redacted_bounded_session_journal(
     tmp_path: Path,
     monkeypatch: Any,
