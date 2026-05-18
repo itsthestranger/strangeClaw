@@ -1327,6 +1327,46 @@ def test_handle_web_fetch_truncates_to_max_response_bytes(monkeypatch: pytest.Mo
 
 
 @responses.activate
+def test_handle_web_fetch_decodes_utf8_text_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mapped_dns(monkeypatch, {"example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/utf8",
+        body="snowman ☃".encode(),
+        status=200,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/utf8"})
+
+    assert result["success"] is True
+    assert result["body"] == "snowman ☃"
+    assert result["truncated"] is False
+
+
+@responses.activate
+def test_handle_web_fetch_decodes_non_utf8_with_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mapped_dns(monkeypatch, {"example.com": "93.184.216.34"})
+    broker = RequestBroker(credentials=_credentials(), config=_broker_config())
+    responses.add(
+        responses.GET,
+        "https://example.com/latin1",
+        body=b"caf\xe9",
+        status=200,
+        headers={"Content-Type": "text/plain; charset=iso-8859-1"},
+    )
+
+    result = broker.handle({"action": "web_fetch", "url": "https://example.com/latin1"})
+
+    assert result["success"] is True
+    assert result["body"] == "caf\ufffd"
+    assert result["truncated"] is False
+
+
+@responses.activate
 def test_handle_web_search_normalizes_brave() -> None:
     config = _broker_config()
     config["web_search"] = {

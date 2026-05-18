@@ -365,6 +365,8 @@ class RequestBroker:
         headers: dict[str, str],
         body: str | None,
         max_bytes: int,
+        *,
+        decode_utf8: bool = False,
     ) -> dict[str, Any]:
         session = requests.Session()
         session.trust_env = False
@@ -396,7 +398,10 @@ class RequestBroker:
                 total += len(chunk)
 
             raw = b"".join(chunks)
-            body_text = raw.decode(response.encoding or "utf-8", errors="replace")
+            if decode_utf8:
+                body_text = raw.decode("utf-8", errors="replace")
+            else:
+                body_text = raw.decode(response.encoding or "utf-8", errors="replace")
             return {
                 "success": True,
                 "status_code": response.status_code,
@@ -418,6 +423,7 @@ class RequestBroker:
         body: str | None,
         max_bytes: int,
         redirect_guard: Callable[[str, str], dict[str, Any] | None] | None = None,
+        decode_utf8: bool = False,
     ) -> dict[str, Any]:
         current_method = method.upper()
         current_url = url
@@ -430,6 +436,7 @@ class RequestBroker:
                 headers,
                 body,
                 max_bytes,
+                decode_utf8=decode_utf8,
             )
             if result.get("success") is False:
                 return result
@@ -578,6 +585,7 @@ class RequestBroker:
         enforce_validation: bool,
         enforce_initial_ssrf: bool,
         enforce_redirect_ssrf: bool,
+        decode_utf8: bool = False,
     ) -> dict[str, Any]:
         if enforce_validation:
             validation_denial = self._validate_or_deny(
@@ -615,6 +623,7 @@ class RequestBroker:
             body=body,
             max_bytes=max_bytes,
             redirect_guard=redirect_guard,
+            decode_utf8=decode_utf8,
         )
 
     def _validate_or_deny(
@@ -707,6 +716,7 @@ class RequestBroker:
             enforce_validation=False,
             enforce_initial_ssrf=True,
             enforce_redirect_ssrf=True,
+            decode_utf8=True,
         )
 
     def _handle_web_search(self, payload: dict[str, Any]) -> dict[str, Any]:
