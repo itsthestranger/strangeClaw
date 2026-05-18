@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,30 @@ class FailingSandbox(FakeSandbox):
     def send_task(self, task: dict[str, Any]) -> None:
         del task
         raise RuntimeError("boom")
+
+
+class BlockingStopFireSandbox(FireSandbox):
+    """Fire sandbox stub whose stop() blocks until explicitly released."""
+
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        stop_entered: threading.Event,
+        stop_release: threading.Event,
+        stop_finished: threading.Event,
+    ) -> None:
+        super().__init__(events)
+        self._stop_entered = stop_entered
+        self._stop_release = stop_release
+        self._stop_finished = stop_finished
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._stop_entered.set()
+        self._stop_release.wait(timeout=2.0)
+        self._running = False
+        self._stop_finished.set()
 
 
 def _wait_until(predicate: Any, timeout_seconds: float = 2.0) -> bool:
@@ -344,6 +369,148 @@ def test_coordinator_restarts_sandbox_when_not_running_between_tasks(
         lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
     )
     coordinator.stop_all()
+
+
+def test_coordinator_replacing_dead_sandbox_does_not_stop_old_instance(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first = FireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    second = FireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+
+    # Simulate dead VM between tasks; coordinator should replace it.
+    first._running = False  # noqa: SLF001
+    assert (
+        coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: second.send_task_calls == 1)
+    first_stop_calls_after_replacement = first.stop_calls
+    coordinator.stop_all()
+
+    # Expected safe behavior: old sandbox should have been stopped before replacement.
+    # Current behavior leaves this at 0, proving the leak gap.
+    assert first_stop_calls_after_replacement == 1
+
+
+def test_coordinator_can_start_new_sandbox_before_old_stop_finishes(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+    stop_finished = threading.Event()
+    first = BlockingStopFireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {"goal": "g", "history": []},
+                "files": [],
+            }
+        ],
+        stop_entered=stop_entered,
+        stop_release=stop_release,
+        stop_finished=stop_finished,
+    )
+    second = FireSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": []},
+                "files": [],
+            }
+        ]
+    )
+    sandboxes = [first, second]
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandboxes.pop(0),
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="first", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+
+    stop_thread = threading.Thread(
+        target=coordinator.stop_session,
+        kwargs={"session_id": "sess-1"},
+        daemon=True,
+    )
+    stop_thread.start()
+    assert stop_entered.wait(timeout=1.0) is True
+    assert first.is_running() is True
+
+    # While stop is in progress, session startup is deferred.
+    status_during_stop = coordinator.start_task(
+        session_id="sess-1",
+        text="second",
+        sink=lambda _: None,
+    )
+    assert status_during_stop == "busy"
+    first_running_during_replacement = first.is_running()
+    second_start_calls_during_replacement = second.start_calls
+
+    stop_release.set()
+    stop_thread.join(timeout=1.0)
+    assert stop_finished.is_set()
+
+    # Once stop completes, task start succeeds on a fresh sandbox.
+    status_after_stop = coordinator.start_task(
+        session_id="sess-1",
+        text="second",
+        sink=lambda _: None,
+    )
+    assert status_after_stop == "started"
+    assert _wait_until(lambda: second.start_calls == 1)
+    coordinator.stop_all()
+
+    assert first_running_during_replacement is True
+    assert second_start_calls_during_replacement == 0
 
 
 def test_coordinator_reaps_idle_session_sandbox_after_timeout(

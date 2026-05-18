@@ -28,6 +28,7 @@ class _SessionRecord:
     latest_state: dict[str, Any] | None = None
     sink: EventSink | None = None
     sandbox: Any | None = None
+    sandbox_stopping: bool = False
     last_task_completed_at: float | None = None
 
 
@@ -91,10 +92,14 @@ class Coordinator:
         if not text.strip():
             raise ValueError("Task text cannot be empty.")
 
+        self._retire_stale_sandbox(session_id=session_id)
+
         start_error: Exception | None = None
         with self._lock:
             record = self._sessions.setdefault(session_id, _SessionRecord())
             if record.worker is not None and record.worker.is_running():
+                return "busy"
+            if record.sandbox_stopping:
                 return "busy"
             if (
                 self._max_active_sessions is not None
@@ -201,7 +206,8 @@ class Coordinator:
                 sandbox = record.sandbox
                 record.pending_role = None
                 record.worker = None
-                record.sandbox = None
+                if sandbox is not None:
+                    record.sandbox_stopping = True
                 record.last_task_completed_at = None
         if worker is not None:
             worker.stop()
@@ -210,29 +216,43 @@ class Coordinator:
                 sandbox.stop()
             except Exception:
                 pass
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is not None:
+                if record.sandbox is sandbox:
+                    record.sandbox = None
+                record.sandbox_stopping = False
 
     def stop_all(self) -> None:
         """Stop all session workers."""
         self._idle_reaper_stop.set()
         workers: list[_SessionWorker] = []
-        sandboxes: list[Any] = []
+        sandboxes: list[tuple[str, Any]] = []
         with self._lock:
-            for record in self._sessions.values():
+            for session_id, record in self._sessions.items():
                 if record.worker is not None:
                     workers.append(record.worker)
                     record.worker = None
                 if record.sandbox is not None:
-                    sandboxes.append(record.sandbox)
-                    record.sandbox = None
+                    sandboxes.append((session_id, record.sandbox))
+                    record.sandbox_stopping = True
                 record.pending_role = None
                 record.last_task_completed_at = None
         for worker in workers:
             worker.stop()
-        for sandbox in sandboxes:
+        for _, sandbox in sandboxes:
             try:
                 sandbox.stop()
             except Exception:
                 pass
+        with self._lock:
+            for session_id, sandbox in sandboxes:
+                record = self._sessions.get(session_id)
+                if record is None:
+                    continue
+                if record.sandbox is sandbox:
+                    record.sandbox = None
+                record.sandbox_stopping = False
         self._idle_reaper_thread.join(timeout=2.0)
 
     def _active_session_count_locked(self) -> int:
@@ -243,6 +263,9 @@ class Coordinator:
         return count
 
     def _record_counts_toward_capacity(self, record: _SessionRecord) -> bool:
+        if record.sandbox_stopping:
+            return True
+
         worker = record.worker
         if worker is not None and worker.is_running():
             return True
@@ -323,11 +346,13 @@ class Coordinator:
                 continue
 
             now = time.monotonic()
-            sandboxes_to_stop: list[Any] = []
+            sandboxes_to_stop: list[tuple[str, Any]] = []
             with self._lock:
-                for record in self._sessions.values():
+                for session_id, record in self._sessions.items():
                     sandbox = record.sandbox
                     if sandbox is None:
+                        continue
+                    if record.sandbox_stopping:
                         continue
 
                     worker = record.worker
@@ -340,20 +365,55 @@ class Coordinator:
                     if now - completed_at <= timeout_seconds:
                         continue
 
-                    if not sandbox.is_running():
-                        record.sandbox = None
-                        record.last_task_completed_at = None
-                        continue
-
-                    record.sandbox = None
+                    record.sandbox_stopping = True
                     record.last_task_completed_at = None
-                    sandboxes_to_stop.append(sandbox)
+                    sandboxes_to_stop.append((session_id, sandbox))
 
-            for sandbox in sandboxes_to_stop:
+            for session_id, sandbox in sandboxes_to_stop:
                 try:
                     sandbox.stop()
                 except Exception:
                     pass
+                with self._lock:
+                    record = self._sessions.get(session_id)
+                    if record is None:
+                        continue
+                    if record.sandbox is sandbox:
+                        record.sandbox = None
+                    record.sandbox_stopping = False
+
+    def _retire_stale_sandbox(self, *, session_id: str) -> None:
+        stale_sandbox: Any | None = None
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return
+            if record.sandbox_stopping:
+                return
+            sandbox = record.sandbox
+            if sandbox is None:
+                return
+            try:
+                running = bool(sandbox.is_running())
+            except Exception:
+                running = False
+            if running:
+                return
+            record.sandbox_stopping = True
+            stale_sandbox = sandbox
+
+        try:
+            stale_sandbox.stop()
+        except Exception:
+            pass
+
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return
+            if record.sandbox is stale_sandbox:
+                record.sandbox = None
+            record.sandbox_stopping = False
 
 
 class _SessionWorker:
