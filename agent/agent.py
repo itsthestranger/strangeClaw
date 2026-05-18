@@ -205,6 +205,7 @@ class Agent:
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
         self._history_summarized_count = 0
+        self._integrations = self._load_integrations()
 
     def _load_integrations(self) -> list[str]:
         if self._broker is None:
