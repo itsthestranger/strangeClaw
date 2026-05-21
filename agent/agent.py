@@ -205,7 +205,11 @@ class Agent:
         self._llm: LLMRuntime | None = None
         self._history_summary: str | None = None
         self._history_summarized_count = 0
-        self._integrations = self._load_integrations()
+        # Important: do not call broker-backed _load_integrations() here.
+        # In Fire mode, BrokerClient._call_fire() reads from the same transport
+        # used for host task delivery; doing this before run_forever() can race
+        # and consume/discard the first task event.
+        self._integrations = []
 
     def _load_integrations(self) -> list[str]:
         if self._broker is None:
