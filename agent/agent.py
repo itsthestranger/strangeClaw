@@ -12,7 +12,8 @@ from typing import Any, Protocol
 
 from agent.broker_client import BrokerClient, HostServiceError
 from agent.llm import LLMClient
-from agent.llm_types import LLMResponse, LLMRuntime, ToolCall
+from agent.llm_proxy import LLMProxyRuntime
+from agent.llm_types import LLMResponse, LLMRuntime, LLMRuntimeError, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools
 from agent.transport import VsockTransport
@@ -454,9 +455,23 @@ class Agent:
                 history=history,
                 activated_skills=activated_skills,
             )
+        except LLMRuntimeError as exc:
+            history.append(self._emit_llm_runtime_error(exc))
+            return None
         except AgentError as exc:
             history.append(self._emit_decision_parse_error(exc))
             return None
+
+    def _emit_llm_runtime_error(self, error: LLMRuntimeError) -> dict[str, Any]:
+        error_result = ToolResult(exit_code=1, stdout="", stderr=error.message)
+        action_event = {
+            "type": "action",
+            "tool": _CONTROL_TOOL_DECISION_ERROR,
+            "args": {"category": "llm_runtime_error"},
+            "result": asdict(error_result),
+        }
+        self._send(action_event)
+        return action_event
 
     def _emit_decision_parse_error(self, error: AgentError) -> dict[str, Any]:
         error_result = ToolResult(
@@ -817,7 +832,10 @@ class Agent:
                 },
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
             ]
-            token_count = self._require_llm().count_tokens(messages)
+            try:
+                token_count = self._require_llm().count_tokens(messages)
+            except LLMRuntimeError:
+                token_count = _estimate_message_tokens(messages)
             if token_count <= self._token_budget:
                 return messages
             if recent_history:
@@ -978,6 +996,27 @@ def _read_context_int(agent_config: dict[str, Any], key: str, *, fallback: int) 
     return value
 
 
+def _read_host_service_llm_timeout(agent_config: dict[str, Any]) -> float:
+    host_services = agent_config.get("host_services")
+    if not isinstance(host_services, dict):
+        return 120.0
+    raw_timeout = host_services.get("llm_timeout_seconds", 120)
+    if isinstance(raw_timeout, bool):
+        return 120.0
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        return 120.0
+    if timeout <= 0:
+        return 120.0
+    return timeout
+
+
+def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    serialized = json.dumps(messages, ensure_ascii=True, default=str)
+    return max(1, len(serialized) // 4)
+
+
 def _load_agent_config_file(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise AgentError(f"Agent config file was not found: {path}")
@@ -1027,21 +1066,30 @@ def main(argv: list[str] | None = None) -> None:
     if isinstance(args.llm_config_path, str) and args.llm_config_path.strip():
         config_path = args.llm_config_path
 
+    agent_config = _load_agent_config_file(Path(config_path))
     transport = VsockTransport(guest_port=int(args.vsock_port))
     try:
         broker = BrokerClient(
             mode="fire",
             send_fn=transport.send,
             receive_fn=transport.receive,
+            service_timeouts={
+                "_default": 60.0,
+                "broker": 60.0,
+                "llm": _read_host_service_llm_timeout(agent_config),
+            },
         )
+        llm_runtime = LLMProxyRuntime(broker)
         agent = Agent(
             transport=transport,
             skills_dir=str(args.skills_dir),
             max_iterations=int(args.max_iterations),
             output_dir=str(args.output_dir),
+            agent_config=agent_config,
             agent_config_path=str(config_path),
             token_budget=int(args.token_budget),
             summary_threshold=int(args.summary_threshold),
+            llm_runtime=llm_runtime,
             broker=broker,
         )
         agent.run_forever()

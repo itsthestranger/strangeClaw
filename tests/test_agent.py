@@ -17,7 +17,7 @@ import agent.agent as agent_module
 from agent.agent import Agent
 from agent.broker_client import BrokerClient
 from agent.llm import LLMClient
-from agent.llm_types import LLMResponse, ToolCall
+from agent.llm_types import LLMResponse, LLMRuntimeError, ToolCall
 from agent.transport import InProcessTransport
 from sandbox.host_services import HostServiceServer
 
@@ -661,6 +661,85 @@ def test_execution_prompt_includes_configured_integrations() -> None:
     )
 
     assert "Configured integrations: notion" in messages[0]["content"]
+
+
+def test_llm_runtime_error_becomes_decision_error_and_execution_recovers() -> None:
+    class FailsOnceLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: list[dict[str, Any]],
+            action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
+        ) -> LLMResponse:
+            del messages
+            self.calls += 1
+            if action_schema is None:
+                return LLMResponse(text='{"steps":["single"]}', action=None)
+            if self.calls == 2:
+                raise LLMRuntimeError("transient llm service failure sk-redacted")
+            return LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
+            )
+
+        def count_tokens(self, messages: list[dict[str, Any]]) -> int:
+            del messages
+            return 1
+
+    llm = FailsOnceLLM()
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+
+    error_events = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_decision_error"
+    ]
+    assert error_events
+    assert error_events[0]["args"] == {"category": "llm_runtime_error"}
+    assert "transient llm service failure" in error_events[0]["result"]["stderr"]
+    assert events[-1]["type"] == "done"
+    assert events[-1]["reply"] == "recovered"
+    assert llm.calls == 3
+
+
+def test_count_token_runtime_error_uses_conservative_budget_estimate() -> None:
+    class CountFailingLLM(ScriptedLLM):
+        def count_tokens(self, messages: list[dict[str, Any]]) -> int:
+            del messages
+            raise LLMRuntimeError("count failed")
+
+    llm = CountFailingLLM(responses=[])
+    host_transport, agent_transport = InProcessTransport.pair()
+    del host_transport
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=llm,
+        token_budget=1_000_000,
+    )
+
+    messages = agent.build_execution_prompt(
+        goal="g",
+        plan={"steps": []},
+        history=[],
+        activated_skills={},
+    )
+
+    assert messages
 
 
 def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> None:
@@ -1565,6 +1644,16 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     tmp_path: Path,
 ) -> None:
     captured: dict[str, Any] = {}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llm": {"model": "fake/model", "api_key": "fake-key"},
+                "host_services": {"llm_timeout_seconds": 123},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class FakeVsockTransport:
         def __init__(self, *, guest_port: int) -> None:
@@ -1598,7 +1687,7 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
             "--skills-dir",
             str(tmp_path / "skills"),
             "--agent-config-path",
-            str(tmp_path / "config.json"),
+            str(config_path),
         ]
     )
 
@@ -1608,5 +1697,6 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
 
     kwargs = captured["agent_kwargs"]
     assert kwargs["skills_dir"] == str(tmp_path / "skills")
-    assert kwargs["agent_config_path"] == str(tmp_path / "config.json")
-    assert "llm_runtime" not in kwargs
+    assert kwargs["agent_config_path"] == str(config_path)
+    assert kwargs["agent_config"]["host_services"]["llm_timeout_seconds"] == 123
+    assert kwargs["llm_runtime"].__class__.__name__ == "LLMProxyRuntime"

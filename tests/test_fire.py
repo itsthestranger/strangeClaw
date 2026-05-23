@@ -1091,6 +1091,95 @@ def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(
         sandbox.stop()
 
 
+def test_fire_sandbox_registers_llm_host_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sandbox.fire.load_secrets", lambda: {})
+    service_configs: list[dict[str, Any]] = []
+
+    class FakeLLMService:
+        def __init__(self, config: dict[str, Any]) -> None:
+            service_configs.append(config)
+
+        def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+            assert payload == {"action": "count_tokens", "messages": []}
+            return {"success": True, "tokens": 7}
+
+    monkeypatch.setattr("sandbox.fire.LLMService", FakeLLMService)
+
+    config = _build_firecracker_config(tmp_path)
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[
+                    b"OK 100\n"
+                    + encode_event({"type": "agent_ready"}).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "broker_request",
+                            "request_id": "llm-1",
+                            "service": "llm",
+                            "payload": {"action": "count_tokens", "messages": []},
+                        }
+                    ).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "done",
+                            "success": True,
+                            "reply": "ok",
+                            "state": {},
+                            "files": [],
+                        }
+                    ).encode("utf-8")
+                ]
+            )
+        ]
+    )
+    agent_config = _agent_config(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-host",
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=agent_config,
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "llm service",
+                "session_id": "sess-llm-fire",
+                "approval_mode": "auto",
+            }
+        )
+        event = sandbox.receive(timeout_seconds=1.0)
+        assert event is not None
+        assert event["type"] == "done"
+        assert service_configs == [agent_config]
+        sent_payloads = [
+            payload.decode("utf-8", errors="replace")
+            for payload in socket_factory.sockets[0].sent
+            if payload.startswith(b"{")
+        ]
+        assert any('"request_id":"llm-1"' in payload for payload in sent_payloads)
+        assert any('"tokens":7' in payload for payload in sent_payloads)
+    finally:
+        sandbox.stop()
+
+
 def test_fire_sandbox_connect_retries_with_new_socket(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     vsock_path = tmp_path / "fire.vsock"

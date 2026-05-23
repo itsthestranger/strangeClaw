@@ -27,6 +27,7 @@ class BrokerClient:
         mode: str = "yolo",
         send_fn: Callable[[dict[str, Any]], None] | None = None,
         receive_fn: Callable[[float | None], dict[str, Any] | None] | None = None,
+        service_timeouts: dict[str, float] | None = None,
     ) -> None:
         if mode not in {"yolo", "fire"}:
             raise ValueError(f"Unsupported broker client mode: {mode}")
@@ -38,6 +39,7 @@ class BrokerClient:
         self._server = server
         self._send_fn = send_fn
         self._receive_fn = receive_fn
+        self._service_timeouts = dict(service_timeouts or {})
 
     def call(self, service: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Call a host service and return its payload."""
@@ -75,9 +77,13 @@ class BrokerClient:
             }
         )
         while True:
-            event = self._receive_fn(60.0)
+            timeout = self._service_timeouts.get(
+                str(request.get("service", "")),
+                self._service_timeouts.get("_default", 60.0),
+            )
+            event = self._receive_fn(timeout)
             if event is None:
-                raise HostServiceError("broker response timeout")
+                raise HostServiceError(f"{request['service']} response timeout")
             if event.get("type") != "broker_response":
                 LOGGER.warning(
                     "Discarding non-broker event while waiting for broker response: %s",

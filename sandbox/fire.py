@@ -27,6 +27,7 @@ from agent.protocol import decode_event, encode_event
 from host_secrets import load_secrets
 from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
+from sandbox.llm_service import LLMService
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -999,6 +1000,7 @@ class FireSandbox:
             )
             host_services = HostServiceServer()
             host_services.register("broker", request_broker.handle)
+            host_services.register("llm", LLMService(self._agent_config_template).handle)
             host_services.start()
             self._host_service_server = host_services
             self._prepare_runtime_paths(session_id=session_id)

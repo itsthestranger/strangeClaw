@@ -163,6 +163,52 @@ def test_broker_client_fire_mode_timeout_raises() -> None:
     assert sent
 
 
+def test_broker_client_fire_mode_uses_service_specific_timeouts() -> None:
+    seen_timeouts: list[float | None] = []
+
+    def send_fn(event: dict[str, Any]) -> None:
+        del event
+
+    def receive_fn(timeout_seconds: float | None) -> dict[str, Any] | None:
+        seen_timeouts.append(timeout_seconds)
+        return None
+
+    client = BrokerClient(
+        mode="fire",
+        send_fn=send_fn,
+        receive_fn=receive_fn,
+        service_timeouts={"_default": 11.0, "broker": 60.0, "llm": 120.0},
+    )
+
+    with pytest.raises(HostServiceError, match="llm response timeout"):
+        client.call("llm", {"action": "complete", "messages": []})
+
+    assert seen_timeouts == [120.0]
+
+
+def test_broker_client_fire_mode_uses_default_timeout_for_unknown_service() -> None:
+    seen_timeouts: list[float | None] = []
+
+    def send_fn(event: dict[str, Any]) -> None:
+        del event
+
+    def receive_fn(timeout_seconds: float | None) -> dict[str, Any] | None:
+        seen_timeouts.append(timeout_seconds)
+        return None
+
+    client = BrokerClient(
+        mode="fire",
+        send_fn=send_fn,
+        receive_fn=receive_fn,
+        service_timeouts={"_default": 17.0},
+    )
+
+    with pytest.raises(HostServiceError, match="custom response timeout"):
+        client.call("custom", {})
+
+    assert seen_timeouts == [17.0]
+
+
 def test_broker_client_fire_mode_discards_non_broker_events(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
