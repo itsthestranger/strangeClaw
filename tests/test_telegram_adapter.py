@@ -15,7 +15,7 @@ from adapters.telegram import (
     TelegramAdapter,
     TelegramLimits,
 )
-from agent.llm import LLMResponse, ToolCall
+from agent.llm_types import LLMResponse, ToolCall
 from coordinator import Coordinator
 from sandbox.yolo import YoloSandbox
 
@@ -362,13 +362,13 @@ def test_telegram_integration_task_plan_approve_execute_done(
     adapter = TelegramAdapter(
         sandbox_factory=lambda: YoloSandbox(
             skills_dir=str(_skills_root()),
-            llm_factory=lambda _: llm,
+            llm_runtime=llm,
             agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
         ),
         coordinator=Coordinator(
             sandbox_factory=lambda: YoloSandbox(
                 skills_dir=str(_skills_root()),
-                llm_factory=lambda _: llm,
+                llm_runtime=llm,
                 agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
             ),
             approval_mode="review",

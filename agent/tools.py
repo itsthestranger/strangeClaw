@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.broker_client import BrokerClient, HostServiceError
-from agent.llm import ToolCall
+from agent.llm_types import ToolCall
 
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0

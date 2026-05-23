@@ -67,3 +67,19 @@ def test_decode_rejects_invalid_json() -> None:
 def test_encode_rejects_invalid_event_shape() -> None:
     with pytest.raises(ProtocolError, match="Unsupported event type"):
         encode_event({"type": "nope"})
+
+
+def test_task_event_with_llm_logs_deprecation_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    event = {
+        "type": "task",
+        "text": "do thing",
+        "session_id": "abc123",
+        "approval_mode": "review",
+        "llm": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
+    }
+    with caplog.at_level("WARNING"):
+        decoded = decode_event(encode_event(event))
+    assert decoded == event
+    assert "task.llm is deprecated and ignored" in caplog.text

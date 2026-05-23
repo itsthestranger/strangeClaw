@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, cast
 
 EVENT_TYPES = {
@@ -17,6 +18,7 @@ EVENT_TYPES = {
     "broker_response",
 }
 MESSAGE_ROLES = {"plan", "clarification", "status", "reply"}
+LOGGER = logging.getLogger(__name__)
 
 
 class ProtocolError(ValueError):
@@ -60,6 +62,10 @@ def validate_event(event: dict[str, Any]) -> None:
         llm = event.get("llm")
         if llm is not None and not isinstance(llm, dict):
             raise ProtocolError("Event field 'llm' must be an object when provided.")
+        if isinstance(llm, dict):
+            LOGGER.warning(
+                "task.llm is deprecated and ignored. Pass LLM config at agent construction time."
+            )
         return
 
     if event_type == "user_reply":

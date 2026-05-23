@@ -9,9 +9,10 @@ from unittest.mock import patch
 
 import requests
 
+import agent.agent as agent_module
 import session
 from adapters.session_persistence import persist_done_event
-from agent.llm import LLMResponse, ToolCall
+from agent.llm_types import LLMResponse, ToolCall
 from agent.tools import Tools
 from sandbox.yolo import YoloSandbox
 
@@ -127,7 +128,7 @@ def test_yolo_integration_success_path() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task())
@@ -157,7 +158,7 @@ def test_yolo_integration_plan_rejection_and_replan() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task(approval_mode="review"))
@@ -198,7 +199,7 @@ def test_yolo_integration_clarification_round_trip() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task())
@@ -234,7 +235,7 @@ def test_yolo_integration_invalid_tool_call_is_observed_next_turn() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task())
@@ -265,7 +266,7 @@ def test_yolo_integration_max_iteration_guard() -> None:
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
         max_iterations=1,
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task())
@@ -299,7 +300,7 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
     }
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task(state=resume_state))
@@ -369,23 +370,25 @@ def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> Non
         ]
     )
     captured_llm_config: dict[str, Any] = {}
+    original_from_config = agent_module.LLMClient.from_config
 
-    def llm_factory(config: dict[str, Any]) -> ScriptedLLM:
+    def fake_from_config(config: dict[str, Any]) -> ScriptedLLM:
         captured_llm_config.update(config)
         return llm
 
+    agent_module.LLMClient.from_config = fake_from_config  # type: ignore[assignment]
     sandbox = YoloSandbox(
         skills_dir=str(skills_root),
-        llm_factory=llm_factory,
         agent_config=_agent_config(),
     )
     task = _task(approval_mode="auto")
     task["llm"] = {"model": "inline/model", "api_key": "inline-key"}
-    sandbox.run(task)
     try:
+        sandbox.run(task)
         events = _collect_until_done(sandbox)
     finally:
         sandbox.stop()
+        agent_module.LLMClient.from_config = original_from_config  # type: ignore[assignment]
 
     # Yolo must use construction-time config and ignore task-inline llm config.
     assert captured_llm_config == _agent_config()["llm"]
@@ -444,7 +447,7 @@ def test_yolo_integration_missing_notion_credentials_denial_no_retry(
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
     sandbox.run(_task())
@@ -519,7 +522,7 @@ def test_yolo_integration_broker_redaction_propagates_to_events_and_persistence(
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: llm,
+        llm_runtime=llm,
         agent_config=_agent_config(),
     )
 

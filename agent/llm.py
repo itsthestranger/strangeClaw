@@ -3,28 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import litellm
 
-
-@dataclass(slots=True)
-class ToolCall:
-    """Normalized tool call."""
-
-    tool: str
-    args: dict[str, Any]
-    reason: str | None = None
-
-
-@dataclass(slots=True)
-class LLMResponse:
-    """Normalized model response."""
-
-    text: str
-    action: ToolCall | None
-    usage: dict[str, int] | None = None
+from agent.llm_types import LLMResponse, ToolCall
 
 
 class LLMClient:

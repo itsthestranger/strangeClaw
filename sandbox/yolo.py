@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
 from typing import Any
 
-from agent.agent import Agent, AgentError, LLMRuntime
+from agent.agent import Agent, AgentError
 from agent.broker_client import BrokerClient
+from agent.llm_types import LLMRuntime
 from agent.transport import InProcessTransport
 from host_secrets import load_secrets
 from sandbox.broker import RequestBroker
@@ -26,7 +26,7 @@ class YoloSandbox:
         output_dir: str = "/output",
         token_budget: int = 4000,
         summary_threshold: int = 10,
-        llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
+        llm_runtime: LLMRuntime | None = None,
     ) -> None:
         self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
         if self._agent_config is not None:
@@ -46,7 +46,7 @@ class YoloSandbox:
         self._output_dir = output_dir
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
-        self._llm_factory = llm_factory
+        self._llm_runtime = llm_runtime
 
         self._host_transport: InProcessTransport | None = None
         self._agent_transport: InProcessTransport | None = None
@@ -110,8 +110,7 @@ class YoloSandbox:
             output_dir=self._output_dir,
             token_budget=self._token_budget,
             summary_threshold=self._summary_threshold,
-            allow_task_llm=self._agent_config is None,
-            llm_factory=self._llm_factory,
+            llm_runtime=self._llm_runtime,
             broker=broker_client,
         )
         self._agent_thread = threading.Thread(target=self._run_agent, args=(agent,), daemon=True)

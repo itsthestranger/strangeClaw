@@ -247,12 +247,12 @@ class Coordinator:
                 pass
         with self._lock:
             for session_id, sandbox in sandboxes:
-                record = self._sessions.get(session_id)
-                if record is None:
+                session_record = self._sessions.get(session_id)
+                if session_record is None:
                     continue
-                if record.sandbox is sandbox:
-                    record.sandbox = None
-                record.sandbox_stopping = False
+                if session_record.sandbox is sandbox:
+                    session_record.sandbox = None
+                session_record.sandbox_stopping = False
         self._idle_reaper_thread.join(timeout=2.0)
 
     def _active_session_count_locked(self) -> int:
@@ -375,12 +375,12 @@ class Coordinator:
                 except Exception:
                     pass
                 with self._lock:
-                    record = self._sessions.get(session_id)
-                    if record is None:
+                    session_record = self._sessions.get(session_id)
+                    if session_record is None:
                         continue
-                    if record.sandbox is sandbox:
-                        record.sandbox = None
-                    record.sandbox_stopping = False
+                    if session_record.sandbox is sandbox:
+                        session_record.sandbox = None
+                    session_record.sandbox_stopping = False
 
     def _retire_stale_sandbox(self, *, session_id: str) -> None:
         stale_sandbox: Any | None = None

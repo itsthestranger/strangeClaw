@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
+import sys
 from typing import Any
 
 import pytest
@@ -92,6 +94,15 @@ class _FakeClientError(RuntimeError):
     def __init__(self, message: str, *, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def test_llm_types_import_does_not_import_litellm() -> None:
+    sys.modules.pop("agent.llm_types", None)
+    sys.modules.pop("litellm", None)
+
+    importlib.import_module("agent.llm_types")
+
+    assert "litellm" not in sys.modules
 
 
 def test_complete_normalizes_text_and_usage(monkeypatch: pytest.MonkeyPatch) -> None:

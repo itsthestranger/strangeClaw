@@ -68,6 +68,11 @@ broker:
     # Set enabled: false to require integration: "<name>" for every
     # http_request call.
 
+host_services:
+  # Host-side service limits (guest receives only llm_timeout_seconds in C8+).
+  llm_timeout_seconds: 120
+  llm_max_request_bytes: 2097152
+
 context:
   token_budget: 4000
   summary_threshold: 10

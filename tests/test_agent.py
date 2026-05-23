@@ -16,7 +16,8 @@ import pytest
 import agent.agent as agent_module
 from agent.agent import Agent
 from agent.broker_client import BrokerClient
-from agent.llm import LLMClient, LLMResponse, ToolCall
+from agent.llm import LLMClient
+from agent.llm_types import LLMResponse, ToolCall
 from agent.transport import InProcessTransport
 from sandbox.host_services import HostServiceServer
 
@@ -82,6 +83,10 @@ def _task_event(approval_mode: str = "auto") -> dict[str, Any]:
     }
 
 
+def _agent_config() -> dict[str, Any]:
+    return {"llm": {"model": "fake/model", "api_key": "fake-key"}}
+
+
 def _collect_until_done(
     host_transport: InProcessTransport,
     *,
@@ -105,6 +110,80 @@ def _collect_until_done(
             continue
         if event["type"] == "done":
             return events
+
+
+def test_agent_constructs_llm_client_once_and_reuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_configs: list[dict[str, Any]] = []
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["first"]}', action=None, usage=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "one"})),
+            LLMResponse(text='{"steps":["second"]}', action=None, usage=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "two"})),
+        ]
+    )
+
+    def fake_from_config(config: dict[str, Any]) -> ScriptedLLM:
+        created_configs.append(dict(config))
+        return scripted_llm
+
+    monkeypatch.setattr(agent_module.LLMClient, "from_config", staticmethod(fake_from_config))
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config=_agent_config(),
+    )
+
+    worker = threading.Thread(target=agent.run_forever)
+    worker.start()
+    host_transport.send({**_task_event(), "text": "first"})
+    first = _collect_until_done(host_transport)
+    host_transport.send({**_task_event(), "text": "second"})
+    second = _collect_until_done(host_transport)
+    host_transport.send({"type": "stop"})
+    worker.join(timeout=2.0)
+
+    assert created_configs == [_agent_config()["llm"]]
+    assert first[-1]["reply"] == "one"
+    assert second[-1]["reply"] == "two"
+
+
+def test_agent_uses_supplied_llm_runtime_without_constructing_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module.LLMClient,
+        "from_config",
+        staticmethod(lambda config: (_ for _ in ()).throw(AssertionError(config))),
+    )
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "done"})),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config=_agent_config(),
+        llm_runtime=scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+
+    assert events[-1]["type"] == "done"
+    assert events[-1]["reply"] == "done"
+
 
 
 def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
@@ -159,7 +238,7 @@ def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
         skills_dir=str(_skills_root()),
         max_iterations=10,
         output_dir=str(output_dir),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -232,7 +311,7 @@ def test_agent_run_forever_processes_sequential_tasks_with_clean_state(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run_forever)
@@ -285,7 +364,7 @@ def test_agent_run_forever_continues_after_max_iteration_done() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=1,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run_forever)
@@ -312,7 +391,7 @@ def test_agent_run_forever_stop_during_idle_exits() -> None:
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run_forever)
@@ -343,7 +422,7 @@ def test_agent_plan_rejection_replans_in_review_mode() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -386,7 +465,7 @@ def test_agent_emits_clarification_when_max_iterations_reached() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=1,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -422,7 +501,7 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
         skills_dir=str(_skills_root()),
         token_budget=220,
         summary_threshold=50,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
     agent._llm = scripted_llm
 
@@ -455,8 +534,17 @@ def test_build_execution_prompt_drops_oldest_history_when_over_budget() -> None:
     assert payload["output_instruction"] == "Place any files for the user in /output/."
 
 
-def test_agent_loads_integrations_via_broker_at_startup() -> None:
-    scripted_llm = ScriptedLLM(responses=[])
+def test_agent_loads_integrations_via_broker_when_task_starts() -> None:
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["single"]}', action=None, usage=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "done"}),
+                usage=None,
+            ),
+        ]
+    )
     calls: list[dict[str, Any]] = []
 
     def _broker_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -467,13 +555,19 @@ def test_agent_loads_integrations_via_broker_at_startup() -> None:
     server.register("broker", _broker_handler)
     broker = BrokerClient(server)
     host_transport, agent_transport = InProcessTransport.pair()
-    del host_transport
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
         broker=broker,
     )
+
+    assert calls == []
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
 
     assert calls == [{"action": "list_integrations"}]
     assert agent._integrations == ["github", "notion"]
@@ -489,10 +583,11 @@ def test_execution_prompt_includes_configured_integrations() -> None:
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
         broker=broker,
     )
     agent._llm = scripted_llm
+    agent._integrations = agent._load_integrations()
 
     messages = agent.build_execution_prompt(
         goal="g",
@@ -526,7 +621,7 @@ def test_agent_done_reports_error_when_output_limit_exceeded(tmp_path: Path) -> 
         skills_dir=str(_skills_root()),
         output_dir=str(output_dir),
         max_output_total_bytes=8,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -576,7 +671,7 @@ def test_recent_history_triggers_summary_and_done_state_persists_it() -> None:
         skills_dir=str(_skills_root()),
         max_iterations=5,
         summary_threshold=1,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -610,7 +705,7 @@ def test_agent_handles_invalid_decision_output_without_crashing() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -669,7 +764,7 @@ def test_agent_malformed_control_call_emits_action_error_and_recovers(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -705,7 +800,7 @@ def test_agent_malformed_control_call_emits_action_error_and_recovers(
     )
 
 
-def test_agent_uses_agent_config_file_when_task_llm_is_disallowed(tmp_path: Path) -> None:
+def test_agent_uses_agent_config_file_and_ignores_task_llm(tmp_path: Path) -> None:
     llm_from_file = {"model": "file/model", "api_key": "file-key"}
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"llm": llm_from_file}), encoding="utf-8")
@@ -722,18 +817,21 @@ def test_agent_uses_agent_config_file_when_task_llm_is_disallowed(tmp_path: Path
         ]
     )
 
-    def llm_factory(config: dict[str, Any]) -> ScriptedLLM:
+    def fake_from_config(config: dict[str, Any]) -> ScriptedLLM:
         captured["config"] = config
         return scripted_llm
 
     host_transport, agent_transport = InProcessTransport.pair()
-    agent = Agent(
-        transport=agent_transport,
-        skills_dir=str(_skills_root()),
-        agent_config_path=str(config_path),
-        allow_task_llm=False,
-        llm_factory=llm_factory,
-    )
+    original_from_config = agent_module.LLMClient.from_config
+    agent_module.LLMClient.from_config = fake_from_config  # type: ignore[assignment]
+    try:
+        agent = Agent(
+            transport=agent_transport,
+            skills_dir=str(_skills_root()),
+            agent_config_path=str(config_path),
+        )
+    finally:
+        agent_module.LLMClient.from_config = original_from_config  # type: ignore[assignment]
 
     worker = threading.Thread(target=agent.run)
     worker.start()
@@ -783,7 +881,7 @@ def test_agent_stage3_read_skill_file_control_action() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -838,7 +936,7 @@ def test_agent_stage3_read_skill_file_allows_activated_skill(tmp_path: Path) -> 
         transport=agent_transport,
         skills_dir=str(skills_root),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -886,7 +984,7 @@ def test_agent_replans_when_plan_references_unknown_skill() -> None:
         transport=agent_transport,
         skills_dir=str(_skills_root()),
         max_iterations=5,
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
     )
 
     worker = threading.Thread(target=agent.run)
@@ -988,9 +1086,9 @@ def test_agent_native_read_skill_file_success_path(
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(skills_root),
-        llm_factory=lambda config: LLMClient.from_config(
+        llm_runtime=LLMClient.from_config(
             {
-                **config,
+                **_agent_config()["llm"],
                 "structured_output": "native",
                 "native_probe": False,
                 "native_tool_choice": "required",
@@ -1095,9 +1193,9 @@ def test_agent_native_read_skill_file_failure_paths(
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(skills_root),
-        llm_factory=lambda config: LLMClient.from_config(
+        llm_runtime=LLMClient.from_config(
             {
-                **config,
+                **_agent_config()["llm"],
                 "structured_output": "native",
                 "native_probe": False,
                 "native_tool_choice": "required",
@@ -1187,9 +1285,9 @@ def test_agent_prompt_read_skill_file_success_path(
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(skills_root),
-        llm_factory=lambda config: LLMClient.from_config(
+        llm_runtime=LLMClient.from_config(
             {
-                **config,
+                **_agent_config()["llm"],
                 "structured_output": "prompt",
             }
         ),
@@ -1276,9 +1374,9 @@ def test_agent_prompt_read_skill_file_failure_paths(
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(skills_root),
-        llm_factory=lambda config: LLMClient.from_config(
+        llm_runtime=LLMClient.from_config(
             {
-                **config,
+                **_agent_config()["llm"],
                 "structured_output": "prompt",
             }
         ),
@@ -1352,9 +1450,9 @@ def test_agent_prompt_recovers_after_decision_error(monkeypatch: pytest.MonkeyPa
     agent = Agent(
         transport=agent_transport,
         skills_dir=str(_skills_root()),
-        llm_factory=lambda config: LLMClient.from_config(
+        llm_runtime=LLMClient.from_config(
             {
-                **config,
+                **_agent_config()["llm"],
                 "structured_output": "prompt",
             }
         ),
@@ -1445,6 +1543,6 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     assert captured["closed"] is True
 
     kwargs = captured["agent_kwargs"]
-    assert kwargs["allow_task_llm"] is False
     assert kwargs["skills_dir"] == str(tmp_path / "skills")
     assert kwargs["agent_config_path"] == str(tmp_path / "config.json")
+    assert "llm_runtime" not in kwargs

@@ -134,6 +134,7 @@ def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
     _validate_skills_optional_fields(config)
+    _validate_host_services_optional_fields(config)
     _validate_firecracker_optional_fields(config)
     _validate_session_journal_optional_fields(config)
 
@@ -318,6 +319,50 @@ def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
     if max_file_chars <= 0:
         raise ConfigError("Config field skills.max_file_chars must be greater than zero.")
     skills["max_file_chars"] = max_file_chars
+
+
+def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
+    host_services = config.get("host_services")
+    if host_services is None:
+        config["host_services"] = {
+            "llm_timeout_seconds": 120,
+            "llm_max_request_bytes": 2 * 1024 * 1024,
+        }
+        return
+    if not isinstance(host_services, dict):
+        raise ConfigError("Config field host_services must be a mapping.")
+
+    llm_timeout_raw = host_services.get("llm_timeout_seconds", 120)
+    if isinstance(llm_timeout_raw, bool):
+        raise ConfigError("Config field host_services.llm_timeout_seconds must be an integer.")
+    try:
+        llm_timeout_seconds = int(llm_timeout_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field host_services.llm_timeout_seconds must be an integer."
+        ) from exc
+    if llm_timeout_seconds <= 0:
+        raise ConfigError(
+            "Config field host_services.llm_timeout_seconds must be greater than zero."
+        )
+    host_services["llm_timeout_seconds"] = llm_timeout_seconds
+
+    llm_max_request_bytes_raw = host_services.get("llm_max_request_bytes", 2 * 1024 * 1024)
+    if isinstance(llm_max_request_bytes_raw, bool):
+        raise ConfigError(
+            "Config field host_services.llm_max_request_bytes must be an integer."
+        )
+    try:
+        llm_max_request_bytes = int(llm_max_request_bytes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "Config field host_services.llm_max_request_bytes must be an integer."
+        ) from exc
+    if llm_max_request_bytes <= 0:
+        raise ConfigError(
+            "Config field host_services.llm_max_request_bytes must be greater than zero."
+        )
+    host_services["llm_max_request_bytes"] = llm_max_request_bytes
 
 
 def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:

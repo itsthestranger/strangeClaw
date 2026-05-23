@@ -6,13 +6,13 @@ import argparse
 import base64
 import json
 import re
-from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
 
 from agent.broker_client import BrokerClient, HostServiceError
-from agent.llm import LLMClient, LLMResponse, ToolCall
+from agent.llm import LLMClient
+from agent.llm_types import LLMResponse, LLMRuntime, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools
 from agent.transport import VsockTransport
@@ -117,18 +117,6 @@ class AgentError(RuntimeError):
     """Raised for invalid runtime events/configuration."""
 
 
-class LLMRuntime(Protocol):
-    """Minimal runtime contract for the LLM used by Agent."""
-
-    def complete(
-        self,
-        messages: list[dict[str, Any]],
-        action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
-    ) -> LLMResponse: ...
-
-    def count_tokens(self, messages: list[dict[str, Any]]) -> int: ...
-
-
 class AgentTransport(Protocol):
     """Transport contract required by Agent."""
 
@@ -152,8 +140,7 @@ class Agent:
         token_budget: int = 4000,
         summary_threshold: int = 10,
         max_output_total_bytes: int = 10 * 1024 * 1024,
-        allow_task_llm: bool = True,
-        llm_factory: Callable[[dict[str, Any]], LLMRuntime] | None = None,
+        llm_runtime: LLMRuntime | None = None,
         broker: BrokerClient | None = None,
     ) -> None:
         if max_iterations <= 0:
@@ -166,10 +153,9 @@ class Agent:
             raise AgentError("max_output_total_bytes must be greater than zero.")
 
         self._transport = transport
-        self._allow_task_llm = allow_task_llm
         self._agent_config_path = Path(agent_config_path)
         self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
-        if self._agent_config is None and not self._allow_task_llm:
+        if self._agent_config is None and llm_runtime is None:
             self._agent_config = _load_agent_config_file(self._agent_config_path)
 
         if isinstance(self._agent_config, dict):
@@ -201,8 +187,7 @@ class Agent:
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
         self._max_output_total_bytes = max_output_total_bytes
-        self._llm_factory = llm_factory or LLMClient.from_config
-        self._llm: LLMRuntime | None = None
+        self._llm = llm_runtime or LLMClient.from_config(self._require_llm_config())
         self._history_summary: str | None = None
         self._history_summarized_count = 0
         # Important: do not call broker-backed _load_integrations() here.
@@ -243,8 +228,6 @@ class Agent:
         goal = task_event["text"]
         approval_mode = task_event["approval_mode"]
         self._integrations = self._load_integrations()
-        llm_config = self._resolve_llm_config(task_event)
-        self._llm = self._llm_factory(llm_config)
         self._history_summary = None
         self._history_summarized_count = 0
 
@@ -341,31 +324,6 @@ class Agent:
                 return None
             if event_type == "task":
                 return event
-
-    def _resolve_llm_config(self, task_event: dict[str, Any]) -> dict[str, Any]:
-        if self._agent_config is not None:
-            llm_from_config = self._agent_config.get("llm")
-            if isinstance(llm_from_config, dict):
-                return dict(llm_from_config)
-            raise AgentError("Agent config is missing required llm mapping.")
-
-        llm_from_task = task_event.get("llm")
-        if self._allow_task_llm and isinstance(llm_from_task, dict):
-            return llm_from_task
-
-        if not self._agent_config_path.is_file():
-            raise AgentError(
-                "Task did not contain llm config and MMDS config file was not found: "
-                f"{self._agent_config_path}"
-            )
-        parsed = _load_agent_config_file(self._agent_config_path)
-        llm_mapping = parsed.get("llm")
-        if not isinstance(llm_mapping, dict):
-            raise AgentError(
-                "Agent config is missing required llm mapping: "
-                f"{self._agent_config_path}"
-            )
-        return dict(llm_mapping)
 
     def _planning_phase(self, *, goal: str, approval_mode: str) -> Any:
         feedback: str | None = None
@@ -791,6 +749,12 @@ class Agent:
             raise AgentError("LLM client is not configured.")
         return self._llm
 
+    def _require_llm_config(self) -> dict[str, Any]:
+        llm_config = self._agent_config.get("llm") if isinstance(self._agent_config, dict) else None
+        if not isinstance(llm_config, dict):
+            raise AgentError("Agent config is missing required llm mapping.")
+        return dict(llm_config)
+
     def build_planning_prompt(
         self,
         *,
@@ -1075,7 +1039,6 @@ def main(argv: list[str] | None = None) -> None:
             agent_config_path=str(config_path),
             token_budget=int(args.token_budget),
             summary_threshold=int(args.summary_threshold),
-            allow_task_llm=False,
             broker=broker,
         )
         agent.run_forever()

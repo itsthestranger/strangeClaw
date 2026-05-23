@@ -119,6 +119,10 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     }
     assert loaded["web_fetch"] == {"max_response_bytes": 524288}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
+    assert loaded["host_services"] == {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 2 * 1024 * 1024,
+    }
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
     assert loaded["firecracker"]["session_idle_timeout_seconds"] == 1800
@@ -186,6 +190,28 @@ def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"llm\.api_base"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "host_services",
+    [
+        {"llm_timeout_seconds": 0, "llm_max_request_bytes": 1024},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 0},
+        {"llm_timeout_seconds": True, "llm_max_request_bytes": 1024},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": False},
+    ],
+)
+def test_load_config_rejects_invalid_host_services(
+    tmp_path: Path,
+    host_services: dict[str, Any],
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["host_services"] = host_services
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"host_services"):
         load_config(config_path)
 
 

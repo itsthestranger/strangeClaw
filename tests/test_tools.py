@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from agent.broker_client import HostServiceError
-from agent.llm import ToolCall
+from agent.llm_types import ToolCall
 from agent.tools import Tools
 
 

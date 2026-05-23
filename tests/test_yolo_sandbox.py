@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from agent.llm import LLMResponse, ToolCall
+from agent.llm_types import LLMResponse, ToolCall
 from sandbox.yolo import YoloSandbox
 
 
@@ -60,7 +60,7 @@ def test_yolo_sandbox_runs_agent_and_exchanges_events() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
         agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
     )
     sandbox.run(_task_event(approval_mode="auto"))
@@ -84,7 +84,7 @@ def test_yolo_sandbox_receive_returns_none_on_timeout() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
         agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
     )
     sandbox.run(_task_event(approval_mode="review"))
@@ -111,7 +111,7 @@ def test_yolo_sandbox_lifecycle_send_task_starts_fresh_runtime() -> None:
     )
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: scripted_llm,
+        llm_runtime=scripted_llm,
         agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
     )
 
@@ -140,7 +140,7 @@ def test_yolo_sandbox_lifecycle_send_task_starts_fresh_runtime() -> None:
 def test_yolo_sandbox_stop_after_start_without_task_marks_not_running() -> None:
     sandbox = YoloSandbox(
         skills_dir=str(_skills_root()),
-        llm_factory=lambda _: ScriptedLLM([]),
+        llm_runtime=ScriptedLLM([]),
         agent_config={"llm": {"model": "fake/model", "api_key": "fake-key"}},
     )
 
