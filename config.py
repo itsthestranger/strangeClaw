@@ -335,12 +335,11 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
     llm_timeout_raw = host_services.get("llm_timeout_seconds", 120)
     if isinstance(llm_timeout_raw, bool):
         raise ConfigError("Config field host_services.llm_timeout_seconds must be an integer.")
-    try:
-        llm_timeout_seconds = int(llm_timeout_raw)
-    except (TypeError, ValueError) as exc:
+    if not isinstance(llm_timeout_raw, int):
         raise ConfigError(
             "Config field host_services.llm_timeout_seconds must be an integer."
-        ) from exc
+        )
+    llm_timeout_seconds = llm_timeout_raw
     if llm_timeout_seconds <= 0:
         raise ConfigError(
             "Config field host_services.llm_timeout_seconds must be greater than zero."
@@ -352,12 +351,11 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
         raise ConfigError(
             "Config field host_services.llm_max_request_bytes must be an integer."
         )
-    try:
-        llm_max_request_bytes = int(llm_max_request_bytes_raw)
-    except (TypeError, ValueError) as exc:
+    if not isinstance(llm_max_request_bytes_raw, int):
         raise ConfigError(
             "Config field host_services.llm_max_request_bytes must be an integer."
-        ) from exc
+        )
+    llm_max_request_bytes = llm_max_request_bytes_raw
     if llm_max_request_bytes <= 0:
         raise ConfigError(
             "Config field host_services.llm_max_request_bytes must be greater than zero."

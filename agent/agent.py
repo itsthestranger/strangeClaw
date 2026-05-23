@@ -155,8 +155,11 @@ class Agent:
         self._transport = transport
         self._agent_config_path = Path(agent_config_path)
         self._agent_config = dict(agent_config) if isinstance(agent_config, dict) else None
-        if self._agent_config is None and llm_runtime is None:
-            self._agent_config = _load_agent_config_file(self._agent_config_path)
+        if self._agent_config is None:
+            if self._agent_config_path.is_file():
+                self._agent_config = _load_agent_config_file(self._agent_config_path)
+            elif llm_runtime is None:
+                self._agent_config = _load_agent_config_file(self._agent_config_path)
 
         if isinstance(self._agent_config, dict):
             configured_skills_dir = _read_skills_directory(self._agent_config)

@@ -200,6 +200,10 @@ def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
         {"llm_timeout_seconds": 30, "llm_max_request_bytes": 0},
         {"llm_timeout_seconds": True, "llm_max_request_bytes": 1024},
         {"llm_timeout_seconds": 30, "llm_max_request_bytes": False},
+        {"llm_timeout_seconds": "30", "llm_max_request_bytes": 1024},
+        {"llm_timeout_seconds": 30.5, "llm_max_request_bytes": 1024},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": "1024"},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024.5},
     ],
 )
 def test_load_config_rejects_invalid_host_services(

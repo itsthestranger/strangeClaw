@@ -185,6 +185,70 @@ def test_agent_uses_supplied_llm_runtime_without_constructing_client(
     assert events[-1]["reply"] == "done"
 
 
+def test_agent_loads_config_file_when_llm_runtime_is_supplied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module.LLMClient,
+        "from_config",
+        staticmethod(lambda config: (_ for _ in ()).throw(AssertionError(config))),
+    )
+    skills_root = tmp_path / "skills"
+    _build_temp_skill(skills_root, name="runtime-config-skill")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llm": {"model": "file/model", "api_key": "file-key"},
+                "tools": {
+                    "shell": False,
+                    "web_search": False,
+                    "web_fetch": False,
+                    "http_request": False,
+                },
+                "skills": {
+                    "directory": str(skills_root),
+                    "max_file_chars": 20000,
+                },
+                "loop": {"max_iterations": 3},
+                "context": {
+                    "token_budget": 4000,
+                    "summary_threshold": 10,
+                    "max_output_chars": 8000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    scripted_llm = ScriptedLLM(
+        responses=[
+            LLMResponse(text='{"steps":["single"]}', action=None),
+            LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": "done"})),
+        ]
+    )
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(tmp_path / "unused-skills"),
+        agent_config_path=str(config_path),
+        llm_runtime=scripted_llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+
+    assert events[-1]["reply"] == "done"
+    planning_payload = scripted_llm.calls[0]["messages"][1]["content"]
+    assert "runtime-config-skill" in planning_payload
+    execution_payload = json.loads(scripted_llm.calls[1]["messages"][1]["content"])
+    assert execution_payload["enabled_tools"] == []
+
+
 
 def test_agent_completes_multi_step_task_end_to_end(tmp_path: Path) -> None:
     output_dir = tmp_path / "output"
