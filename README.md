@@ -122,9 +122,6 @@ llm:
   api_base: "http://127.0.0.1:11434"
 ```
 
-No `host_expose` configuration is needed. Host-loopback endpoints are reachable
-because the host process, not the Fire guest, performs the LLM call.
-
 ## Features
 
 - Fully agentic loop with plan/review, clarification, execution, and completion.
