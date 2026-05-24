@@ -399,6 +399,7 @@ def test_fire_sanitized_skills_match_loaded_config_defaults(tmp_path: Path) -> N
     assert fire_payload["web_search"] == loaded["web_search"]
     assert fire_payload["web_search"]["max_results"] == 10
     assert "api_key" not in fire_payload["web_search"]
+    assert "llm" not in fire_payload
     assert "integrations" not in fire_payload
 
 

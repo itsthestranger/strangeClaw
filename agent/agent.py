@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.broker_client import BrokerClient, HostServiceError
-from agent.llm import LLMClient
 from agent.llm_proxy import LLMProxyRuntime
 from agent.llm_types import LLMResponse, LLMRuntime, LLMRuntimeError, ToolCall
 from agent.skills import Skills, SkillsError
@@ -191,7 +190,7 @@ class Agent:
         self._token_budget = token_budget
         self._summary_threshold = summary_threshold
         self._max_output_total_bytes = max_output_total_bytes
-        self._llm = llm_runtime or LLMClient.from_config(self._require_llm_config())
+        self._llm = llm_runtime or _build_default_llm_runtime(self._require_llm_config())
         self._history_summary: str | None = None
         self._history_summarized_count = 0
         # Important: do not call broker-backed _load_integrations() here.
@@ -1079,12 +1078,25 @@ def _load_agent_config_file(path: Path) -> dict[str, Any]:
         return parsed
     if _looks_like_llm_config(parsed):
         return {"llm": parsed}
-    raise AgentError(f"Agent config in {path} must contain an llm object.")
+    if "host_services" in parsed:
+        host_services = parsed.get("host_services")
+        if not isinstance(host_services, dict):
+            raise AgentError(
+                f"Agent config in {path} must contain host_services as an object."
+            )
+        return parsed
+    raise AgentError(f"Agent config in {path} must contain an llm object or host_services object.")
 
 
 def _looks_like_llm_config(payload: dict[str, Any]) -> bool:
     required = {"model", "api_key"}
     return required.issubset(payload.keys())
+
+
+def _build_default_llm_runtime(llm_config: dict[str, Any]) -> LLMRuntime:
+    from agent.llm import LLMClient
+
+    return LLMClient.from_config(llm_config)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

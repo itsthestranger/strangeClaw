@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 import requests
 
 import agent.agent as agent_module
@@ -321,7 +322,10 @@ def test_yolo_integration_resume_from_saved_state_skips_replanning() -> None:
     assert set(tool_names) == expected_names
 
 
-def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> None:
+def test_yolo_integration_autonomous_replan_read_and_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     skills_root = tmp_path / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     _build_temp_skill(skills_root, name="demo")
@@ -370,13 +374,11 @@ def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> Non
         ]
     )
     captured_llm_config: dict[str, Any] = {}
-    original_from_config = agent_module.LLMClient.from_config
-
     def fake_from_config(config: dict[str, Any]) -> ScriptedLLM:
         captured_llm_config.update(config)
         return llm
 
-    agent_module.LLMClient.from_config = fake_from_config  # type: ignore[assignment]
+    monkeypatch.setattr(agent_module, "_build_default_llm_runtime", fake_from_config)
     sandbox = YoloSandbox(
         skills_dir=str(skills_root),
         agent_config=_agent_config(),
@@ -388,7 +390,6 @@ def test_yolo_integration_autonomous_replan_read_and_done(tmp_path: Path) -> Non
         events = _collect_until_done(sandbox)
     finally:
         sandbox.stop()
-        agent_module.LLMClient.from_config = original_from_config  # type: ignore[assignment]
 
     # Yolo must use construction-time config and ignore task-inline llm config.
     assert captured_llm_config == _agent_config()["llm"]

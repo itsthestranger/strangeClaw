@@ -129,7 +129,7 @@ def test_agent_constructs_llm_client_once_and_reuses_it(
         created_configs.append(dict(config))
         return scripted_llm
 
-    monkeypatch.setattr(agent_module.LLMClient, "from_config", staticmethod(fake_from_config))
+    monkeypatch.setattr(agent_module, "_build_default_llm_runtime", fake_from_config)
 
     host_transport, agent_transport = InProcessTransport.pair()
     agent = Agent(
@@ -156,9 +156,9 @@ def test_agent_uses_supplied_llm_runtime_without_constructing_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        agent_module.LLMClient,
-        "from_config",
-        staticmethod(lambda config: (_ for _ in ()).throw(AssertionError(config))),
+        agent_module,
+        "_build_default_llm_runtime",
+        lambda config: (_ for _ in ()).throw(AssertionError(config)),
     )
     scripted_llm = ScriptedLLM(
         responses=[
@@ -190,9 +190,9 @@ def test_agent_loads_config_file_when_llm_runtime_is_supplied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        agent_module.LLMClient,
-        "from_config",
-        staticmethod(lambda config: (_ for _ in ()).throw(AssertionError(config))),
+        agent_module,
+        "_build_default_llm_runtime",
+        lambda config: (_ for _ in ()).throw(AssertionError(config)),
     )
     skills_root = tmp_path / "skills"
     _build_temp_skill(skills_root, name="runtime-config-skill")
@@ -1003,7 +1003,10 @@ def test_agent_malformed_control_call_emits_action_error_and_recovers(
     )
 
 
-def test_agent_uses_agent_config_file_and_ignores_task_llm(tmp_path: Path) -> None:
+def test_agent_uses_agent_config_file_and_ignores_task_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     llm_from_file = {"model": "file/model", "api_key": "file-key"}
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"llm": llm_from_file}), encoding="utf-8")
@@ -1025,16 +1028,12 @@ def test_agent_uses_agent_config_file_and_ignores_task_llm(tmp_path: Path) -> No
         return scripted_llm
 
     host_transport, agent_transport = InProcessTransport.pair()
-    original_from_config = agent_module.LLMClient.from_config
-    agent_module.LLMClient.from_config = fake_from_config  # type: ignore[assignment]
-    try:
-        agent = Agent(
-            transport=agent_transport,
-            skills_dir=str(_skills_root()),
-            agent_config_path=str(config_path),
-        )
-    finally:
-        agent_module.LLMClient.from_config = original_from_config  # type: ignore[assignment]
+    monkeypatch.setattr(agent_module, "_build_default_llm_runtime", fake_from_config)
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config_path=str(config_path),
+    )
 
     worker = threading.Thread(target=agent.run)
     worker.start()
@@ -1708,7 +1707,6 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     config_path.write_text(
         json.dumps(
             {
-                "llm": {"model": "fake/model", "api_key": "fake-key"},
                 "host_services": {"llm_timeout_seconds": 123},
             }
         ),

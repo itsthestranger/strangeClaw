@@ -204,12 +204,7 @@ def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path
             "approval_mode": "review",
             "max_iterations": 50,
             "context": {"token_budget": 4000, "summary_threshold": 10, "max_output_chars": 8000},
-            "llm": {
-                "model": "anthropic/claude-sonnet-4-20250514",
-                "api_key": "sk-test",
-                "max_tokens": 4096,
-                "temperature": 0.2,
-            },
+            "host_services": {"llm_timeout_seconds": 120},
         },
     )
 
@@ -260,14 +255,7 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
             "netmask": "255.255.255.252",
             "dns": ["8.8.8.8"],
         },
-        agent_config={
-            "llm": {
-                "model": "openai/gpt-4.1-mini",
-                "api_key": "sk-test",
-                "max_tokens": 1024,
-                "temperature": 0.2,
-            }
-        },
+        agent_config={"host_services": {"llm_timeout_seconds": 120}},
     )
 
     with pytest.raises(FirecrackerConfigError, match="Invalid guest MAC format"):
@@ -281,11 +269,20 @@ def test_configure_microvm_preboot_rejects_invalid_guest_mac(tmp_path: Path) -> 
 def test_assert_no_secrets_raises_on_token_leak() -> None:
     with pytest.raises(ValueError, match=r"credential leaked into MMDS: notion"):
         _assert_no_secrets(
-            mmds_json='{"config":{"llm":{"api_key":"safe"},"web_search":{"endpoint":"x"}},"token":"notion-secret"}',
+            mmds_json='{"config":{"web_search":{"endpoint":"x"}},"token":"notion-secret"}',
             credentials={
                 "notion": {"token": "notion-secret"},
                 "_web_search": {"token": "search-secret"},
             },
+        )
+
+
+def test_assert_no_secrets_raises_on_llm_api_key_leak() -> None:
+    with pytest.raises(ValueError, match="LLM API key leaked into MMDS"):
+        _assert_no_secrets(
+            mmds_json='{"config":{"host_services":{"llm_timeout_seconds":120}},"leak":"sk-host"}',
+            credentials={},
+            llm_config={"api_key": "sk-host"},
         )
 
 
@@ -294,12 +291,6 @@ def test_configure_microvm_preboot_rejects_credentials_in_mmds_payload(tmp_path:
     preboot = _build_preboot_config(
         tmp_path,
         agent_config={
-            "llm": {
-                "model": "openai/gpt-4.1-mini",
-                "api_key": "sk-host",
-                "max_tokens": 1024,
-                "temperature": 0.2,
-            },
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
@@ -353,21 +344,17 @@ def test_configure_microvm_preboot_rejects_invalid_network_ip(tmp_path: Path) ->
         )
 
 
-def test_configure_microvm_preboot_rejects_invalid_llm_max_tokens(tmp_path: Path) -> None:
+def test_configure_microvm_preboot_rejects_invalid_host_service_timeout(tmp_path: Path) -> None:
     config = _build_firecracker_config(tmp_path)
     preboot = _build_preboot_config(
         tmp_path,
-        agent_config={
-            "llm": {
-                "model": "openai/gpt-4.1-mini",
-                "api_key": "sk-test",
-                "max_tokens": 0,
-                "temperature": 0.2,
-            }
-        },
+        agent_config={"host_services": {"llm_timeout_seconds": 0}},
     )
 
-    with pytest.raises(FirecrackerConfigError, match=r"llm\.max_tokens must be a positive integer"):
+    with pytest.raises(
+        FirecrackerConfigError,
+        match=r"config\.host_services\.llm_timeout_seconds must be greater than zero",
+    ):
         configure_microvm_preboot(
             api_client=_NoopClient(),
             config=config,
@@ -737,6 +724,7 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
     }
     assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
     assert "llm_max_request_bytes" not in mmds_payload["config"]["host_services"]
+    assert "llm" not in mmds_payload["config"]
     assert "api_key" not in mmds_payload["config"]["web_search"]
     assert "credentials" not in mmds_payload["config"]
     assert "integrations" not in mmds_payload["config"]
@@ -947,8 +935,7 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         assert b'"type":"task"' in sent_payloads[1]
         assert b'"approval_mode":"auto"' in sent_payloads[1]
         assert b'"llm"' not in sent_payloads[1]
-        assert mmds_payload["config"]["llm"]["api_key"] == "sk-host"
-        assert mmds_payload["config"]["llm"]["model"] == "openai/gpt-4.1-mini"
+        assert "llm" not in mmds_payload["config"]
         assert mmds_payload["config"]["skills"]["max_file_chars"] == 20000
         assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
 
@@ -1441,6 +1428,13 @@ def _build_firecracker_config(
 def _build_preboot_config(tmp_path: Path, **overrides: Any) -> FirePrebootConfig:
     rootfs_copy = tmp_path / "rootfs-copy.ext4"
     rootfs_copy.write_text("copy", encoding="utf-8")
+    agent_config = _agent_config(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    agent_config.pop("llm", None)
     params: dict[str, Any] = {
         "rootfs_path": rootfs_copy,
         "tap_name": "fc-testtap",
@@ -1454,12 +1448,7 @@ def _build_preboot_config(tmp_path: Path, **overrides: Any) -> FirePrebootConfig
             "netmask": "255.255.255.252",
             "dns": ["8.8.8.8", "1.1.1.1"],
         },
-        "agent_config": _agent_config(
-            model="openai/gpt-4.1-mini",
-            api_key="sk-test",
-            max_tokens=1024,
-            temperature=0.2,
-        ),
+        "agent_config": agent_config,
     }
     params.update(overrides)
     return FirePrebootConfig(**params)

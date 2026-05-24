@@ -811,6 +811,7 @@ def configure_microvm_preboot(
     config: FirecrackerConfig,
     preboot: FirePrebootConfig,
     credentials: Mapping[str, Any] | None = None,
+    llm_config: Mapping[str, Any] | None = None,
 ) -> None:
     """Configure and start the microVM via sequential pre-boot API PUT calls."""
     _validate_preboot_config(preboot)
@@ -887,7 +888,7 @@ def configure_microvm_preboot(
     for path, payload in requests:
         if path == "/mmds":
             mmds_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-            _assert_no_secrets(mmds_json, credentials or {})
+            _assert_no_secrets(mmds_json, credentials or {}, llm_config=llm_config)
         api_client.put(path, payload)
 
 
@@ -1288,6 +1289,7 @@ class FireSandbox:
             config=self._firecracker_config,
             preboot=preboot,
             credentials=self._credentials,
+            llm_config=_extract_llm_config(self._agent_config_template),
         )
 
     def _connect_vsock_with_retry(self, *, timeout_seconds: float) -> ConnectedSocket:
@@ -1668,11 +1670,6 @@ def _validate_llm_payload(llm: Mapping[str, Any]) -> None:
 
 
 def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
-    llm = payload.get("llm")
-    if not isinstance(llm, Mapping):
-        raise FirecrackerConfigError("config.llm must be an object.")
-    _validate_llm_payload(llm)
-
     tools = payload.get("tools")
     if tools is not None and not isinstance(tools, Mapping):
         raise FirecrackerConfigError("config.tools must be an object when provided.")
@@ -1761,12 +1758,6 @@ def _coerce_agent_config_template(
 
 
 def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]:
-    llm_raw = config.get("llm")
-    if not isinstance(llm_raw, Mapping):
-        raise FirecrackerConfigError("Config must contain llm mapping for Fire mode.")
-    llm: dict[str, Any] = dict(llm_raw)
-    _validate_llm_payload(llm)
-
     tools_raw = config.get("tools")
     if isinstance(tools_raw, Mapping):
         tools = {
@@ -1872,7 +1863,6 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
             llm_timeout_seconds = raw_timeout
 
     payload = {
-        "llm": llm,
         "tools": tools,
         "web_search": web_search,
         "web_fetch": web_fetch,
@@ -1886,7 +1876,12 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
     return payload
 
 
-def _assert_no_secrets(mmds_json: str, credentials: Mapping[str, Any]) -> None:
+def _assert_no_secrets(
+    mmds_json: str,
+    credentials: Mapping[str, Any],
+    *,
+    llm_config: Mapping[str, Any] | None = None,
+) -> None:
     for integration_name, record in credentials.items():
         if not isinstance(record, Mapping):
             continue
@@ -1895,6 +1890,15 @@ def _assert_no_secrets(mmds_json: str, credentials: Mapping[str, Any]) -> None:
             continue
         if token in mmds_json:
             raise ValueError(f"credential leaked into MMDS: {integration_name}")
+    if isinstance(llm_config, Mapping):
+        api_key = llm_config.get("api_key")
+        if isinstance(api_key, str) and api_key and api_key in mmds_json:
+            raise ValueError("LLM API key leaked into MMDS")
+
+
+def _extract_llm_config(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    llm = config.get("llm")
+    return llm if isinstance(llm, Mapping) else None
 
 
 def _tap_guest_ips_from_index(session_index: int) -> tuple[str, str]:
