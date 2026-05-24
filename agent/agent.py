@@ -236,14 +236,33 @@ class Agent:
         self._history_summarized_count = 0
 
         history, plan = self._resume_context(task_event)
-        if plan is None:
-            plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
-        plan = self._normalize_plan(plan, goal=goal)
-        plan, activated_skills = self._activate_referenced_skills(
-            goal=goal,
-            approval_mode=approval_mode,
-            plan=plan,
-        )
+        try:
+            if plan is None:
+                plan = self._planning_phase(
+                    goal=goal,
+                    approval_mode=approval_mode,
+                    history=history,
+                )
+            plan = self._normalize_plan(plan, goal=goal)
+            plan, activated_skills = self._activate_referenced_skills(
+                goal=goal,
+                approval_mode=approval_mode,
+                plan=plan,
+                history=history,
+            )
+        except AgentError as exc:
+            error_event = self._emit_decision_parse_error(exc)
+            history.append(error_event)
+            self._send(
+                self._build_done_event(
+                    goal=goal,
+                    plan=plan,
+                    history=history,
+                    success=False,
+                    reply=f"Unable to continue: {exc}",
+                )
+            )
+            return
 
         # Strict Inspect -> Choose -> Act -> Observe -> Repeat loop.
         # Exactly one model-issued structured decision is required per turn.
@@ -272,6 +291,7 @@ class Agent:
                     goal=goal,
                     approval_mode=approval_mode,
                     plan=plan,
+                    history=history,
                 )
             self._observe(history=history, observation=outcome["observation"])
             if outcome["done"]:
@@ -329,10 +349,29 @@ class Agent:
             if event_type == "task":
                 return event
 
-    def _planning_phase(self, *, goal: str, approval_mode: str) -> Any:
+    def _planning_phase(
+        self,
+        *,
+        goal: str,
+        approval_mode: str,
+        history: list[dict[str, Any]] | None = None,
+    ) -> Any:
         feedback: str | None = None
+        llm_runtime_error_count = 0
         while True:
-            plan = self._generate_plan(goal=goal, feedback=feedback)
+            try:
+                plan = self._generate_plan(goal=goal, feedback=feedback)
+                llm_runtime_error_count = 0
+            except LLMRuntimeError as exc:
+                observation = self._emit_llm_runtime_error(exc)
+                if history is not None:
+                    history.append(observation)
+                llm_runtime_error_count += 1
+                if llm_runtime_error_count >= self._max_iterations:
+                    raise AgentError(
+                        "LLM runtime failed repeatedly during planning."
+                    ) from exc
+                continue
             self._send({"type": "message", "role": "plan", "content": plan})
 
             if approval_mode != "review":
@@ -379,6 +418,7 @@ class Agent:
         goal: str,
         approval_mode: str,
         plan: dict[str, Any],
+        history: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         current_plan = plan
         attempts = 0
@@ -411,7 +451,11 @@ class Agent:
 
             self._send({"type": "message", "role": "status", "content": activation_error})
             current_plan = self._normalize_plan(
-                self._planning_phase(goal=goal, approval_mode=approval_mode),
+                self._planning_phase(
+                    goal=goal,
+                    approval_mode=approval_mode,
+                    history=history,
+                ),
                 goal=goal,
             )
 
@@ -600,7 +644,11 @@ class Agent:
                     message="agent_replan args.feedback must be a string when provided.",
                 )
                 return {"done": False, "plan": current_plan, "observation": error_event}
-            new_plan = self._planning_phase(goal=goal, approval_mode=approval_mode)
+            new_plan = self._planning_phase(
+                goal=goal,
+                approval_mode=approval_mode,
+                history=history,
+            )
             observation: dict[str, Any] | None = None
             if feedback:
                 observation = {"type": "replan", "feedback": feedback}

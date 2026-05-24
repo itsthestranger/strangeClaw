@@ -735,6 +735,8 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
         "format": "brave",
         "max_results": 10,
     }
+    assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
+    assert "llm_max_request_bytes" not in mmds_payload["config"]["host_services"]
     assert "api_key" not in mmds_payload["config"]["web_search"]
     assert "credentials" not in mmds_payload["config"]
     assert "integrations" not in mmds_payload["config"]
@@ -948,6 +950,7 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         assert mmds_payload["config"]["llm"]["api_key"] == "sk-host"
         assert mmds_payload["config"]["llm"]["model"] == "openai/gpt-4.1-mini"
         assert mmds_payload["config"]["skills"]["max_file_chars"] == 20000
+        assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
 
         # Deterministic autonomous loop stream includes replan, skill-file read, and done.
         plan_events = [
@@ -1142,6 +1145,10 @@ def test_fire_sandbox_registers_llm_host_service(
         max_tokens=1024,
         temperature=0.2,
     )
+    agent_config["host_services"] = {
+        "llm_timeout_seconds": 17,
+        "llm_max_request_bytes": 12345,
+    }
     sandbox = FireSandbox(
         firecracker_config=config,
         agent_config=agent_config,
@@ -1169,6 +1176,7 @@ def test_fire_sandbox_registers_llm_host_service(
         assert event is not None
         assert event["type"] == "done"
         assert service_configs == [agent_config]
+        assert service_configs[0]["host_services"]["llm_max_request_bytes"] == 12345
         sent_payloads = [
             payload.decode("utf-8", errors="replace")
             for payload in socket_factory.sockets[0].sent
@@ -1490,6 +1498,10 @@ def _agent_config(
         "approval_mode": "review",
         "max_iterations": 50,
         "context": {"token_budget": 4000, "summary_threshold": 10, "max_output_chars": 8000},
+        "host_services": {
+            "llm_timeout_seconds": 120,
+            "llm_max_request_bytes": 2 * 1024 * 1024,
+        },
     }
 
 

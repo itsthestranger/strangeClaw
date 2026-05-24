@@ -1688,6 +1688,20 @@ def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
     context = payload.get("context")
     if context is not None and not isinstance(context, Mapping):
         raise FirecrackerConfigError("config.context must be an object when provided.")
+    host_services = payload.get("host_services")
+    if host_services is not None:
+        if not isinstance(host_services, Mapping):
+            raise FirecrackerConfigError("config.host_services must be an object when provided.")
+        timeout = host_services.get("llm_timeout_seconds")
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, int):
+                raise FirecrackerConfigError(
+                    "config.host_services.llm_timeout_seconds must be an integer."
+                )
+            if timeout <= 0:
+                raise FirecrackerConfigError(
+                    "config.host_services.llm_timeout_seconds must be greater than zero."
+                )
 
     approval_mode = payload.get("approval_mode")
     if approval_mode is not None and not isinstance(approval_mode, str):
@@ -1707,8 +1721,9 @@ def _coerce_agent_config_template(
     agent_config: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     if agent_config is not None:
-        candidate = _sanitize_agent_config_for_mmds(dict(agent_config))
-        _validate_agent_config_payload(candidate)
+        candidate = dict(agent_config)
+        sanitized = _sanitize_agent_config_for_mmds(candidate)
+        _validate_agent_config_payload(sanitized)
         return candidate
 
     if llm_config is not None:
@@ -1735,6 +1750,10 @@ def _coerce_agent_config_template(
                 "token_budget": 4000,
                 "summary_threshold": 10,
                 "max_output_chars": 8000,
+            },
+            "host_services": {
+                "llm_timeout_seconds": 120,
+                "llm_max_request_bytes": 2 * 1024 * 1024,
             },
         }
 
@@ -1845,6 +1864,13 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
     context.setdefault("summary_threshold", 10)
     context.setdefault("max_output_chars", 8000)
 
+    host_services_raw = config.get("host_services")
+    llm_timeout_seconds = 120
+    if isinstance(host_services_raw, Mapping):
+        raw_timeout = host_services_raw.get("llm_timeout_seconds", 120)
+        if isinstance(raw_timeout, int) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
+            llm_timeout_seconds = raw_timeout
+
     payload = {
         "llm": llm,
         "tools": tools,
@@ -1854,6 +1880,7 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         "approval_mode": approval_mode,
         "max_iterations": max_iterations,
         "context": context,
+        "host_services": {"llm_timeout_seconds": llm_timeout_seconds},
     }
     _validate_agent_config_payload(payload)
     return payload

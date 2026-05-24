@@ -716,6 +716,66 @@ def test_llm_runtime_error_becomes_decision_error_and_execution_recovers() -> No
     assert llm.calls == 3
 
 
+def test_planning_llm_runtime_error_becomes_observation_and_recovers() -> None:
+    class PlanningFailsOnceLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: list[dict[str, Any]],
+            action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
+        ) -> LLMResponse:
+            del messages
+            self.calls += 1
+            if action_schema is None:
+                if self.calls == 1:
+                    raise LLMRuntimeError("planning proxy timeout sk-redacted")
+                return LLMResponse(
+                    text='{"goal":"g","steps":["single"],"referenced_skills":[]}',
+                    action=None,
+                )
+            return LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
+            )
+
+        def count_tokens(self, messages: list[dict[str, Any]]) -> int:
+            del messages
+            return 1
+
+    llm = PlanningFailsOnceLLM()
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=llm,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+
+    error_events = [
+        event
+        for event in events
+        if event.get("type") == "action"
+        and event.get("tool") == "agent_decision_error"
+    ]
+    assert error_events
+    assert error_events[0]["args"] == {"category": "llm_runtime_error"}
+    assert "planning proxy timeout" in error_events[0]["result"]["stderr"]
+    assert events[-1]["type"] == "done"
+    assert events[-1]["reply"] == "recovered"
+    assert llm.calls == 3
+    assert any(
+        item.get("tool") == "agent_decision_error"
+        for item in events[-1]["state"]["history"]
+    )
+
+
 def test_count_token_runtime_error_uses_conservative_budget_estimate() -> None:
     class CountFailingLLM(ScriptedLLM):
         def count_tokens(self, messages: list[dict[str, Any]]) -> int:
