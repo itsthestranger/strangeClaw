@@ -1644,31 +1644,6 @@ def _validate_network_payload(network: Mapping[str, Any]) -> None:
         raise FirecrackerConfigError("network.dns must be a non-empty list of strings.")
 
 
-def _validate_llm_payload(llm: Mapping[str, Any]) -> None:
-    required = ("model", "api_key", "max_tokens", "temperature")
-    missing = [field for field in required if field not in llm]
-    if missing:
-        raise FirecrackerConfigError(
-            f"llm payload missing required fields: {', '.join(missing)}"
-        )
-    if not isinstance(llm.get("model"), str) or not llm["model"]:
-        raise FirecrackerConfigError("llm.model must be a non-empty string.")
-    if not isinstance(llm.get("api_key"), str):
-        raise FirecrackerConfigError("llm.api_key must be a string.")
-    max_tokens = llm.get("max_tokens")
-    if not isinstance(max_tokens, int) or max_tokens <= 0:
-        raise FirecrackerConfigError("llm.max_tokens must be a positive integer.")
-    temperature = llm.get("temperature")
-    if not isinstance(temperature, (int, float)):
-        raise FirecrackerConfigError("llm.temperature must be a number.")
-    api_base = llm.get("api_base")
-    if api_base is not None and (not isinstance(api_base, str) or not api_base.strip()):
-        raise FirecrackerConfigError("llm.api_base must be a non-empty string or null.")
-    provider_settings = llm.get("provider_settings")
-    if provider_settings is not None and not isinstance(provider_settings, Mapping):
-        raise FirecrackerConfigError("llm.provider_settings must be an object when provided.")
-
-
 def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
     tools = payload.get("tools")
     if tools is not None and not isinstance(tools, Mapping):
@@ -1725,7 +1700,6 @@ def _coerce_agent_config_template(
 
     if llm_config is not None:
         llm_candidate = dict(llm_config)
-        _validate_llm_payload(llm_candidate)
         return {
             "llm": llm_candidate,
             "tools": {

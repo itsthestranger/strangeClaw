@@ -108,12 +108,22 @@ sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
 
 ## Local LLMs In Fire Mode
 
-Until the host-side LLM proxy lands (planned in milestone C8), Fire guests can
-only reach local/self-hosted model endpoints that are already reachable over the
-guest's normal NAT path (for example, a non-loopback host or network endpoint).
-Host-loopback-only endpoints (such as `127.0.0.1`) are not reachable from Fire
-mode.
+Fire mode uses the host-side LLM proxy. The guest never receives the LLM API key
+or LiteLLM configuration; it sends model calls over the existing host-services
+channel, and the host process calls the configured provider.
 
+For local/self-hosted models such as Ollama, LM Studio, or vLLM, configure the
+host-side endpoint normally:
+
+```yaml
+llm:
+  model: ollama/llama3.1
+  api_key: ""
+  api_base: "http://127.0.0.1:11434"
+```
+
+No `host_expose` configuration is needed. Host-loopback endpoints are reachable
+because the host process, not the Fire guest, performs the LLM call.
 
 ## Features
 
