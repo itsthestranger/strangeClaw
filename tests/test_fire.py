@@ -795,6 +795,103 @@ def test_fire_sandbox_start_send_task_stop_lifecycle(tmp_path: Path) -> None:
     assert tap_manager.destroyed == [_build_allocation().tap_name]
 
 
+def test_fire_sandbox_reuses_started_vm_for_sequential_tasks(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    event_stream = [
+        {"type": "agent_ready"},
+        {"type": "message", "role": "plan", "content": {"steps": ["first"]}},
+        {
+            "type": "done",
+            "success": True,
+            "reply": "first done",
+            "state": {"goal": "first", "history": []},
+            "files": [],
+        },
+        {"type": "message", "role": "plan", "content": {"steps": ["second"]}},
+        {
+            "type": "done",
+            "success": True,
+            "reply": "second done",
+            "state": {"goal": "second", "history": []},
+            "files": [],
+        },
+    ]
+    stream_chunk = (
+        b"OK 100\n" + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+    )
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[stream_chunk])]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    sandbox.start(session_id="sess-persist")
+    assert len(process_factory.processes) == 1
+    assert tap_manager.create_calls == ["sess-persist"]
+
+    sandbox.send_task(
+        {
+            "type": "task",
+            "text": "first",
+            "session_id": "sess-persist",
+            "approval_mode": "auto",
+        }
+    )
+    first_plan = sandbox.receive(timeout_seconds=1.0)
+    first_done = sandbox.receive(timeout_seconds=1.0)
+    assert first_plan is not None
+    assert first_plan["role"] == "plan"
+    assert first_done is not None
+    assert first_done["reply"] == "first done"
+    assert sandbox.is_running() is True
+
+    sandbox.send_task(
+        {
+            "type": "task",
+            "text": "second",
+            "session_id": "sess-persist",
+            "approval_mode": "auto",
+        }
+    )
+    second_plan = sandbox.receive(timeout_seconds=1.0)
+    second_done = sandbox.receive(timeout_seconds=1.0)
+    assert second_plan is not None
+    assert second_plan["role"] == "plan"
+    assert second_done is not None
+    assert second_done["reply"] == "second done"
+
+    sent_payloads = socket_factory.sockets[0].sent
+    assert len(process_factory.processes) == 1
+    assert sent_payloads[0] == b"CONNECT 5000\n"
+    assert b'"text":"first"' in sent_payloads[1]
+    assert b'"text":"second"' in sent_payloads[2]
+
+    sandbox.stop()
+    assert tap_manager.destroyed == [_build_allocation().tap_name]
+
+
 def test_fire_sandbox_send_task_requires_running_vm(tmp_path: Path) -> None:
     sandbox = FireSandbox(
         firecracker_config=_build_firecracker_config(tmp_path),

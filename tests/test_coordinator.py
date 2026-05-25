@@ -547,6 +547,41 @@ def test_coordinator_reaps_idle_session_sandbox_after_timeout(
     coordinator.stop_all()
 
 
+def test_coordinator_reaper_ignores_non_running_session_sandbox(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FakeSandbox(
+        events=[
+            {"type": "done", "success": True, "reply": "ok", "state": {"goal": "g"}, "files": []}
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_idle_timeout_seconds=1,
+        _idle_reaper_interval_seconds=0.02,
+    )
+
+    assert (
+        coordinator.start_task(session_id="sess-1", text="task", sink=lambda _: None)
+        == "started"
+    )
+    assert _wait_until(lambda: sandbox.send_task_calls == 1)
+    assert _wait_until(
+        lambda: coordinator._sessions["sess-1"].worker is None  # type: ignore[attr-defined]
+    )
+    sandbox._running = False  # noqa: SLF001
+    with coordinator._lock:  # type: ignore[attr-defined]
+        coordinator._sessions["sess-1"].last_task_completed_at = time.monotonic() - 5.0  # type: ignore[attr-defined]
+
+    time.sleep(0.1)
+    assert sandbox.stop_calls == 0
+    coordinator.stop_all()
+
+
 def test_coordinator_timeout_zero_disables_idle_reaper(
     tmp_path: Path,
     monkeypatch: Any,

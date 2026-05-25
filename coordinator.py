@@ -354,6 +354,12 @@ class Coordinator:
                         continue
                     if record.sandbox_stopping:
                         continue
+                    try:
+                        running = bool(sandbox.is_running())
+                    except Exception:
+                        running = False
+                    if not running:
+                        continue
 
                     worker = record.worker
                     if worker is not None and worker.is_running():
