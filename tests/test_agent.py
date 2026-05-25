@@ -1758,3 +1758,35 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     assert kwargs["agent_config_path"] == str(config_path)
     assert kwargs["agent_config"]["host_services"]["llm_timeout_seconds"] == 123
     assert kwargs["llm_runtime"].__class__.__name__ == "LLMProxyRuntime"
+
+
+def test_agent_main_rejects_guest_llm_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llm": {"model": "host-only/model", "api_key": "sk-host-only"},
+                "host_services": {"llm_timeout_seconds": 123},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeVsockTransport:
+        def __init__(self, *, guest_port: int) -> None:
+            raise AssertionError(f"transport should not start: {guest_port}")
+
+    monkeypatch.setattr(agent_module, "VsockTransport", FakeVsockTransport)
+
+    with pytest.raises(agent_module.AgentError, match="must not contain an llm block"):
+        agent_module.main(
+            [
+                "--vsock-port",
+                "5000",
+                "--agent-config-path",
+                str(config_path),
+            ]
+        )

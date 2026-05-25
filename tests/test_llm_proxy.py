@@ -34,6 +34,7 @@ def test_llm_proxy_complete_sends_payload_and_deserializes_response() -> None:
             "action_schema": [{"name": "agent_done"}],
         }
         return {
+            "success": True,
             "text": "",
             "action": {"tool": "agent_done", "args": {"reply": "ok"}, "reason": "done"},
             "usage": {"input_tokens": 1, "output_tokens": 2},
@@ -62,7 +63,7 @@ def test_llm_proxy_count_tokens_sends_payload_and_returns_int() -> None:
             "action": "count_tokens",
             "messages": [{"role": "user", "content": "hi"}],
         }
-        return {"tokens": 42}
+        return {"success": True, "tokens": 42}
 
     runtime = LLMProxyRuntime(cast(BrokerClient, _FakeClient(handler)))
 
@@ -94,9 +95,26 @@ def test_llm_proxy_service_failure_payload_raises_runtime_error() -> None:
         runtime.complete([])
 
 
+def test_llm_proxy_rejects_missing_success_envelope() -> None:
+    runtime = LLMProxyRuntime(
+        cast(BrokerClient, _FakeClient(lambda _service, _payload: {"text": "missing"}))
+    )
+
+    with pytest.raises(LLMRuntimeError, match="missing success envelope"):
+        runtime.complete([])
+
+
 def test_llm_proxy_rejects_malformed_complete_action() -> None:
     runtime = LLMProxyRuntime(
-        cast(BrokerClient, _FakeClient(lambda _service, _payload: {"action": {"tool": "x"}}))
+        cast(
+            BrokerClient,
+            _FakeClient(
+                lambda _service, _payload: {
+                    "success": True,
+                    "action": {"tool": "x"},
+                }
+            ),
+        )
     )
 
     with pytest.raises(LLMRuntimeError, match="tool and args"):

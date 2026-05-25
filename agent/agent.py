@@ -1108,12 +1108,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--summary-threshold", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="/output")
     parser.add_argument("--agent-config-path", type=str, default="/run/strangeclaw/config.json")
-    parser.add_argument(
-        "--llm-config-path",
-        type=str,
-        default=None,
-        help="Deprecated alias for --agent-config-path.",
-    )
     return parser.parse_args(argv)
 
 
@@ -1123,10 +1117,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.vsock_port is None:
         raise ValueError("Missing required --vsock-port for guest execution.")
     config_path = args.agent_config_path
-    if isinstance(args.llm_config_path, str) and args.llm_config_path.strip():
-        config_path = args.llm_config_path
 
     agent_config = _load_agent_config_file(Path(config_path))
+    _validate_guest_proxy_config(agent_config, Path(config_path))
     transport = VsockTransport(guest_port=int(args.vsock_port))
     try:
         broker = BrokerClient(
@@ -1155,6 +1148,18 @@ def main(argv: list[str] | None = None) -> None:
         agent.run_forever()
     finally:
         transport.close()
+
+
+def _validate_guest_proxy_config(agent_config: dict[str, Any], path: Path) -> None:
+    """Reject legacy direct-LLM guest configs for the Fire proxy entrypoint."""
+    if "llm" in agent_config:
+        raise AgentError(
+            f"Guest proxy config in {path} must not contain an llm block. "
+            "LLM provider configuration is host-only and served through the llm host service."
+        )
+    host_services = agent_config.get("host_services")
+    if not isinstance(host_services, dict):
+        raise AgentError(f"Guest proxy config in {path} must contain host_services.")
 
 
 if __name__ == "__main__":

@@ -31,8 +31,11 @@ class LLMProxyRuntime:
         except HostServiceError as exc:
             raise LLMRuntimeError(str(exc)) from exc
 
-        if response.get("success") is False:
+        success = response.get("success")
+        if success is False:
             raise LLMRuntimeError(str(response.get("error", "llm complete failed")))
+        if success is not True:
+            raise LLMRuntimeError("llm complete response missing success envelope")
         return LLMResponse(
             text=str(response.get("text", "")),
             action=_deserialize_tool_call(response.get("action")),
@@ -48,8 +51,11 @@ class LLMProxyRuntime:
         except HostServiceError as exc:
             raise LLMRuntimeError(str(exc)) from exc
 
-        if response.get("success") is False:
+        success = response.get("success")
+        if success is False:
             raise LLMRuntimeError(str(response.get("error", "llm count_tokens failed")))
+        if success is not True:
+            raise LLMRuntimeError("llm count_tokens response missing success envelope")
         tokens = response.get("tokens")
         if not isinstance(tokens, int):
             raise LLMRuntimeError("llm count_tokens response missing integer tokens")

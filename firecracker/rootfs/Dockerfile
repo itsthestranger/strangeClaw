@@ -26,20 +26,20 @@ RUN apt-get update \
 
 WORKDIR /opt/strangeclaw
 
-# Copy only runtime assets needed in the guest.
-COPY pyproject.toml README.md ./
-COPY config.py coordinator.py main.py session.py ./
-COPY agent ./agent
-COPY adapters ./adapters
-COPY sandbox ./sandbox
+# Copy only runtime assets needed in the guest. The direct LiteLLM client
+# (agent/llm.py) is intentionally host-only and is not copied into the guest.
+RUN mkdir -p agent
+COPY agent/__init__.py agent/agent.py agent/broker_client.py agent/llm_proxy.py agent/llm_types.py \
+     agent/protocol.py agent/skills.py agent/tools.py agent/transport.py ./agent/
 COPY skills ./skills
 COPY firecracker/rootfs/entrypoint.sh /tmp/entrypoint.sh
 
+# Guest runtime dependencies are intentionally minimal. HTTP and LLM calls run
+# through host services, so no HTTP client, LiteLLM, or provider SDK is installed
+# in the guest venv.
 RUN python3.11 -m venv /opt/strangeclaw/.venv \
     && /opt/strangeclaw/.venv/bin/pip install --upgrade pip \
-    && /opt/strangeclaw/.venv/bin/pip install --no-cache-dir . \
-    # HTTP and LLM calls run through host services. No HTTP client or LiteLLM needed in the guest.
-    && /opt/strangeclaw/.venv/bin/pip uninstall -y litellm requests trafilatura \
+    && /opt/strangeclaw/.venv/bin/pip install --no-cache-dir 'PyYAML>=6.0.1' \
     && install -m 0755 /tmp/entrypoint.sh /sbin/entrypoint.sh \
     && ln -sf /usr/bin/tini /sbin/tini \
     && rm -f /sbin/init \
