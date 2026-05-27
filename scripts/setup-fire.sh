@@ -87,6 +87,33 @@ run_as_root() {
   fi
 }
 
+user_can_rw_path() {
+  local target_user="$1"
+  local path="$2"
+
+  if [[ "${EUID}" -ne 0 && "${target_user}" == "${USER}" ]]; then
+    [[ -r "${path}" && -w "${path}" ]]
+    return
+  fi
+
+  if [[ "${target_user}" == "root" ]]; then
+    run_as_root test -r "${path}" && run_as_root test -w "${path}"
+    return
+  fi
+
+  if command_exists sudo; then
+    sudo -u "${target_user}" test -r "${path}" && sudo -u "${target_user}" test -w "${path}"
+    return
+  fi
+
+  if [[ "${EUID}" -eq 0 ]] && command_exists runuser; then
+    runuser -u "${target_user}" -- test -r "${path}" && runuser -u "${target_user}" -- test -w "${path}"
+    return
+  fi
+
+  return 1
+}
+
 read_os_release_value() {
   local key="$1"
   if [[ ! -f /etc/os-release ]]; then
@@ -127,10 +154,12 @@ check_supported_arch() {
 
 setup_os_check() {
   local distro_id
+  local distro_like
   local distro_version
   local pretty_name
   local pkg_manager
   distro_id="$(read_os_release_value ID)"
+  distro_like="$(read_os_release_value ID_LIKE)"
   distro_version="$(read_os_release_value VERSION_ID)"
   pretty_name="$(read_os_release_value PRETTY_NAME)"
   pkg_manager="$(detect_package_manager)"
@@ -143,11 +172,33 @@ setup_os_check() {
     add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}}, but apt/dnf/pacman was not found."
     return
   fi
-  if [[ -n "${distro_version}" ]]; then
-    add_step "os_check" "PASS" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
-    return
-  fi
-  add_step "os_check" "PASS" "Detected ${distro_id} (package manager: ${pkg_manager})."
+
+  case "${pkg_manager}" in
+    apt)
+      if [[ "${distro_id}" =~ ^(ubuntu|linuxmint|debian)$ || " ${distro_like} " == *" debian "* || " ${distro_like} " == *" ubuntu "* ]]; then
+        add_step "os_check" "PASS" "Detected ${pretty_name:-${distro_id}} (apt-family host)."
+      else
+        add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}} with apt-get; proceeding with generic apt prerequisite package names."
+      fi
+      ;;
+    dnf)
+      if [[ "${distro_id}" =~ ^(fedora|rhel|centos|rocky|almalinux)$ || " ${distro_like} " == *" fedora "* || " ${distro_like} " == *" rhel "* ]]; then
+        add_step "os_check" "PASS" "Detected ${pretty_name:-${distro_id}} (dnf-family host)."
+      else
+        add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}} with dnf; proceeding with generic dnf prerequisite package names."
+      fi
+      ;;
+    pacman)
+      if [[ "${distro_id}" =~ ^(arch|cachyos|manjaro)$ || " ${distro_like} " == *" arch "* ]]; then
+        add_step "os_check" "PASS" "Detected ${pretty_name:-${distro_id}} (pacman-family host; package installs are manual)."
+      else
+        add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}} with pacman; automatic package installs remain skipped."
+      fi
+      ;;
+    *)
+      add_step "os_check" "WARN" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
+      ;;
+  esac
 }
 
 setup_packages() {
@@ -156,15 +207,18 @@ setup_packages() {
 
   case "${pkg_manager}" in
     apt)
-      if run_as_root apt-get update >/dev/null 2>&1 && \
-        run_as_root apt-get install -y acl curl iproute2 iptables ca-certificates kmod tar >/dev/null 2>&1; then
+      echo "Running apt-get update..."
+      echo "Running apt-get install for Fire prerequisites..."
+      if run_as_root apt-get update && \
+        run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y acl curl iproute2 iptables ca-certificates kmod tar; then
         add_step "packages" "PASS" "Installed via apt: acl curl iproute2 iptables ca-certificates kmod tar."
       else
         add_step "packages" "FAIL" "Failed to install prerequisites with apt."
       fi
       ;;
     dnf)
-      if run_as_root dnf -y install acl curl iproute iptables-nft ca-certificates kmod tar >/dev/null 2>&1; then
+      echo "Running dnf install for Fire prerequisites..."
+      if run_as_root dnf -y install acl curl iproute iptables-nft ca-certificates kmod tar; then
         add_step "packages" "PASS" "Installed via dnf: acl curl iproute iptables-nft ca-certificates kmod tar."
       else
         add_step "packages" "FAIL" "Failed to install prerequisites with dnf."
@@ -207,18 +261,18 @@ setup_kvm_access() {
     add_step "kvm_access" "FAIL" "/dev/kvm not found."
     return
   fi
-  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-    add_step "kvm_access" "PASS" "Read/write access to /dev/kvm already available."
+  if user_can_rw_path "${target_user}" /dev/kvm; then
+    add_step "kvm_access" "PASS" "Read/write access to /dev/kvm already available for ${target_user}."
     return
   fi
   if ! command_exists setfacl; then
     add_step "kvm_access" "FAIL" "setfacl not found; cannot grant /dev/kvm access."
     return
   fi
-  if run_as_root setfacl -m "u:${target_user}:rw" /dev/kvm >/dev/null 2>&1 && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+  if run_as_root setfacl -m "u:${target_user}:rw" /dev/kvm >/dev/null 2>&1 && user_can_rw_path "${target_user}" /dev/kvm; then
     add_step "kvm_access" "PASS" "Granted /dev/kvm read/write access to ${target_user}."
   else
-    add_step "kvm_access" "FAIL" "Could not grant /dev/kvm read/write access."
+    add_step "kvm_access" "FAIL" "Could not grant /dev/kvm read/write access to ${target_user}."
   fi
 }
 
@@ -346,7 +400,7 @@ setup_ip_forwarding() {
     if [[ "${current_value}" == "1" ]]; then
       add_step "ip_forward" "PASS" "IPv4 forwarding already enabled; left unchanged (runtime-managed policy)."
     else
-      add_step "ip_forward" "WARN" "IPv4 forwarding is disabled; left unchanged. Re-run with --enable-ip-forwarding-now if you accept this host-networking change."
+      add_step "ip_forward" "WARN" "IPv4 forwarding is disabled. Fire guest NAT needs it; left unchanged until you explicitly run with --enable-ip-forwarding-now or --persist-ip-forwarding."
     fi
     return
   fi
@@ -369,10 +423,26 @@ setup_ip_forwarding() {
 }
 
 setup_tun_module() {
+  if [[ -d /sys/module/tun && -c /dev/net/tun ]]; then
+    add_step "tun_module" "PASS" "tun module and /dev/net/tun are already present."
+    return
+  fi
+  if ! command_exists modprobe; then
+    add_step "tun_module" "FAIL" "modprobe not found; cannot load tun module."
+    return
+  fi
+  if [[ ! -d "/lib/modules/$(uname -r)" ]]; then
+    add_step "tun_module" "FAIL" "Kernel module directory /lib/modules/$(uname -r) is missing. Reboot into the installed kernel or install matching kernel modules before loading tun."
+    return
+  fi
   if run_as_root modprobe tun >/dev/null 2>&1; then
-    add_step "tun_module" "PASS" "Loaded tun module."
+    if [[ -d /sys/module/tun && -c /dev/net/tun ]]; then
+      add_step "tun_module" "PASS" "Loaded tun module and verified /dev/net/tun."
+    else
+      add_step "tun_module" "FAIL" "modprobe tun returned success, but /dev/net/tun is still missing."
+    fi
   else
-    add_step "tun_module" "FAIL" "Failed to load tun module."
+    add_step "tun_module" "FAIL" "Failed to load tun module. Check that the running kernel has matching modules installed."
   fi
 }
 
@@ -415,6 +485,10 @@ print_step_report() {
 run_setup() {
   check_supported_arch
   setup_os_check
+  if [[ "${STEP_FAILS}" -gt 0 ]]; then
+    add_step "setup" "FAIL" "Preflight failed; skipped package installs and host state changes."
+    return
+  fi
   if [[ "${CHECK_ONLY}" -eq 0 ]]; then
     setup_packages
     setup_iptables_backend_check

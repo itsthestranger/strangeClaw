@@ -32,6 +32,33 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+user_can_rw_path() {
+  local target_user="$1"
+  local path="$2"
+
+  if [[ "${EUID}" -ne 0 && "${target_user}" == "${USER}" ]]; then
+    [[ -r "${path}" && -w "${path}" ]]
+    return
+  fi
+
+  if [[ "${target_user}" == "root" ]]; then
+    [[ -r "${path}" && -w "${path}" ]]
+    return
+  fi
+
+  if [[ "${EUID}" -eq 0 ]] && command_exists runuser; then
+    runuser -u "${target_user}" -- test -r "${path}" && runuser -u "${target_user}" -- test -w "${path}"
+    return
+  fi
+
+  if command_exists sudo; then
+    sudo -u "${target_user}" test -r "${path}" && sudo -u "${target_user}" test -w "${path}"
+    return
+  fi
+
+  return 1
+}
+
 read_os_release_value() {
   local key="$1"
   if [[ ! -f /etc/os-release ]]; then
@@ -59,10 +86,12 @@ detect_package_manager() {
 
 check_host_os() {
   local distro_id
+  local distro_like
   local distro_version
   local pretty_name
   local pkg_manager
   distro_id="$(read_os_release_value ID)"
+  distro_like="$(read_os_release_value ID_LIKE)"
   distro_version="$(read_os_release_value VERSION_ID)"
   pretty_name="$(read_os_release_value PRETTY_NAME)"
   pkg_manager="$(detect_package_manager)"
@@ -76,11 +105,32 @@ check_host_os() {
     return
   fi
 
-  if [[ -n "${distro_version}" ]]; then
-    add_check "host_os" "PASS" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
-    return
-  fi
-  add_check "host_os" "PASS" "Detected ${distro_id} (package manager: ${pkg_manager})."
+  case "${pkg_manager}" in
+    apt)
+      if [[ "${distro_id}" =~ ^(ubuntu|linuxmint|debian)$ || " ${distro_like} " == *" debian "* || " ${distro_like} " == *" ubuntu "* ]]; then
+        add_check "host_os" "PASS" "Detected ${pretty_name:-${distro_id}} (apt-family host)."
+      else
+        add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}} with apt-get; generic apt package names are used by setup."
+      fi
+      ;;
+    dnf)
+      if [[ "${distro_id}" =~ ^(fedora|rhel|centos|rocky|almalinux)$ || " ${distro_like} " == *" fedora "* || " ${distro_like} " == *" rhel "* ]]; then
+        add_check "host_os" "PASS" "Detected ${pretty_name:-${distro_id}} (dnf-family host)."
+      else
+        add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}} with dnf; generic dnf package names are used by setup."
+      fi
+      ;;
+    pacman)
+      if [[ "${distro_id}" =~ ^(arch|cachyos|manjaro)$ || " ${distro_like} " == *" arch "* ]]; then
+        add_check "host_os" "PASS" "Detected ${pretty_name:-${distro_id}} (pacman-family host; package installs are manual)."
+      else
+        add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}} with pacman; setup skips automatic package installs."
+      fi
+      ;;
+    *)
+      add_check "host_os" "WARN" "Detected ${pretty_name:-${distro_id}} (package manager: ${pkg_manager})."
+      ;;
+  esac
 }
 
 check_architecture() {
@@ -97,15 +147,18 @@ check_architecture() {
 }
 
 check_kvm() {
+  local target_user
+  target_user="${SUDO_USER:-${USER}}"
+
   if [[ ! -e /dev/kvm ]]; then
     add_check "kvm_device" "FAIL" "/dev/kvm not found."
     add_check "kvm_access" "FAIL" "Cannot check access without /dev/kvm."
   else
     add_check "kvm_device" "PASS" "/dev/kvm is present."
-    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-      add_check "kvm_access" "PASS" "Read/write access is available."
+    if user_can_rw_path "${target_user}" /dev/kvm; then
+      add_check "kvm_access" "PASS" "Read/write access is available for ${target_user}."
     else
-      add_check "kvm_access" "FAIL" "Read/write access missing."
+      add_check "kvm_access" "FAIL" "Read/write access missing for ${target_user}."
     fi
   fi
 
@@ -142,6 +195,26 @@ check_required_commands() {
   fi
 }
 
+check_iptables_backend() {
+  local version_output
+
+  if ! command_exists iptables; then
+    add_check "iptables_backend" "FAIL" "Cannot check backend without iptables."
+    return
+  fi
+
+  version_output="$(iptables -V 2>/dev/null || true)"
+  if [[ "${version_output}" == *"nf_tables"* ]]; then
+    add_check "iptables_backend" "PASS" "iptables is using nf_tables backend."
+    return
+  fi
+  if command_exists iptables-nft; then
+    add_check "iptables_backend" "WARN" "iptables default backend may be legacy; iptables-nft is available."
+    return
+  fi
+  add_check "iptables_backend" "WARN" "Could not confirm nft backend for iptables."
+}
+
 check_ip_forwarding() {
   if [[ ! -f /proc/sys/net/ipv4/ip_forward ]]; then
     add_check "ip_forward" "FAIL" "Cannot read net.ipv4.ip_forward."
@@ -150,7 +223,7 @@ check_ip_forwarding() {
   if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then
     add_check "ip_forward" "PASS" "IPv4 forwarding is enabled."
   else
-    add_check "ip_forward" "FAIL" "IPv4 forwarding is disabled."
+    add_check "ip_forward" "FAIL" "IPv4 forwarding is disabled. Fire guest NAT requires it; run scripts/setup-fire.sh --enable-ip-forwarding-now for the current boot or --persist-ip-forwarding for a persistent host-networking change."
   fi
 }
 
@@ -158,7 +231,7 @@ check_tun() {
   if [[ -d /sys/module/tun && -c /dev/net/tun ]]; then
     add_check "tun" "PASS" "tun module and /dev/net/tun are present."
   else
-    add_check "tun" "FAIL" "tun module or /dev/net/tun is missing."
+    add_check "tun" "FAIL" "tun module or /dev/net/tun is missing. Run scripts/setup-fire.sh to load tun; if /lib/modules/$(uname -r) is missing, reboot into the installed kernel or install matching kernel modules first."
   fi
 }
 
@@ -230,6 +303,7 @@ run_checks() {
   check_architecture
   check_kvm
   check_required_commands
+  check_iptables_backend
   check_ip_forwarding
   check_tun
   check_firecracker_binary
