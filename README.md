@@ -54,11 +54,17 @@ Resume a saved session:
 
 ### Fire Mode Setup
 
-Run host setup (installs/updates prerequisites and runs checks):
+On Ubuntu, Linux Mint, Fedora, and other `apt-get`/`dnf` hosts, run host setup
+(installs/updates prerequisites and runs checks):
 
 ```bash
 bash scripts/setup-fire.sh
 ```
+
+The setup script deliberately does not install packages with `pacman`. Arch
+Linux and CachyOS are rolling-release systems; running a package database refresh
+without a full system upgrade can create a partial-upgrade state. Use the manual
+Arch path below instead.
 
 Useful variants:
 
@@ -75,6 +81,64 @@ bash scripts/setup-fire.sh --enable-ip-forwarding-now
 # Optional: enable + persist IP forwarding
 bash scripts/setup-fire.sh --persist-ip-forwarding
 ```
+
+If the final check only fails on `ip_forward`, decide whether you want to allow
+Fire mode guest NAT on this host. For a runtime-only change, rerun:
+
+```bash
+bash scripts/setup-fire.sh --enable-ip-forwarding-now
+```
+
+For a persistent host-networking change:
+
+```bash
+bash scripts/setup-fire.sh --persist-ip-forwarding
+```
+
+#### Arch Linux / CachyOS Manual Fire Setup
+
+Do the package-manager work yourself on Arch-family systems. This avoids
+automated partial upgrades and keeps kernel/module changes explicit.
+
+1. Fully upgrade first:
+   ```bash
+   sudo pacman -Syu
+   ```
+2. If the upgrade installed a new kernel, `systemd`, `glibc`, `kmod`, or low-level
+   networking packages, reboot before continuing. This keeps `/dev/kvm`,
+   `modprobe`, and loaded modules aligned with the running kernel:
+   ```bash
+   sudo reboot
+   ```
+3. Install the host prerequisites:
+   ```bash
+   sudo pacman -S --needed acl curl iproute2 iptables ca-certificates kmod tar
+   ```
+   If `pacman` asks about an iptables provider, choose the nft-compatible
+   `iptables` package, not a legacy-only alternative.
+4. Verify the commands strangeClaw needs:
+   ```bash
+   command -v setfacl curl ip iptables modprobe tar sha256sum
+   iptables -V
+   ```
+   `iptables -V` should mention `nf_tables`. If it does not, fix the iptables
+   backend before running Fire mode.
+5. Verify KVM is available:
+   ```bash
+   ls -l /dev/kvm
+   test -d /sys/module/kvm && echo "kvm module loaded"
+   ```
+   If `/dev/kvm` is missing, enable virtualization in firmware and make sure the
+   appropriate KVM module for your CPU is loaded by the running kernel.
+6. Run the strangeClaw setup script. On Arch-family systems it skips package
+   installation, grants `/dev/kvm` access when possible, installs the pinned
+   Firecracker binary from GitHub after checksum verification, optionally loads
+   `tun`, and runs the post-setup checks:
+   ```bash
+   bash scripts/setup-fire.sh
+   ```
+7. If the only remaining failure is IPv4 forwarding, enable it for the current
+   boot or persist it as described above.
 
 Switch config to Fire mode:
 

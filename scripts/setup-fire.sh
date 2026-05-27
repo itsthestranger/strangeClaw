@@ -157,25 +157,21 @@ setup_packages() {
   case "${pkg_manager}" in
     apt)
       if run_as_root apt-get update >/dev/null 2>&1 && \
-        run_as_root apt-get install -y acl curl iproute2 iptables ca-certificates kmod >/dev/null 2>&1; then
-        add_step "packages" "PASS" "Installed via apt: acl curl iproute2 iptables ca-certificates kmod."
+        run_as_root apt-get install -y acl curl iproute2 iptables ca-certificates kmod tar >/dev/null 2>&1; then
+        add_step "packages" "PASS" "Installed via apt: acl curl iproute2 iptables ca-certificates kmod tar."
       else
         add_step "packages" "FAIL" "Failed to install prerequisites with apt."
       fi
       ;;
     dnf)
-      if run_as_root dnf -y install acl curl iproute iptables ca-certificates kmod >/dev/null 2>&1; then
-        add_step "packages" "PASS" "Installed via dnf: acl curl iproute iptables ca-certificates kmod."
+      if run_as_root dnf -y install acl curl iproute iptables-nft ca-certificates kmod tar >/dev/null 2>&1; then
+        add_step "packages" "PASS" "Installed via dnf: acl curl iproute iptables-nft ca-certificates kmod tar."
       else
         add_step "packages" "FAIL" "Failed to install prerequisites with dnf."
       fi
       ;;
     pacman)
-      if run_as_root pacman -Sy --noconfirm --needed acl curl iproute2 iptables ca-certificates kmod >/dev/null 2>&1; then
-        add_step "packages" "PASS" "Installed via pacman: acl curl iproute2 iptables ca-certificates kmod."
-      else
-        add_step "packages" "FAIL" "Failed to install prerequisites with pacman."
-      fi
+      add_step "packages" "WARN" "Automatic pacman installs skipped to avoid Arch partial-upgrade risk; install prerequisites manually (see README)."
       ;;
     *)
       add_step "packages" "WARN" "No supported package manager found (expected apt, dnf, or pacman)."
@@ -288,26 +284,29 @@ setup_firecracker_binary() {
 
   checksum_url="${url}.sha256.txt"
   checksum_file="${tmp_dir}/firecracker.tgz.sha256.txt"
-  if command_exists sha256sum; then
-    if curl -fsSL --retry 2 "${checksum_url}" -o "${checksum_file}"; then
-      expected_sha="$(grep -E "[A-Fa-f0-9]{64}.*firecracker-${pinned_version}-${arch}\.tgz" "${checksum_file}" | head -n 1 | sed -E 's/^.*([A-Fa-f0-9]{64}).*$/\1/')"
-      if [[ -n "${expected_sha}" ]]; then
-        actual_sha="$(sha256sum "${tmp_dir}/firecracker.tgz" | awk '{print $1}')"
-        if [[ "${actual_sha}" == "${expected_sha}" ]]; then
-          add_step "firecracker_checksum" "PASS" "Archive checksum verified."
-        else
-          rm -rf "${tmp_dir}"
-          add_step "firecracker_checksum" "FAIL" "Archive checksum mismatch."
-          return
-        fi
-      else
-        add_step "firecracker_checksum" "WARN" "Downloaded checksum file but could not parse expected hash."
-      fi
-    else
-      add_step "firecracker_checksum" "WARN" "Could not download release checksum file; verification skipped."
-    fi
+  if ! command_exists sha256sum; then
+    rm -rf "${tmp_dir}"
+    add_step "firecracker_checksum" "FAIL" "sha256sum not found; refusing to install unverified Firecracker archive."
+    return
+  fi
+  if ! curl -fsSL --retry 2 "${checksum_url}" -o "${checksum_file}"; then
+    rm -rf "${tmp_dir}"
+    add_step "firecracker_checksum" "FAIL" "Could not download release checksum file; refusing to install unverified Firecracker archive."
+    return
+  fi
+  expected_sha="$(awk '/[A-Fa-f0-9]{64}/ && index($0, "firecracker-'"${pinned_version}"'-'"${arch}"'.tgz") { for (i = 1; i <= NF; i++) if ($i ~ /^[A-Fa-f0-9]{64}$/) { print $i; exit } }' "${checksum_file}")"
+  if [[ -z "${expected_sha}" ]]; then
+    rm -rf "${tmp_dir}"
+    add_step "firecracker_checksum" "FAIL" "Downloaded checksum file but could not parse expected hash."
+    return
+  fi
+  actual_sha="$(sha256sum "${tmp_dir}/firecracker.tgz" | awk '{print $1}')"
+  if [[ "${actual_sha}" == "${expected_sha}" ]]; then
+    add_step "firecracker_checksum" "PASS" "Archive checksum verified."
   else
-    add_step "firecracker_checksum" "WARN" "sha256sum not found; archive checksum not verified."
+    rm -rf "${tmp_dir}"
+    add_step "firecracker_checksum" "FAIL" "Archive checksum mismatch."
+    return
   fi
 
   if ! tar -xzf "${tmp_dir}/firecracker.tgz" -C "${tmp_dir}"; then
@@ -347,7 +346,7 @@ setup_ip_forwarding() {
     if [[ "${current_value}" == "1" ]]; then
       add_step "ip_forward" "PASS" "IPv4 forwarding already enabled; left unchanged (runtime-managed policy)."
     else
-      add_step "ip_forward" "WARN" "IPv4 forwarding is disabled; left unchanged (runtime-managed policy)."
+      add_step "ip_forward" "WARN" "IPv4 forwarding is disabled; left unchanged. Re-run with --enable-ip-forwarding-now if you accept this host-networking change."
     fi
     return
   fi
