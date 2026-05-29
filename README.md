@@ -54,19 +54,119 @@ Resume a saved session:
 
 ### Fire Mode Setup
 
-On Ubuntu, Linux Mint, Fedora, and other `apt-get`/`dnf` hosts, run host setup
-(installs/updates prerequisites and runs checks):
+Fire mode needs host prerequisites, Firecracker kernel/rootfs assets, and a
+guest rootfs containing the current strangeClaw agent code. Run these steps from
+the repository root.
 
-```bash
-bash scripts/setup-fire.sh
-```
+1. Install the Python environment as in the Yolo quickstart:
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -e ".[dev]"
+   ```
+2. Install/check host prerequisites. On Ubuntu, Linux Mint, Fedora, and other
+   `apt-get`/`dnf` hosts:
+   ```bash
+   bash scripts/setup-fire.sh
+   ```
+   This installs basic host packages where supported, grants `/dev/kvm` access,
+   installs the pinned Firecracker binary to `/usr/local/bin/firecracker`, checks
+   `tun`, checks the container runtime, and prints a post-setup report.
 
-The setup script deliberately does not install packages with `pacman`. Arch
-Linux and CachyOS are rolling-release systems; running a package database refresh
-without a full system upgrade can create a partial-upgrade state. Use the manual
-Arch path below instead.
+   The setup script deliberately does not install packages with `pacman`. Arch
+   Linux and CachyOS are rolling-release systems; running a package database
+   refresh without a full system upgrade can create a partial-upgrade state. Use
+   the manual Arch path below instead.
+3. Enable IPv4 forwarding if the prerequisite report says `ip_forward` is the
+   remaining blocker. For the current boot only:
+   ```bash
+   bash scripts/setup-fire.sh --enable-ip-forwarding-now
+   ```
+   To persist it in `/etc/sysctl.d`:
+   ```bash
+   bash scripts/setup-fire.sh --persist-ip-forwarding
+   ```
+4. Download the pinned Firecracker kernel/rootfs artifacts and run the kernel
+   vsock checks:
+   ```bash
+   bash scripts/fetch-fire-assets.sh
+   ```
+   This reads `firecracker/VERSION`, downloads the matching CI kernel and Ubuntu
+   rootfs assets into `firecracker/kernel/` and `firecracker/rootfs/`, generates
+   a temporary `firecracker/rootfs/agent.ext4`, and verifies that the kernel can
+   expose `/dev/vsock`.
 
-Useful variants:
+   If this script reports missing commands such as `unsquashfs`, `mkfs.ext4`,
+   `debugfs`, or `e2fsck`, install the distro packages that provide them
+   (`squashfs-tools` and `e2fsprogs` on most Linux distributions) and rerun it.
+   If the downloaded kernel does not provide built-in vsock support, build a
+   fallback kernel:
+   ```bash
+   bash scripts/build-fire-kernel.sh
+   ```
+
+   If you only want to download assets and skip the runtime smoke checks:
+   ```bash
+   bash scripts/fetch-fire-assets.sh --download-only
+   ```
+5. Build the actual strangeClaw guest rootfs:
+   ```bash
+   bash scripts/build-fire-rootfs.sh
+   ```
+   This uses Docker or Podman to build `firecracker/rootfs/agent.ext4` from
+   `firecracker/rootfs/Dockerfile`, exports the container filesystem, creates an
+   ext4 image with `mkfs.ext4 -d`, and verifies critical guest files with
+   `debugfs`.
+
+   If `setup-fire.sh` warned that Docker/Podman is missing, install one of them
+   before this step. The script auto-detects either runtime; you can force one
+   with `--runtime docker` or `--runtime podman`.
+
+   Re-run this script whenever you need Fire mode to pick up changed agent code,
+   built-in skills, guest dependencies, or `firecracker/rootfs/entrypoint.sh`.
+6. Create/update local config:
+   ```bash
+   mkdir -p ~/.strangeclaw
+   cp config.example.yaml ~/.strangeclaw/config.yaml
+   ```
+   Set Fire mode and confirm the Firecracker paths match the generated files:
+   ```yaml
+   mode: fire
+   adapters:
+     enabled: [cli]
+
+   firecracker:
+     binary: /usr/local/bin/firecracker
+     kernel: ./firecracker/kernel/vmlinux
+     rootfs: ./firecracker/rootfs/agent.ext4
+   ```
+7. Add any host-side secrets. LLM credentials stay in `config.yaml`; external
+   API/search credentials live in `~/.strangeclaw/secrets.yaml`:
+   ```bash
+   cp secrets.example.yaml ~/.strangeclaw/secrets.yaml
+   chmod 600 ~/.strangeclaw/secrets.yaml
+   ```
+8. Run a verification check before starting normal tasks:
+   ```bash
+   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python scripts/verify_fire.py --check network
+   ```
+   `--check network` verifies TAP/firewall setup and cleanup without running an
+   LLM task. For a full boot + agent lifecycle check, use:
+   ```bash
+   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python scripts/verify_fire.py --check lifecycle
+   ```
+   Preserve whichever environment variables your `~/.strangeclaw/config.yaml`
+   references, not only `ANTHROPIC_API_KEY`.
+9. Run strangeClaw in Fire mode:
+   ```bash
+   sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
+   ```
+   For local models only `HOME` needs to be preserved:
+   ```bash
+   sudo --preserve-env=HOME .venv/bin/python -m main
+   ```
+   Fire mode needs elevated privileges for TAP device and iptables management.
+
+Useful prerequisite-check variants:
 
 ```bash
 # Checks only (no host changes)
@@ -74,25 +174,6 @@ bash scripts/setup-fire.sh --check-only
 
 # Direct prerequisite checker
 bash scripts/fire-check.sh
-
-# Optional: enable IP forwarding for current runtime only
-bash scripts/setup-fire.sh --enable-ip-forwarding-now
-
-# Optional: enable + persist IP forwarding
-bash scripts/setup-fire.sh --persist-ip-forwarding
-```
-
-If the final check only fails on `ip_forward`, decide whether you want to allow
-Fire mode guest NAT on this host. For a runtime-only change, rerun:
-
-```bash
-bash scripts/setup-fire.sh --enable-ip-forwarding-now
-```
-
-For a persistent host-networking change:
-
-```bash
-bash scripts/setup-fire.sh --persist-ip-forwarding
 ```
 
 #### Arch Linux / CachyOS Manual Fire Setup
@@ -112,13 +193,13 @@ automated partial upgrades and keeps kernel/module changes explicit.
    ```
 3. Install the host prerequisites:
    ```bash
-   sudo pacman -S --needed acl curl iproute2 iptables ca-certificates kmod tar
+   sudo pacman -S --needed acl curl iproute2 iptables ca-certificates kmod tar docker e2fsprogs squashfs-tools
    ```
    If `pacman` asks about an iptables provider, choose the nft-compatible
    `iptables` package, not a legacy-only alternative.
 4. Verify the commands strangeClaw needs:
    ```bash
-   command -v setfacl curl ip iptables modprobe tar sha256sum
+   command -v setfacl curl ip iptables modprobe tar sha256sum unsquashfs mkfs.ext4 debugfs e2fsck
    iptables -V
    ```
    `iptables -V` should mention `nf_tables`. If it does not, fix the iptables
@@ -139,26 +220,6 @@ automated partial upgrades and keeps kernel/module changes explicit.
    ```
 7. If the only remaining failure is IPv4 forwarding, enable it for the current
    boot or persist it as described above.
-
-Switch config to Fire mode:
-
-```yaml
-mode: fire
-adapters:
-  enabled: [cli]
-```
-
-Run with elevated privileges (required for TAP + iptables):
-
-```bash
-sudo --preserve-env=HOME .venv/bin/python -m main
-```
-
-If your API key is from env interpolation, preserve it too:
-
-```bash
-sudo --preserve-env=HOME,ANTHROPIC_API_KEY .venv/bin/python -m main
-```
 
 ## Fire Mode Behavior (Current)
 
