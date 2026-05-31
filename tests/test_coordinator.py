@@ -220,6 +220,69 @@ def test_coordinator_follow_up_uses_saved_state_without_plan(
     assert "plan" not in second_task["state"]
 
 
+def test_coordinator_follow_up_uses_redacted_in_memory_state(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    secret = "sk-coordinator-follow-up-secret"
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {
+                    "goal": "g",
+                    "plan": {"steps": ["old"]},
+                    "llm": {"api_key": secret},
+                    "history": [
+                        {
+                            "type": "action",
+                            "headers": {"Authorization": f"Bearer {secret}"},
+                        }
+                    ],
+                },
+                "files": [],
+            }
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+    first_seen: list[dict[str, Any]] = []
+
+    status_one = coordinator.start_task(session_id="sess-1", text="first", sink=first_seen.append)
+    assert status_one == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in first_seen))
+
+    sandbox._events.append(
+        {
+            "type": "done",
+            "success": True,
+            "reply": "second",
+            "state": {"goal": "g2", "history": []},
+            "files": [],
+        }
+    )
+    status_two = coordinator.start_task(session_id="sess-1", text="second", sink=lambda _: None)
+    assert status_two == "started"
+    assert _wait_until(lambda: len(sandbox.started_tasks) == 2)
+
+    second_task = sandbox.started_tasks[1]
+    rendered_follow_up = json.dumps(second_task["state"], ensure_ascii=True, sort_keys=True)
+    assert secret not in rendered_follow_up
+    assert second_task["state"]["llm"]["api_key"] == "[REDACTED]"
+    assert (
+        second_task["state"]["history"][0]["headers"]["Authorization"]
+        == "[REDACTED]"
+    )
+    assert "plan" not in second_task["state"]
+    coordinator.stop_all()
+
+
 def test_coordinator_worker_exit_does_not_stop_session_sandbox(
     tmp_path: Path,
     monkeypatch: Any,

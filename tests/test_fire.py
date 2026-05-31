@@ -803,7 +803,7 @@ def test_fire_sandbox_reuses_started_vm_for_sequential_tasks(tmp_path: Path) -> 
     cid_manager = _FakeCidManager(cid=52)
     api_factory = _FakeApiFactory()
     process_factory = _FakePopenFactory()
-    event_stream = [
+    event_stream: list[dict[str, Any]] = [
         {"type": "agent_ready"},
         {"type": "message", "role": "plan", "content": {"steps": ["first"]}},
         {

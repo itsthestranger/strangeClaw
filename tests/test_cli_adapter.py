@@ -284,3 +284,53 @@ def test_follow_up_task_reuses_state_but_forces_replan(
     assert "state" in second_task
     assert second_task["state"]["history"] == [{"type": "action"}]
     assert "plan" not in second_task["state"]
+
+
+def test_follow_up_task_uses_redacted_in_memory_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    secret = "sk-cli-follow-up-secret"
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": {
+                    "goal": "g1",
+                    "plan": {"steps": ["old"]},
+                    "llm": {"api_key": secret},
+                    "history": [
+                        {
+                            "type": "action",
+                            "headers": {"Authorization": f"Bearer {secret}"},
+                        }
+                    ],
+                },
+                "files": [],
+            },
+            {
+                "type": "done",
+                "success": True,
+                "reply": "second",
+                "state": {"goal": "g2", "history": []},
+                "files": [],
+            },
+        ]
+    )
+    answers = iter(["task one", "task two", "/quit"])
+    adapter = CLIAdapter(sandbox=sandbox, input_func=lambda _: next(answers))
+
+    adapter.run()
+
+    second_task = sandbox.started_tasks[1]
+    rendered_follow_up = json.dumps(second_task["state"], ensure_ascii=True, sort_keys=True)
+    assert secret not in rendered_follow_up
+    assert second_task["state"]["llm"]["api_key"] == "[REDACTED]"
+    assert (
+        second_task["state"]["history"][0]["headers"]["Authorization"]
+        == "[REDACTED]"
+    )
+    assert "plan" not in second_task["state"]

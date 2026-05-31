@@ -14,12 +14,16 @@ import session
 
 
 def persist_done_event(*, session_id: str, done_event: dict[str, Any]) -> dict[str, Any] | None:
-    """Persist done event state and output files for a session."""
+    """Persist done event state and output files for a session.
+
+    The returned value is the same redacted state written to disk, so in-memory
+    follow-up state has the same secret-safety guarantees as persisted state.
+    """
     state = done_event.get("state")
     if not isinstance(state, dict):
         return None
 
-    redacted_state = redact_sensitive(state)
+    redacted_state: dict[str, Any] = redact_sensitive(state)
     session_dir = session.create(session_id)
     session.save(session_dir, redacted_state)
     outputs_dir = session_dir / "outputs"
@@ -45,12 +49,12 @@ def persist_done_event(*, session_id: str, done_event: dict[str, Any]) -> dict[s
                 raise ValueError(f"Invalid base64 content for output file: {rel_path}") from exc
             output_path.write_bytes(decoded)
 
-    return state
+    return redacted_state
 
 
 def state_for_follow_up(state: dict[str, Any]) -> dict[str, Any]:
     """Return follow-up state that preserves context while forcing re-planning."""
-    next_state = dict(state)
+    next_state: dict[str, Any] = redact_sensitive(state)
     next_state.pop("plan", None)
     return next_state
 
