@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import socket
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -9,8 +11,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import responses
 
-from agent.protocol import encode_event
+from agent.protocol import decode_event, encode_event
 from sandbox.fire import (
     DEFAULT_BOOT_ARGS,
     FirecrackerAPIClient,
@@ -360,6 +363,23 @@ def test_configure_microvm_preboot_rejects_invalid_host_service_timeout(tmp_path
             config=config,
             preboot=preboot,
         )
+
+
+def test_fire_guest_rootfs_excludes_host_only_llm_and_html_parser_dependencies() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    dockerfile = project_root / "firecracker" / "rootfs" / "Dockerfile"
+    non_comment_lines = "\n".join(
+        line
+        for line in dockerfile.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith("#")
+    ).lower()
+
+    assert "agent/llm.py" not in non_comment_lines
+    assert "litellm" not in non_comment_lines
+    assert "trafilatura" not in non_comment_lines
+    assert "requests" not in non_comment_lines
+    assert "agent/llm_proxy.py" in non_comment_lines
+    assert "'pyyaml>=6.0.1'" in non_comment_lines
 
 
 def test_firecracker_api_client_put_raises_on_non_2xx() -> None:
@@ -892,6 +912,112 @@ def test_fire_sandbox_reuses_started_vm_for_sequential_tasks(tmp_path: Path) -> 
     assert tap_manager.destroyed == [_build_allocation().tap_name]
 
 
+def test_fire_sandbox_persistent_vm_preserves_guest_file_state_between_tasks(
+    tmp_path: Path,
+) -> None:
+    config = _build_firecracker_config(tmp_path)
+    command_runner = _CopyingCommandRunner()
+    tap_manager = _FakeTapManager(_build_allocation())
+    iptables_manager = _FakeIptablesManager()
+    cid_manager = _FakeCidManager(cid=52)
+    api_factory = _FakeApiFactory()
+    process_factory = _FakePopenFactory()
+    event_stream: list[dict[str, Any]] = [
+        {"type": "agent_ready"},
+        {
+            "type": "action",
+            "tool": "shell",
+            "args": {"command": "printf hello > /tmp/c9-persist.txt"},
+            "result": {"exit_code": 0, "stdout": "", "stderr": ""},
+        },
+        {
+            "type": "done",
+            "success": True,
+            "reply": "wrote file",
+            "state": {"goal": "first", "history": []},
+            "files": [],
+        },
+        {
+            "type": "action",
+            "tool": "shell",
+            "args": {"command": "cat /tmp/c9-persist.txt"},
+            "result": {"exit_code": 0, "stdout": "hello", "stderr": ""},
+        },
+        {
+            "type": "done",
+            "success": True,
+            "reply": "read file",
+            "state": {"goal": "second", "history": []},
+            "files": [],
+        },
+    ]
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[
+                    b"OK 100\n"
+                    + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+                ]
+            )
+        ]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=tap_manager,
+        iptables_manager=iptables_manager,
+        cid_manager=cid_manager,
+        api_client_factory=api_factory.make,
+        command_runner=command_runner,
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    sandbox.start(session_id="sess-file-persist")
+    sandbox.send_task(
+        {
+            "type": "task",
+            "text": "write persistent file",
+            "session_id": "sess-file-persist",
+            "approval_mode": "auto",
+        }
+    )
+    first_action = sandbox.receive(timeout_seconds=1.0)
+    first_done = sandbox.receive(timeout_seconds=1.0)
+    sandbox.send_task(
+        {
+            "type": "task",
+            "text": "read persistent file",
+            "session_id": "sess-file-persist",
+            "approval_mode": "auto",
+        }
+    )
+    second_action = sandbox.receive(timeout_seconds=1.0)
+    second_done = sandbox.receive(timeout_seconds=1.0)
+
+    try:
+        assert len(process_factory.processes) == 1
+        assert first_action is not None
+        assert first_action["tool"] == "shell"
+        assert first_action["args"]["command"] == "printf hello > /tmp/c9-persist.txt"
+        assert first_done is not None
+        assert first_done["reply"] == "wrote file"
+        assert second_action is not None
+        assert second_action["args"]["command"] == "cat /tmp/c9-persist.txt"
+        assert second_action["result"]["stdout"] == "hello"
+        assert second_done is not None
+        assert second_done["reply"] == "read file"
+    finally:
+        sandbox.stop()
+
+
 def test_fire_sandbox_send_task_requires_running_vm(tmp_path: Path) -> None:
     sandbox = FireSandbox(
         firecracker_config=_build_firecracker_config(tmp_path),
@@ -1178,6 +1304,307 @@ def test_fire_sandbox_handles_broker_requests_without_adapter_visibility(
         sandbox.stop()
 
 
+@responses.activate
+def test_fire_sandbox_broker_http_fetch_search_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github_token = "ghp-fire-integration-token"
+    search_token = "brave-fire-integration-token"
+    credentials = {
+        "github": {
+            "auth_type": "bearer",
+            "token": github_token,
+            "allowed_hosts": ["api.github.com"],
+            "allowed_methods": ["GET"],
+            "allowed_paths": ["/user/repos"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {"Accept": "application/json"},
+            "max_response_bytes": 4096,
+            "rate_limit": None,
+        },
+        "_web_search": {
+            "auth_type": "header",
+            "header_name": "X-Subscription-Token",
+            "token": search_token,
+            "allowed_hosts": ["api.search.brave.com"],
+            "allowed_methods": ["GET"],
+            "allowed_paths": ["/*"],
+            "protected_headers": ["Authorization"],
+            "default_headers": {},
+            "max_response_bytes": 4096,
+            "rate_limit": None,
+        },
+    }
+    monkeypatch.setattr("sandbox.fire.load_secrets", lambda: credentials)
+    monkeypatch.setattr(
+        "sandbox.broker.socket.getaddrinfo",
+        lambda host, port: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", int(port or 443)),
+            )
+        ],
+    )
+    responses.get(
+        "https://api.github.com/user/repos",
+        json=[{"name": "strangeclaw"}],
+        headers={"X-Test": "github"},
+    )
+    responses.get(
+        "https://example.com/page",
+        body="<html><body><h1>Fire raw HTML</h1></body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+    responses.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        json={
+            "web": {
+                "results": [
+                    {
+                        "title": "Fire Result",
+                        "url": "https://example.com/page",
+                        "description": "Fire search snippet",
+                    }
+                ]
+            }
+        },
+        match=[
+            responses.matchers.query_param_matcher(
+                {"q": "strangeclaw fire"},
+                strict_match=True,
+            )
+        ],
+    )
+
+    config = _build_firecracker_config(tmp_path)
+    api_factory = _FakeApiFactory()
+    event_stream: list[dict[str, Any]] = [
+        {"type": "agent_ready"},
+        {
+            "type": "broker_request",
+            "request_id": "http-1",
+            "service": "broker",
+            "payload": {
+                "action": "http_request",
+                "integration": "github",
+                "method": "GET",
+                "url": "https://api.github.com/user/repos",
+                "headers": {},
+                "body": None,
+            },
+        },
+        {
+            "type": "broker_request",
+            "request_id": "fetch-1",
+            "service": "broker",
+            "payload": {"action": "web_fetch", "url": "https://example.com/page"},
+        },
+        {
+            "type": "broker_request",
+            "request_id": "search-1",
+            "service": "broker",
+            "payload": {"action": "web_search", "query": "strangeclaw fire"},
+        },
+        {
+            "type": "action",
+            "tool": "shell",
+            "args": {"command": "curl -s https://example.com"},
+            "result": {
+                "exit_code": 0,
+                "stdout": "<html><title>Example Domain</title></html>",
+                "stderr": "",
+            },
+        },
+        {
+            "type": "done",
+            "success": True,
+            "reply": "fire broker done",
+            "state": {"goal": "broker fire", "history": []},
+            "files": [],
+        },
+    ]
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[
+                    b"OK 100\n"
+                    + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+                ]
+            )
+        ]
+    )
+    agent_config = _agent_config(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-host-fire-llm-key",
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=agent_config,
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=api_factory.make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "fire broker end to end",
+                "session_id": "sess-fire-broker-e2e",
+                "approval_mode": "auto",
+            }
+        )
+        action = sandbox.receive(timeout_seconds=1.0)
+        done = sandbox.receive(timeout_seconds=1.0)
+        assert action is not None
+        assert action["tool"] == "shell"
+        assert action["args"]["command"] == "curl -s https://example.com"
+        assert "Example Domain" in action["result"]["stdout"]
+        assert done is not None
+        assert done["type"] == "done"
+
+        sent_events = _decode_sent_events(socket_factory.sockets[0])
+        broker_responses = [
+            event for event in sent_events if event.get("type") == "broker_response"
+        ]
+        by_id = {event["request_id"]: event for event in broker_responses}
+        assert set(by_id) == {"http-1", "fetch-1", "search-1"}
+
+        http_payload = by_id["http-1"]["payload"]
+        assert http_payload["success"] is True
+        assert http_payload["status_code"] == 200
+        assert http_payload["headers"]["X-Test"] == "github"
+        assert "strangeclaw" in http_payload["body"]
+
+        fetch_payload = by_id["fetch-1"]["payload"]
+        assert fetch_payload["success"] is True
+        assert fetch_payload["status_code"] == 200
+        assert "Fire raw HTML" in fetch_payload["body"]
+        assert set(fetch_payload) == {
+            "success",
+            "status_code",
+            "headers",
+            "body",
+            "truncated",
+        }
+
+        search_payload = by_id["search-1"]["payload"]
+        assert search_payload == {
+            "success": True,
+            "results": [
+                {
+                    "title": "Fire Result",
+                    "url": "https://example.com/page",
+                    "snippet": "Fire search snippet",
+                }
+            ],
+        }
+
+        rendered_sent = json.dumps(sent_events, ensure_ascii=True, sort_keys=True)
+        rendered_mmds = json.dumps(
+            api_factory.payload_for("/mmds"),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        assert github_token not in rendered_sent
+        assert search_token not in rendered_sent
+        assert "sk-host-fire-llm-key" not in rendered_sent
+        assert github_token not in rendered_mmds
+        assert search_token not in rendered_mmds
+        assert "sk-host-fire-llm-key" not in rendered_mmds
+        assert "llm" not in api_factory.payload_for("/mmds")["config"]
+        assert api_factory.payload_for("/mmds")["config"]["host_services"] == {
+            "llm_timeout_seconds": 120
+        }
+    finally:
+        sandbox.stop()
+
+
+def test_fire_sandbox_web_fetch_ssrf_denial_round_trip(tmp_path: Path) -> None:
+    config = _build_firecracker_config(tmp_path)
+    event_stream: list[dict[str, Any]] = [
+        {"type": "agent_ready"},
+        {
+            "type": "broker_request",
+            "request_id": "fetch-denied",
+            "service": "broker",
+            "payload": {"action": "web_fetch", "url": "http://127.0.0.1/private"},
+        },
+        {
+            "type": "done",
+            "success": False,
+            "reply": "denied",
+            "state": {"goal": "fetch"},
+            "files": [],
+        },
+    ]
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[
+                    b"OK 100\n"
+                    + "".join(encode_event(event) for event in event_stream).encode("utf-8")
+                ]
+            )
+        ]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "fire ssrf",
+                "session_id": "sess-fire-ssrf",
+                "approval_mode": "auto",
+            }
+        )
+        done = sandbox.receive(timeout_seconds=1.0)
+        assert done is not None
+        assert done["type"] == "done"
+        broker_response = next(
+            event
+            for event in _decode_sent_events(socket_factory.sockets[0])
+            if event.get("request_id") == "fetch-denied"
+        )
+        payload = broker_response["payload"]
+        assert payload["success"] is False
+        assert payload["error"] == "policy_denied"
+        assert payload["integration"] == "_web_fetch"
+        assert "SSRF" in payload["reason"]
+    finally:
+        sandbox.stop()
+
+
 def test_fire_sandbox_registers_llm_host_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1268,6 +1695,146 @@ def test_fire_sandbox_registers_llm_host_service(
         ]
         assert any('"request_id":"llm-1"' in payload for payload in sent_payloads)
         assert any('"tokens":7' in payload for payload in sent_payloads)
+    finally:
+        sandbox.stop()
+
+
+def test_fire_sandbox_llm_proxy_complete_round_trip_and_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sandbox.fire.load_secrets", lambda: {})
+    service_payloads: list[dict[str, Any]] = []
+
+    class FakeLLMService:
+        def __init__(self, config: dict[str, Any]) -> None:
+            assert config["llm"]["api_key"] == "sk-host-fire-proxy"
+
+        def handle(self, payload: dict[str, Any]) -> dict[str, Any]:
+            service_payloads.append(payload)
+            if len(service_payloads) == 1:
+                return {"success": False, "error": "temporary host llm failure"}
+            assert payload["action"] == "complete"
+            assert payload["messages"] == [{"role": "user", "content": "continue"}]
+            assert payload["action_schema"] == [{"name": "agent_done"}]
+            return {
+                "success": True,
+                "text": "",
+                "action": {
+                    "tool": "agent_done",
+                    "args": {"reply": "proxy ok"},
+                    "reason": "complete",
+                },
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            }
+
+    monkeypatch.setattr("sandbox.fire.LLMService", FakeLLMService)
+
+    config = _build_firecracker_config(tmp_path)
+    socket_factory = _FakeSocketFactory(
+        sockets=[
+            _FakeConnectedSocket(
+                recv_chunks=[
+                    b"OK 100\n"
+                    + encode_event({"type": "agent_ready"}).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "broker_request",
+                            "request_id": "llm-fail",
+                            "service": "llm",
+                            "payload": {
+                                "action": "complete",
+                                "messages": [{"role": "user", "content": "continue"}],
+                                "action_schema": [{"name": "agent_done"}],
+                            },
+                        }
+                    ).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "action",
+                            "tool": "agent_decision_error",
+                            "args": {"category": "llm_runtime_error"},
+                            "result": {
+                                "exit_code": 1,
+                                "stdout": "",
+                                "stderr": "temporary host llm failure",
+                            },
+                        }
+                    ).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "broker_request",
+                            "request_id": "llm-ok",
+                            "service": "llm",
+                            "payload": {
+                                "action": "complete",
+                                "messages": [{"role": "user", "content": "continue"}],
+                                "action_schema": [{"name": "agent_done"}],
+                            },
+                        }
+                    ).encode("utf-8")
+                    + encode_event(
+                        {
+                            "type": "done",
+                            "success": True,
+                            "reply": "proxy ok",
+                            "state": {"goal": "llm proxy"},
+                            "files": [],
+                        }
+                    ).encode("utf-8")
+                ]
+            )
+        ]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=config,
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host-fire-proxy",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=_FakePopenFactory(),
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+    try:
+        sandbox.run(
+            {
+                "type": "task",
+                "text": "fire llm proxy",
+                "session_id": "sess-fire-llm-proxy",
+                "approval_mode": "auto",
+            }
+        )
+        error_observation = sandbox.receive(timeout_seconds=1.0)
+        done = sandbox.receive(timeout_seconds=1.0)
+        assert error_observation is not None
+        assert error_observation["tool"] == "agent_decision_error"
+        assert error_observation["args"] == {"category": "llm_runtime_error"}
+        assert done is not None
+        assert done["reply"] == "proxy ok"
+
+        broker_responses = [
+            event
+            for event in _decode_sent_events(socket_factory.sockets[0])
+            if event.get("type") == "broker_response"
+        ]
+        by_id = {event["request_id"]: event for event in broker_responses}
+        assert by_id["llm-fail"]["payload"] == {
+            "success": False,
+            "error": "temporary host llm failure",
+        }
+        assert by_id["llm-ok"]["payload"]["success"] is True
+        assert by_id["llm-ok"]["payload"]["action"]["tool"] == "agent_done"
+        assert len(service_payloads) == 2
     finally:
         sandbox.stop()
 
@@ -1600,6 +2167,16 @@ def _build_allocation() -> TapNetworkAllocation:
         guest_ip="172.16.0.2",
         host_iface="eth0",
     )
+
+
+def _decode_sent_events(socket: _FakeConnectedSocket) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for payload in socket.sent:
+        if not payload.startswith(b"{"):
+            continue
+        for line in payload.decode("utf-8", errors="replace").splitlines():
+            events.append(decode_event(line))
+    return events
 
 
 class _NoopClient:
