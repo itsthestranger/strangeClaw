@@ -42,6 +42,26 @@ def test_broker_client_handler_exception_raises() -> None:
         client.call("broken", {"x": 1})
 
 
+def test_host_service_server_stop_is_non_raising() -> None:
+    server = HostServiceServer()
+
+    server.start()
+    server.stop()
+    server.stop()
+
+
+def test_host_service_server_dispatches_broker_and_llm_from_same_server() -> None:
+    server = HostServiceServer()
+    server.register("broker", lambda payload: {"broker": payload["action"]})
+    server.register("llm", lambda payload: {"llm": payload["action"]})
+    client = BrokerClient(server)
+
+    assert client.call("broker", {"action": "list_integrations"}) == {
+        "broker": "list_integrations"
+    }
+    assert client.call("llm", {"action": "count_tokens"}) == {"llm": "count_tokens"}
+
+
 def test_broker_client_yolo_surfaces_broker_internal_error_as_payload() -> None:
     broker = RequestBroker(
         credentials={

@@ -664,6 +664,8 @@ def test_execution_prompt_includes_configured_integrations() -> None:
 
 
 def test_llm_runtime_error_becomes_decision_error_and_execution_recovers() -> None:
+    api_key = "sk-agent-runtime-secret"
+
     class FailsOnceLLM:
         def __init__(self) -> None:
             self.calls = 0
@@ -678,7 +680,7 @@ def test_llm_runtime_error_becomes_decision_error_and_execution_recovers() -> No
             if action_schema is None:
                 return LLMResponse(text='{"steps":["single"]}', action=None)
             if self.calls == 2:
-                raise LLMRuntimeError("transient llm service failure sk-redacted")
+                raise LLMRuntimeError("transient llm service failure [REDACTED]")
             return LLMResponse(
                 text="",
                 action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
@@ -711,8 +713,10 @@ def test_llm_runtime_error_becomes_decision_error_and_execution_recovers() -> No
     assert error_events
     assert error_events[0]["args"] == {"category": "llm_runtime_error"}
     assert "transient llm service failure" in error_events[0]["result"]["stderr"]
+    assert api_key not in error_events[0]["result"]["stderr"]
     assert events[-1]["type"] == "done"
     assert events[-1]["reply"] == "recovered"
+    assert api_key not in json.dumps(events[-1]["state"])
     assert llm.calls == 3
 
 

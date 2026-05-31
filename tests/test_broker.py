@@ -1434,6 +1434,19 @@ def test_handle_web_search_normalizes_searxng() -> None:
     }
 
 
+def test_handle_web_search_denies_when_web_search_integration_absent() -> None:
+    credentials = _credentials()
+    credentials.pop("_web_search")
+    broker = RequestBroker(credentials=credentials, config=_broker_config())
+
+    result = broker.handle({"action": "web_search", "query": "test"})
+
+    assert result["success"] is False
+    assert result["error"] == "policy_denied"
+    assert "web_search integration not configured" in str(result.get("reason", ""))
+    assert result["integration"] == "_web_search"
+
+
 @responses.activate
 def test_handle_web_search_denies_allowed_hosts_mismatch() -> None:
     config = _broker_config()
