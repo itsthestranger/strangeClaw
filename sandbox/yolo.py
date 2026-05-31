@@ -115,9 +115,7 @@ class YoloSandbox:
         )
         self._agent_thread = threading.Thread(target=self._run_agent, args=(agent,), daemon=True)
         self._agent_thread.start()
-        task_event = dict(task)
-        task_event.pop("llm", None)
-        self.send(task_event)
+        self.send(dict(task))
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event to the agent."""

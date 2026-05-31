@@ -414,14 +414,13 @@ def test_yolo_integration_autonomous_replan_read_and_done(
         agent_config=_agent_config(),
     )
     task = _task(approval_mode="auto")
-    task["llm"] = {"model": "inline/model", "api_key": "inline-key"}
     try:
         sandbox.run(task)
         events = _collect_until_done(sandbox)
     finally:
         sandbox.stop()
 
-    # Yolo must use construction-time config and ignore task-inline llm config.
+    # Yolo must use construction-time config.
     assert captured_llm_config == _agent_config()["llm"]
 
     plan_events = [

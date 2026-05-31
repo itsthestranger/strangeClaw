@@ -709,12 +709,6 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
         "text": "hello",
         "session_id": "sess-1",
         "approval_mode": "review",
-        "llm": {
-            "model": "openai/gpt-4.1-mini",
-            "api_key": "sk-inline",
-            "max_tokens": 2048,
-            "temperature": 0.1,
-        },
     }
     sandbox.run(task)
 
@@ -801,7 +795,6 @@ def test_fire_sandbox_start_send_task_stop_lifecycle(tmp_path: Path) -> None:
             "text": "hello",
             "session_id": "sess-1",
             "approval_mode": "review",
-            "llm": {"model": "ignored", "api_key": "ignored"},
         }
     )
     sent_payloads = socket_factory.sockets[0].sent
@@ -1132,12 +1125,6 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         "text": "integration task",
         "session_id": "sess-c33g-fire",
         "approval_mode": "auto",
-        "llm": {
-            "model": "inline/model",
-            "api_key": "sk-inline",
-            "max_tokens": 2048,
-            "temperature": 0.7,
-        },
     }
     sandbox.run(task)
     events: list[dict[str, Any]] = []
@@ -1152,7 +1139,7 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
     mmds_payload = api_factory.payload_for("/mmds")
 
     try:
-        # Fire mode must use MMDS-delivered config and must not forward task-inline llm.
+        # Fire task events do not carry LLM config.
         sent_payloads = socket_factory.sockets[0].sent
         assert sent_payloads[0] == b"CONNECT 5000\n"
         assert b'"type":"task"' in sent_payloads[1]

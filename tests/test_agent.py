@@ -79,7 +79,6 @@ def _task_event(approval_mode: str = "auto") -> dict[str, Any]:
         "text": "check Python version and write hello world script",
         "session_id": "sess-1",
         "approval_mode": approval_mode,
-        "llm": {"model": "fake/model", "api_key": "fake-key"},
     }
 
 
@@ -1007,7 +1006,7 @@ def test_agent_malformed_control_call_emits_action_error_and_recovers(
     )
 
 
-def test_agent_uses_agent_config_file_and_ignores_task_llm(
+def test_agent_uses_agent_config_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1042,9 +1041,7 @@ def test_agent_uses_agent_config_file_and_ignores_task_llm(
     worker = threading.Thread(target=agent.run)
     worker.start()
 
-    task = _task_event()
-    task["llm"] = {"model": "task/model", "api_key": "task-key"}
-    host_transport.send(task)
+    host_transport.send(_task_event())
 
     events = _collect_until_done(host_transport)
     worker.join(timeout=2.0)

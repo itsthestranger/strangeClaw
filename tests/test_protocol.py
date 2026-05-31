@@ -12,13 +12,6 @@ ROUNDTRIP_EVENTS = [
         "text": "do thing",
         "session_id": "abc123",
         "approval_mode": "review",
-        "llm": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
-    },
-    {
-        "type": "task",
-        "text": "do thing",
-        "session_id": "abc123",
-        "approval_mode": "review",
     },
     {"type": "user_reply", "text": "yes", "approved": True},
     {"type": "stop"},
@@ -69,9 +62,7 @@ def test_encode_rejects_invalid_event_shape() -> None:
         encode_event({"type": "nope"})
 
 
-def test_task_event_with_llm_logs_deprecation_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_task_event_rejects_llm_field() -> None:
     event = {
         "type": "task",
         "text": "do thing",
@@ -79,7 +70,5 @@ def test_task_event_with_llm_logs_deprecation_warning(
         "approval_mode": "review",
         "llm": {"model": "openai/gpt-4.1", "api_key": "sk-test"},
     }
-    with caplog.at_level("WARNING"):
-        decoded = decode_event(encode_event(event))
-    assert decoded == event
-    assert "task.llm is deprecated and ignored" in caplog.text
+    with pytest.raises(ProtocolError, match="Event field 'llm' is not supported"):
+        encode_event(event)

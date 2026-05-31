@@ -1040,9 +1040,7 @@ class FireSandbox:
         """Send a task event to an already-running guest agent."""
         if not self.is_running():
             raise RuntimeError("FireSandbox is not running.")
-        task_event = dict(task)
-        task_event.pop("llm", None)
-        self.send(task_event)
+        self.send(dict(task))
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event to the agent."""
