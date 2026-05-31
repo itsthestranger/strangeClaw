@@ -176,6 +176,27 @@ bash scripts/setup-fire.sh --check-only
 bash scripts/fire-check.sh
 ```
 
+#### Fire Mode Cleanup
+
+If the host process is terminated abnormally, Firecracker processes, TAP
+devices, iptables rules, or `/tmp/strangeclaw-*` runtime directories can be left
+behind. Inspect first:
+
+```bash
+sudo bash scripts/cleanup-fire.sh --dry-run
+```
+
+Then remove strangeClaw-owned Fire resources:
+
+```bash
+sudo bash scripts/cleanup-fire.sh
+```
+
+The cleanup script is best-effort and conservative: it only targets Firecracker
+processes with a strangeClaw `--api-sock`, TAP names matching `fc` plus 12 hex
+characters, matching per-session iptables rules, and verified stale Fire runtime
+paths under `strangeclaw-*` temp directories.
+
 #### Arch Linux / CachyOS Manual Fire Setup
 
 Do the package-manager work yourself on Arch-family systems. This avoids
