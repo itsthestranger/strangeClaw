@@ -17,7 +17,10 @@ llm:
   api_key: ${ANTHROPIC_API_KEY}
 
   # Optional explicit base URL for local/custom endpoints.
-  # Example local OpenAI-compatible server: http://localhost:1234/v1
+  # Fire mode reaches local models through the host-side LLM proxy.
+  # Examples:
+  # - Ollama: http://127.0.0.1:11434
+  # - local OpenAI-compatible server: http://127.0.0.1:1234/v1
   api_base: null
 
   max_tokens: 4096
@@ -54,7 +57,8 @@ web_search:
   max_results: 10
 
 web_fetch:
-  max_response_bytes: 524288    # cap response body size in bytes (old key max_chars removed)
+  # Cap response body size in bytes.
+  max_response_bytes: 524288
 
 broker:
   public_policy:
@@ -69,7 +73,8 @@ broker:
     # http_request call.
 
 host_services:
-  # Host-side service limits (guest receives only llm_timeout_seconds in C8+).
+  # Host-side service limits. Fire guests receive only llm_timeout_seconds;
+  # llm_max_request_bytes is enforced by the host-side LLM service.
   llm_timeout_seconds: 120
   llm_max_request_bytes: 2097152
 
@@ -114,7 +119,10 @@ firecracker:
   # Emit Fire lifecycle status messages into adapter output.
   # Applies to host-side status events such as sandbox start/teardown.
   lifecycle_status_messages: true
-  session_idle_timeout_seconds: 1800  # 0 disables idle VM reaping
+
+  # Persistent Fire VMs are stopped after this many idle seconds.
+  # Set 0 to disable idle VM reaping.
+  session_idle_timeout_seconds: 1800
 
 telegram:
   token: ""

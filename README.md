@@ -250,6 +250,8 @@ automated partial upgrades and keeps kernel/module changes explicit.
   session.
 - Idle Fire sessions are reaped by timeout (`firecracker.session_idle_timeout_seconds`,
   default `1800`; set `0` to disable reaping).
+- Across sessions the VM filesystem is ephemeral; start a new session when you
+  want a clean guest.
 - `--resume` is intentionally rejected in Fire mode.
 
 ## Local LLMs In Fire Mode
@@ -258,8 +260,11 @@ Fire mode uses the host-side LLM proxy. The guest never receives the LLM API key
 or LiteLLM configuration; it sends model calls over the existing host-services
 channel, and the host process calls the configured provider.
 
-For local/self-hosted models such as Ollama, LM Studio, or vLLM, configure the
-host-side endpoint normally:
+For local/self-hosted models such as Ollama, LM Studio, or vLLM, configure
+`llm.api_base` on the host. The guest calls the host LLM service over vsock, and
+the host process talks to the local model.
+
+Ollama quick-start:
 
 ```yaml
 llm:
@@ -298,6 +303,22 @@ Host (main/coordinator/adapters)
       -> HTTP/search/API calls via host-side broker
 ```
 
+## Security Model
+
+`yolo` mode has no isolation and is for trusted local workflows. `fire` mode
+runs the agent in a Firecracker microVM; the Firecracker VMM boundary is the
+primary host protection.
+
+The Fire guest has NAT internet access. The request broker is not an internet
+gatekeeper: it injects credentials and enforces host-defined policy for
+`http_request`, `web_fetch`, and `web_search`. Public guest internet traffic can
+still happen directly through enabled tools such as `shell`.
+
+External API/search credentials stay in `~/.strangeclaw/secrets.yaml` on the
+host. LLM provider credentials stay in the host process and are used by the
+host-side LLM proxy. Fire MMDS contains guest runtime settings only, not
+integration tokens or LLM provider configuration.
+
 ## Tools vs Skills
 
 Tools are capabilities. They are built into strangeclaw, can be enabled or
@@ -309,7 +330,11 @@ disabled in `config.yaml`, and are the permission boundary:
 - `http_request`: make structured HTTP/API calls via the host broker. Medium risk.
 
 `web_fetch` performance note:
-The broker now returns raw HTTP response data (`status_code`, `headers`, `body`, `truncated`) without host-side content extraction. This reduces host-side complexity and parser attack surface, but HTML-heavy pages can increase token usage and response latency. For web-heavy workflows, prefer optional guest-side parsing steps (for example via `shell`) before summarization.
+The broker now returns raw HTTP response data (`status_code`, `headers`, `body`,
+`truncated`) without host-side content extraction. This reduces host-side
+complexity and parser attack surface, but HTML-heavy pages can increase token
+usage and response latency. For web-heavy workflows, prefer optional guest-side
+parsing steps (for example via `shell`) before summarization.
 
 Skills are instructions and workflow context. A skill is a directory under
 `skills/` with a `SKILL.md` file using YAML frontmatter, plus optional
