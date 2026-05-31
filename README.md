@@ -56,7 +56,8 @@ Resume a saved session:
 
 Fire mode needs host prerequisites, Firecracker kernel/rootfs assets, and a
 guest rootfs containing the current strangeClaw agent code. Run these steps from
-the repository root.
+the repository root. See [docs/fire-mode.md](./docs/fire-mode.md) for the
+current Fire architecture and troubleshooting notes.
 
 1. Install the Python environment as in the Yolo quickstart:
    ```bash
