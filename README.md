@@ -42,9 +42,6 @@ It is not production-ready. It is built around four constraints:
   integrations, Telegram, and adapters.
 - [Fire Mode](./docs/fire-mode.md): Firecracker-specific behavior,
   troubleshooting, host services, credential isolation, and cleanup.
-- [Specification](./strangeclaw_spec.md): detailed architecture source of truth.
-- [Implementation Status](./implementation_status.md): current implementation
-  progress.
 
 ## Quick Start
 
