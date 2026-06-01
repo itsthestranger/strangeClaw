@@ -24,8 +24,8 @@ def test_repository_skills_are_discoverable() -> None:
         {
             "name": "notion",
             "description": (
-                "Work with the Notion API using configured auth, data sources, "
-                "pages, querying, and updates."
+                "Work with the Notion API using configured auth, databases, "
+                "data sources, pages, search, querying, and updates."
             ),
         },
         {
@@ -58,7 +58,12 @@ def test_repository_notion_skill_is_self_contained() -> None:
     assert "Configured integrations" in skill_md
     assert "host-side broker" in skill_md
     assert "https://api.notion.com" in skill_md
+    assert "POST /v1/databases" in skill_md
+    assert "GET /v1/databases/{database_id}" in skill_md
+    assert "PATCH /v1/data_sources/{data_source_id}" in skill_md
     assert "POST /v1/data_sources/{data_source_id}/query" in skill_md
+    assert "POST /v1/search" in skill_md
+    assert "PATCH /v1/pages/{page_id}/markdown" in skill_md
 
 
 def test_repository_github_skill_is_self_contained() -> None:
