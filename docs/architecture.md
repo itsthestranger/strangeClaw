@@ -5,13 +5,41 @@ host-services layer, and a strict model-driven execution loop.
 
 ## Runtime Shape
 
-```text
-Host (main/coordinator/adapters)
-  -> Sandbox (Yolo or Fire)
-    -> Agent loop (inspect -> choose -> act -> observe -> repeat)
-      -> Tools + skills
-      -> LLM runtime
-      -> HTTP/search/API calls via host-side broker
+```mermaid
+flowchart LR
+    subgraph Sandbox["Sandbox: Yolo process or Firecracker microVM"]
+        Isolation["Fire mode isolation\nno host filesystem\nno API or LLM secrets"]
+
+        subgraph Agent["Agent loop"]
+            Inspect[Inspect]
+            Choose[Choose]
+            Act[Act]
+            Observe[Observe]
+
+            Inspect --> Choose --> Act --> Observe --> Inspect
+        end
+
+        Skills["Skills\nworkflow context only"]
+        Shell["shell\nlocal sandbox execution"]
+        HTTPTools["HTTP tools\nweb_search, web_fetch, http_request"]
+
+        Skills --> Inspect
+        Act --> Shell
+        Act --> HTTPTools
+    end
+
+    subgraph Host["Host-only boundary"]
+        Broker["Request broker\n1. policy check\n2. credential injection\n3. response redaction"]
+        Secrets["secrets.yaml\nAPI/search tokens"]
+    end
+
+    APIs["Web / external APIs"]
+
+    HTTPTools -->|"request without credentials"| Broker
+    Secrets -.->|"host-only"| Broker
+    Broker -->|"validated request\nwith injected credential"| APIs
+    APIs --> Broker
+    Broker -->|"redacted observation"| Observe
 ```
 
 The host owns adapters, session coordination, sandbox lifecycle, host-side

@@ -9,7 +9,19 @@ until the model chooses to finish, ask for clarification, or replan. The main
 question behind the project is whether a useful personal agent can stay simple
 while running untrusted work inside a stronger sandbox than a container.
 
-It is not production-ready. It is built around four constraints:
+## Status
+
+strangeClaw is work in progress and not production-ready. It is a personal
+agent research project with a working Yolo mode, a Firecracker-backed sandbox
+mode, and a design that is still expected to evolve.
+
+## Why This Exists
+
+The project explores whether an autonomous agent can stay small, inspectable,
+provider-agnostic, and expandable while keeping credentials on the host and
+running risky work behind a stronger-than-container boundary.
+
+It is built around four constraints:
 
 - Simplicity: a small Python codebase with explicit module boundaries.
 - Security: Firecracker mode runs the agent in a microVM; credentials stay on
@@ -18,6 +30,31 @@ It is not production-ready. It is built around four constraints:
   workflow documents.
 - Expandability: adapters, skills, and host services can be added without
   changing the core loop.
+
+## Architecture
+
+```text
+HOST
+┌────────────────────────────────────────────────────────────────┐
+│ User / Adapter / Coordinator                                   │
+│                                                                │
+│ Host secrets.yaml ──► Request Broker ──► External APIs         │
+│                    policy check                                │
+│                    credential injection                        │
+│                    response redaction                          │
+│                                                                │
+│ SANDBOX                                                        │
+│ ┌────────────────────────────────────────────────────────────┐ │
+│ │ Agent loop                                                 │ │
+│ │ Inspect → Choose → Act → Observe → Repeat                  │ │
+│ │                                                            │ │
+│ │ Tools + skills context                                     │ │
+│ │                                                            │ │
+│ │ In Fire mode: no host filesystem, no API secrets,          │ │
+│ │ no LLM credentials. Risky work stays inside the VM.        │ │
+│ └────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+```
 
 ## What It Supports
 
@@ -32,6 +69,28 @@ It is not production-ready. It is built around four constraints:
 - Skills loaded from `skills/<name>/SKILL.md` using the Agent Skills format.
 - Per-session state, output files, optional event journals, and Fire runtime log
   export.
+
+## Current Limitations
+
+- Fire mode requires Linux with KVM plus elevated privileges for TAP and
+  iptables management.
+- Fire rootfs images must be rebuilt when guest code, built-in skills, or guest
+  dependencies change.
+- Fire mode does not support resume across sessions; files persist only while a
+  session VM is running.
+- `shell` is powerful and high risk. Use Yolo mode only for trusted workflows,
+  and review tool settings before running untrusted tasks.
+- The project is intended for local experimentation, not production deployment
+  or multi-user SaaS.
+
+## Future Work
+
+- Expand the built-in skill set, especially for coding workflows, research, and
+  personal knowledge work.
+- Add more integration-focused skills and broker policy examples for common
+  APIs.
+- Improve custom skill delivery in Fire mode without rebuilding the rootfs.
+- Add more adapters and better observability for session replay and debugging.
 
 ## Documentation
 
