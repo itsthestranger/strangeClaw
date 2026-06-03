@@ -46,6 +46,16 @@ The host owns adapters, session coordination, sandbox lifecycle, host-side
 credentials, and host services. The sandbox owns the agent loop and enabled
 tools. In Fire mode, the sandbox is a Firecracker microVM.
 
+## Design Priorities
+
+- Simplicity: a small Python codebase with explicit module boundaries.
+- Security: the agent can run inside a Firecracker microVM; credentials stay on
+  the host behind the request broker.
+- Maintainability: tools are fixed runtime capabilities, skills are plain
+  workflow documents.
+- Expandability: adapters, skills, and host services can be added without
+  changing the core loop.
+
 ## Agentic Loop
 
 The execution loop is strict:

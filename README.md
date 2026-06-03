@@ -1,6 +1,6 @@
 # strangeClaw
 
-strangeClaw is a small, self-hosted autonomous agent experiment. I started it to
+strangeClaw is a small, self-hosted autonomous agent. I started it to
 understand how agent systems are built, where their limitations are, and where
 they can be improved.
 
@@ -13,7 +13,7 @@ credentials on the host behind a **request broker**.
 
 strangeClaw is work in progress and not production-ready. It is a personal
 project with a working Yolo mode, a mode where the agent runs inside a
-Firecracker microVM, and a design that is still expected to evolve.
+Firecracker microVM, and a host-side request broker for authenticated API calls.
 
 ## Why This Exists
 
@@ -26,16 +26,6 @@ microVM**, so commands and tools run behind a VM boundary instead of directly on
 the host. The **request broker** is another part of that: keep API credentials
 on the host, inject them only when a request passes policy, and let the agent
 observe denials instead of giving it direct access to secrets.
-
-It is built around four constraints:
-
-- Simplicity: a small Python codebase with explicit module boundaries.
-- Security: the agent can run inside a **Firecracker microVM**; credentials stay
-  on the host behind the **request broker**.
-- Maintainability: tools are fixed framework capabilities, skills are plain
-  workflow documents.
-- Expandability: adapters, skills, and host services can be added without
-  changing the core loop.
 
 ## Architecture
 
@@ -126,4 +116,6 @@ walkthrough.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](./LICENSE).
+strangeClaw is licensed under the MIT License. If you find the idea useful, feel
+free to use it, take it apart, change it, and build on it. See
+[LICENSE](./LICENSE).
