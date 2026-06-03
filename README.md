@@ -1,31 +1,37 @@
 # strangeClaw
 
 strangeClaw is a small, self-hosted autonomous agent experiment. I started it to
-understand how agent systems work when you keep the moving parts visible:
-planning, tool execution, sandboxing, credentials, and user interaction.
+understand how agent systems are built, where their limitations are, and where
+they can be improved.
 
 The agent accepts a task, plans, executes tools, observes results, and repeats
-until the model chooses to finish, ask for clarification, or replan. The main
-question behind the project is whether a useful personal agent can stay simple
-while running untrusted work inside a stronger sandbox than a container.
+until the model chooses to finish, ask for clarification, or replan. One idea I
+wanted to try was running the agent inside a **Firecracker microVM** and keeping
+credentials on the host behind a **request broker**.
 
 ## Status
 
 strangeClaw is work in progress and not production-ready. It is a personal
-agent research project with a working Yolo mode, a Firecracker-backed sandbox
-mode, and a design that is still expected to evolve.
+project with a working Yolo mode, a mode where the agent runs inside a
+Firecracker microVM, and a design that is still expected to evolve.
 
 ## Why This Exists
 
-The project explores whether an autonomous agent can stay small, inspectable,
-provider-agnostic, and expandable while keeping credentials on the host and
-running risky work behind a stronger-than-container boundary.
+The project is a way for me to learn by building. I wanted to build my own agent
+loop instead of using an agent framework, then use that as a base to try security
+ideas that seemed worth exploring.
+
+The main security experiment is running the agent inside a **Firecracker
+microVM**, so commands and tools run behind a VM boundary instead of directly on
+the host. The **request broker** is another part of that: keep API credentials
+on the host, inject them only when a request passes policy, and let the agent
+observe denials instead of giving it direct access to secrets.
 
 It is built around four constraints:
 
 - Simplicity: a small Python codebase with explicit module boundaries.
-- Security: Firecracker mode runs the agent in a microVM; credentials stay on
-  the host where possible.
+- Security: the agent can run inside a **Firecracker microVM**; credentials stay
+  on the host behind the **request broker**.
 - Maintainability: tools are fixed framework capabilities, skills are plain
   workflow documents.
 - Expandability: adapters, skills, and host services can be added without

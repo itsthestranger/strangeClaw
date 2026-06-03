@@ -84,7 +84,7 @@ finishes. Fire sandboxes are stopped explicitly or by idle timeout.
 ## Tools
 
 Tools are capabilities and form the permission boundary. They are built into the
-framework and can be enabled or disabled in config:
+runtime and can be enabled or disabled in config:
 
 - `shell`: run shell commands. High risk.
 - `web_search`: search via the host broker. Low risk.
@@ -94,9 +94,9 @@ framework and can be enabled or disabled in config:
 
 Disabled tools are removed from the model's action surface.
 
-`web_fetch` is a dumb pipe: the broker returns `status_code`, `headers`, decoded
-UTF-8 `body`, and `truncated`. The host does not parse or summarize fetched
-content.
+`web_fetch` is intentionally a pass-through tool: the broker returns
+`status_code`, `headers`, decoded UTF-8 `body`, and `truncated`. The host does
+not parse or summarize fetched content.
 
 ## Skills
 

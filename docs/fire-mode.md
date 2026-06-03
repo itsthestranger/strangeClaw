@@ -95,7 +95,8 @@ response-size cap, and rate limit before injecting credentials. Denials are
 returned as observations for the model to reason about. Token values are redacted
 before any broker result leaves the host broker.
 
-`web_fetch` is intentionally a dumb pipe. It returns the HTTP response as:
+`web_fetch` is intentionally a pass-through tool. It returns the HTTP response
+as:
 
 ```json
 {

@@ -207,10 +207,11 @@ sudo bash scripts/cleanup-fire.sh
 The cleanup script is conservative: it targets strangeClaw-owned Firecracker
 processes, TAP names, iptables rules, and stale runtime paths.
 
-## Arch Linux And CachyOS Notes
+## Arch Linux Notes
 
 The setup script deliberately does not install packages with `pacman`. Do
 package-manager work manually on Arch-family systems to avoid partial upgrades.
+The Fire setup has been tested on CachyOS and Fedora 42.
 
 1. Fully upgrade first:
 
