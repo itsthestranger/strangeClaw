@@ -1,19 +1,12 @@
 # strangeClaw
 
-strangeClaw is a small, self-hosted autonomous agent. I started it to
-understand how agent systems are built, where their limitations are, and where
-they can be improved.
+**A self-hosted autonomous agent that runs inside a Firecracker microVM — so it can plan, write code, and call tools without ever touching your host filesystem, your LLM credentials, or your API secrets.**
 
-The agent accepts a task, plans, executes tools, observes results, and repeats
-until the model chooses to finish, ask for clarification, or replan. One idea I
-wanted to try was running the agent inside a **Firecracker microVM** and keeping
-credentials on the host behind a **request broker**.
+strangeClaw is a small autonomous agent built from scratch (no agent framework) as a way for me to understand how these systems actually work — and then to try a security idea that seemed worth exploring: what if the agent runs behind a real VM boundary, and credentials never enter the environment it controls?
 
-## Status
+In **Fire mode**, the agent loop runs inside a Firecracker microVM with no host filesystem access and no secrets. When it needs an authenticated API call, the request goes to a **host-side broker** that checks policy, injects credentials, redacts the response, and hands back only the result. The agent observes denials instead of holding keys. Risky work stays inside the VM.
 
-strangeClaw is work in progress and not production-ready. It is a personal
-project with a working Yolo mode, a mode where the agent runs inside a
-Firecracker microVM, and a host-side request broker for authenticated API calls.
+> **Status:** Work in progress, not production-ready. It's a personal project, but a working one — Yolo mode, Fire mode, and the request broker all run today.
 
 ## Why This Exists
 
@@ -26,6 +19,14 @@ microVM**, so commands and tools run behind a VM boundary instead of directly on
 the host. The **request broker** is another part of that: keep API credentials
 on the host, inject them only when a request passes policy, and let the agent
 observe denials instead of giving it direct access to secrets.
+
+## How it works
+
+A strict agent loop — *Inspect → Choose → Act → Observe → Repeat* — that runs until the model finishes, asks for clarification, or replans. Two execution modes:
+
+- **`yolo`** — direct host execution for trusted local workflows.
+- **`fire`** — Firecracker microVM isolation with host-side credential brokering.
+
 
 ## Architecture
 
@@ -66,6 +67,32 @@ HOST
 - Per-session state, output files, optional event journals, and Fire runtime log
   export.
 
+## Quick Start
+
+For a local trusted run:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+mkdir -p ~/.strangeclaw
+cp config.example.yaml ~/.strangeclaw/config.yaml
+.venv/bin/python -m main
+```
+
+Set `mode: yolo` and your `llm` settings in
+`~/.strangeclaw/config.yaml`. See [Setup](docs/setup.md) for the full
+walkthrough.
+
+## Documentation
+
+- [Setup](docs/setup.md): install, configure, and run Yolo or Fire mode.
+- [Architecture](docs/architecture.md): runtime model, agent loop, tools,
+  skills, sessions, and security boundaries.
+- [Configuration](docs/configuration.md): LLMs, web search, secrets,
+  integrations, Telegram, and adapters.
+- [Fire Mode](docs/fire-mode.md): Firecracker-specific behavior,
+  troubleshooting, host services, credential isolation, and cleanup.
+
 ## Current Limitations
 
 - Fire mode requires Linux with KVM plus elevated privileges for TAP and
@@ -88,34 +115,8 @@ HOST
 - Improve custom skill delivery in Fire mode without rebuilding the rootfs.
 - Add more adapters and better observability for session replay and debugging.
 
-## Documentation
-
-- [Setup](./docs/setup.md): install, configure, and run Yolo or Fire mode.
-- [Architecture](./docs/architecture.md): runtime model, agent loop, tools,
-  skills, sessions, and security boundaries.
-- [Configuration](./docs/configuration.md): LLMs, web search, secrets,
-  integrations, Telegram, and adapters.
-- [Fire Mode](./docs/fire-mode.md): Firecracker-specific behavior,
-  troubleshooting, host services, credential isolation, and cleanup.
-
-## Quick Start
-
-For a local trusted run:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-mkdir -p ~/.strangeclaw
-cp config.example.yaml ~/.strangeclaw/config.yaml
-.venv/bin/python -m main
-```
-
-Set `mode: yolo` and your `llm` settings in
-`~/.strangeclaw/config.yaml`. See [Setup](./docs/setup.md) for the full
-walkthrough.
-
 ## License
 
 strangeClaw is licensed under the MIT License. If you find the idea useful, feel
 free to use it, take it apart, change it, and build on it. See
-[LICENSE](./LICENSE).
+[LICENSE](LICENSE).
