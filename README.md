@@ -7,6 +7,8 @@ strangeClaw is a small autonomous agent built from scratch (no agent framework) 
 In **Fire mode**, the agent loop runs inside a Firecracker microVM with no host filesystem access and no secrets. When it needs an authenticated API call, the request goes to a **host-side broker** that checks policy, injects credentials, redacts the response, and hands back only the result. The agent observes denials instead of holding keys. Risky work stays inside the VM.
 
 > **Status:** Work in progress, not production-ready. It's a personal project, but a working one — Yolo mode, Fire mode, and the request broker all run today.
+>
+> **Next up:** subagents.
 
 ## Why This Exists
 
