@@ -216,6 +216,21 @@ def test_result_envelope_is_bounded_and_files_reduced_to_metadata() -> None:
     assert len(envelope["events_summary"]) == 50
 
 
+def test_max_children_per_task_cap_blocks_further_spawns() -> None:
+    runner = _FakeRunner({"success": True, "status": "completed", "reply": "ok"})
+    agent = _make_agent(_config(max_children_per_task=2), runner=runner)
+
+    first = _dispatch_spawn(agent, {"task": "a"})
+    second = _dispatch_spawn(agent, {"task": "b"})
+    third = _dispatch_spawn(agent, {"task": "c"})
+
+    assert first["status"] == "completed"
+    assert second["status"] == "completed"
+    assert third["status"] == "invalid_request"
+    assert "max_children_per_task" in third["reason"]
+    assert len(runner.requests) == 2  # the blocked spawn never reaches the runner
+
+
 def test_runner_exception_becomes_child_failed_observation() -> None:
     class _BoomRunner:
         def run(self, request: dict[str, Any]) -> dict[str, Any]:

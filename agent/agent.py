@@ -6,6 +6,7 @@ import argparse
 import base64
 import json
 import re
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
@@ -114,6 +115,10 @@ _CONTROL_TOOL_NAMES = {schema["name"] for schema in _CONTROL_TOOL_SCHEMAS}
 
 _SPAWN_SUBAGENT_TOOL_NAME = "spawn_subagent"
 _SUBAGENT_EVENTS_SUMMARY_MAX = 50
+
+# Final reply emitted when the execution loop exhausts its iteration budget.
+# Shared so the subagent runner can map this outcome to a `max_iterations` status.
+MAX_ITERATIONS_REPLY = "Stopped after reaching iteration limit."
 _SPAWN_SUBAGENT_SCHEMA: dict[str, Any] = {
     "name": _SPAWN_SUBAGENT_TOOL_NAME,
     "description": (
@@ -175,6 +180,8 @@ class Agent:
         llm_runtime: LLMRuntime | None = None,
         broker: BrokerClient | None = None,
         subagent_runner: SubagentRunnerProtocol | None = None,
+        clarify_enabled: bool = True,
+        task_timeout_seconds: float | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise AgentError("max_iterations must be greater than zero.")
@@ -211,18 +218,30 @@ class Agent:
             )
 
         skills_max_file_chars = _read_skills_max_file_chars(self._agent_config)
+        self._skills_dir = skills_dir
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._broker = broker
         self._tools = Tools(self._agent_config or {}, broker=broker)
         self._subagent_runner = subagent_runner
         self._subagents_settings = _read_subagents_settings(self._agent_config)
         self._subagents_enabled = _read_subagents_enabled(self._agent_config)
+        self._clarify_enabled = clarify_enabled
+        self._task_timeout_seconds = task_timeout_seconds
+        self._deadline: float | None = None
+        self._subagent_children_spawned = 0
+        self._active_session_id = ""
         self._integrations: list[str] = []
+        control_schemas = (
+            _CONTROL_TOOL_SCHEMAS
+            if clarify_enabled
+            else [s for s in _CONTROL_TOOL_SCHEMAS if s["name"] != _CONTROL_TOOL_CLARIFY]
+        )
         extra_action_schemas = (
             [_SPAWN_SUBAGENT_SCHEMA] if self._subagents_enabled else []
         )
         self._execution_action_surface = _build_execution_action_surface(
             self._tools.schema(),
+            control_schemas=control_schemas,
             extra_schemas=extra_action_schemas,
         )
         self._max_iterations = max_iterations
@@ -270,6 +289,13 @@ class Agent:
         """Run one task event using this agent instance."""
         goal = task_event["text"]
         approval_mode = task_event["approval_mode"]
+        self._active_session_id = str(task_event.get("session_id") or "")
+        self._subagent_children_spawned = 0
+        self._deadline = (
+            time.monotonic() + self._task_timeout_seconds
+            if self._task_timeout_seconds is not None
+            else None
+        )
         self._integrations = self._load_integrations()
         self._history_summary = None
         self._history_summarized_count = 0
@@ -306,6 +332,12 @@ class Agent:
         # Strict Inspect -> Choose -> Act -> Observe -> Repeat loop.
         # Exactly one model-issued structured decision is required per turn.
         for _ in range(self._max_iterations):
+            if self._deadline is not None and time.monotonic() >= self._deadline:
+                # Time budget reached at an iteration boundary (a subagent timeout).
+                # Return without a done event; the caller (SubagentRunner) maps a
+                # missing done to a timeout. No effect for parent agents, which run
+                # with no task_timeout_seconds.
+                return
             decision = self._choose_next_decision(
                 goal=goal,
                 plan=plan,
@@ -352,7 +384,7 @@ class Agent:
                 plan=plan,
                 history=history,
                 success=False,
-                reply="Stopped after reaching iteration limit.",
+                reply=MAX_ITERATIONS_REPLY,
             )
         )
 
@@ -649,6 +681,16 @@ class Agent:
             return {"done": True, "plan": current_plan, "observation": None}
 
         if control_tool == _CONTROL_TOOL_CLARIFY:
+            if not self._clarify_enabled:
+                error_event = self._emit_control_action_error(
+                    tool=control_tool,
+                    args=decision.args,
+                    message=(
+                        "clarification is unavailable in this context; proceed on stated "
+                        "assumptions or finish via agent_done and report what you need."
+                    ),
+                )
+                return {"done": False, "plan": current_plan, "observation": error_event}
             question_raw = decision.args.get("question")
             if question_raw is None:
                 question = "Please clarify what you want next."
@@ -793,7 +835,24 @@ class Agent:
                 plan=current_plan,
             )
 
-        if self._subagent_runner is None:
+        max_children = _read_pos_int_field(
+            self._subagents_settings, "max_children_per_task", 3
+        )
+        if self._subagent_children_spawned >= max_children:
+            return self._emit_subagent_observation(
+                args=args,
+                envelope={
+                    "success": False,
+                    "status": "invalid_request",
+                    "reason": (
+                        f"max_children_per_task ({max_children}) reached for this task."
+                    ),
+                },
+                plan=current_plan,
+            )
+
+        runner = self._resolve_subagent_runner()
+        if runner is None:
             return self._emit_subagent_observation(
                 args=args,
                 envelope={
@@ -804,11 +863,30 @@ class Agent:
                 plan=current_plan,
             )
 
+        self._subagent_children_spawned += 1
         try:
-            envelope = self._subagent_runner.run(request)
+            envelope = runner.run(request)
         except Exception as exc:  # child failures are observations, never parent crashes
             envelope = {"success": False, "status": "child_failed", "reason": str(exc)}
         return self._emit_subagent_observation(args=args, envelope=envelope, plan=current_plan)
+
+    def _resolve_subagent_runner(self) -> SubagentRunnerProtocol | None:
+        if self._subagent_runner is not None:
+            return self._subagent_runner
+        if self._llm is None:
+            return None
+        from agent.subagents import SubagentRunner
+
+        return SubagentRunner(
+            llm_runtime=self._llm,
+            broker=self._broker,
+            skills_dir=self._skills_dir,
+            base_config=self._agent_config or {},
+            parent_enabled_tools=self._tools.list_enabled(),
+            parent_session_id=self._active_session_id,
+            output_root=str(self._output_dir / "subagents"),
+            limits=self._subagents_settings,
+        )
 
     def _build_subagent_request(
         self,
@@ -1210,11 +1288,13 @@ def _first_json_object_or_array(text: str) -> dict[str, Any] | list[Any] | None:
 def _build_execution_action_surface(
     capability_tool_schemas: list[dict[str, Any]],
     *,
+    control_schemas: list[dict[str, Any]] | None = None,
     extra_schemas: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    controls = _CONTROL_TOOL_SCHEMAS if control_schemas is None else control_schemas
     surface: list[dict[str, Any]] = []
     seen_names: set[str] = set()
-    for schema in [*capability_tool_schemas, *_CONTROL_TOOL_SCHEMAS, *(extra_schemas or [])]:
+    for schema in [*capability_tool_schemas, *controls, *(extra_schemas or [])]:
         name_raw = schema.get("name")
         params = schema.get("parameters")
         if not isinstance(name_raw, str) or not name_raw.strip():
