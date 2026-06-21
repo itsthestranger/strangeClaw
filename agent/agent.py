@@ -14,7 +14,7 @@ from agent.broker_client import BrokerClient, HostServiceError
 from agent.llm_proxy import LLMProxyRuntime
 from agent.llm_types import LLMResponse, LLMRuntime, LLMRuntimeError, ToolCall
 from agent.skills import Skills, SkillsError
-from agent.tools import ToolResult, Tools
+from agent.tools import ToolResult, Tools, wrap_external_data
 from agent.transport import VsockTransport
 
 PLANNING_SYSTEM_PROMPT = (
@@ -112,6 +112,32 @@ _CONTROL_TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 _CONTROL_TOOL_NAMES = {schema["name"] for schema in _CONTROL_TOOL_SCHEMAS}
 
+_SPAWN_SUBAGENT_TOOL_NAME = "spawn_subagent"
+_SUBAGENT_EVENTS_SUMMARY_MAX = 50
+_SPAWN_SUBAGENT_SCHEMA: dict[str, Any] = {
+    "name": _SPAWN_SUBAGENT_TOOL_NAME,
+    "description": (
+        "Delegate a separable subtask to a child agent that runs to completion in "
+        "the same sandbox/session and returns a single structured result. Sequential "
+        "and blocking: one child at a time. The child uses a subset of your tools, "
+        "cannot ask the user anything, and reports gaps in its reply."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "context": {"type": "string"},
+            "expected_output": {"type": "string"},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "referenced_skills": {"type": "array", "items": {"type": "string"}},
+            "max_iterations": {"type": "integer"},
+            "timeout_seconds": {"type": "integer"},
+        },
+        "required": ["task"],
+        "additionalProperties": False,
+    },
+}
+
 
 class AgentError(RuntimeError):
     """Raised for invalid runtime events/configuration."""
@@ -123,6 +149,12 @@ class AgentTransport(Protocol):
     def send(self, event: dict[str, Any]) -> None: ...
 
     def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None: ...
+
+
+class SubagentRunnerProtocol(Protocol):
+    """Runner contract used by Agent to execute one child agent synchronously."""
+
+    def run(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class Agent:
@@ -142,6 +174,7 @@ class Agent:
         max_output_total_bytes: int = 10 * 1024 * 1024,
         llm_runtime: LLMRuntime | None = None,
         broker: BrokerClient | None = None,
+        subagent_runner: SubagentRunnerProtocol | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise AgentError("max_iterations must be greater than zero.")
@@ -181,9 +214,16 @@ class Agent:
         self._skills = Skills(skills_dir, max_file_chars=skills_max_file_chars)
         self._broker = broker
         self._tools = Tools(self._agent_config or {}, broker=broker)
+        self._subagent_runner = subagent_runner
+        self._subagents_settings = _read_subagents_settings(self._agent_config)
+        self._subagents_enabled = _read_subagents_enabled(self._agent_config)
         self._integrations: list[str] = []
+        extra_action_schemas = (
+            [_SPAWN_SUBAGENT_SCHEMA] if self._subagents_enabled else []
+        )
         self._execution_action_surface = _build_execution_action_surface(
-            self._tools.schema()
+            self._tools.schema(),
+            extra_schemas=extra_action_schemas,
         )
         self._max_iterations = max_iterations
         self._output_dir = Path(output_dir)
@@ -546,6 +586,9 @@ class Agent:
         activated_skills: dict[str, dict[str, Any]],
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        if decision.tool == _SPAWN_SUBAGENT_TOOL_NAME:
+            return self._handle_spawn_subagent(decision=decision, current_plan=current_plan)
+
         if decision.tool in _CONTROL_TOOL_NAMES:
             return self._handle_control_decision(
                 decision=decision,
@@ -716,6 +759,230 @@ class Agent:
 
     def _execute_tool(self, decision: ToolCall) -> ToolResult:
         return self._tools.execute(decision)
+
+    def _handle_spawn_subagent(
+        self,
+        *,
+        decision: ToolCall,
+        current_plan: Any,
+    ) -> dict[str, Any]:
+        args = decision.args if isinstance(decision.args, dict) else {}
+        if not self._subagents_enabled:
+            return self._emit_subagent_observation(
+                args=args,
+                envelope={
+                    "success": False,
+                    "status": "disabled",
+                    "reason": (
+                        "subagents are disabled; both tools.spawn_subagent and "
+                        "subagents.enabled must be true."
+                    ),
+                },
+                plan=current_plan,
+            )
+
+        request, error = self._build_subagent_request(args)
+        if request is None:
+            return self._emit_subagent_observation(
+                args=args,
+                envelope={
+                    "success": False,
+                    "status": "invalid_request",
+                    "reason": error or "invalid spawn_subagent request.",
+                },
+                plan=current_plan,
+            )
+
+        if self._subagent_runner is None:
+            return self._emit_subagent_observation(
+                args=args,
+                envelope={
+                    "success": False,
+                    "status": "child_failed",
+                    "reason": "subagent runtime is not available in this sandbox.",
+                },
+                plan=current_plan,
+            )
+
+        try:
+            envelope = self._subagent_runner.run(request)
+        except Exception as exc:  # child failures are observations, never parent crashes
+            envelope = {"success": False, "status": "child_failed", "reason": str(exc)}
+        return self._emit_subagent_observation(args=args, envelope=envelope, plan=current_plan)
+
+    def _build_subagent_request(
+        self,
+        args: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        task = args.get("task")
+        if not isinstance(task, str) or not task.strip():
+            return None, "spawn_subagent requires args.task as a non-empty string."
+
+        context = args.get("context", "")
+        if context is None:
+            context = ""
+        if not isinstance(context, str):
+            return None, "spawn_subagent args.context must be a string when provided."
+
+        expected_output = args.get("expected_output", "")
+        if expected_output is None:
+            expected_output = ""
+        if not isinstance(expected_output, str):
+            return None, "spawn_subagent args.expected_output must be a string when provided."
+
+        allowed_tools, allowed_error = self._validate_subagent_allowed_tools(
+            args.get("allowed_tools")
+        )
+        if allowed_error is not None:
+            return None, allowed_error
+
+        referenced_skills, skills_error = self._validate_subagent_referenced_skills(
+            args.get("referenced_skills")
+        )
+        if skills_error is not None:
+            return None, skills_error
+
+        max_iterations, iter_error = self._clamp_subagent_int(
+            args.get("max_iterations"),
+            cap=_read_pos_int_field(self._subagents_settings, "max_iterations", 20),
+            field="max_iterations",
+        )
+        if iter_error is not None:
+            return None, iter_error
+
+        timeout_seconds, timeout_error = self._clamp_subagent_int(
+            args.get("timeout_seconds"),
+            cap=_read_pos_int_field(self._subagents_settings, "timeout_seconds", 600),
+            field="timeout_seconds",
+        )
+        if timeout_error is not None:
+            return None, timeout_error
+
+        max_context_chars = _read_pos_int_field(
+            self._subagents_settings, "max_context_chars", 20000
+        )
+        return {
+            "task": task.strip(),
+            "context": _truncate_to(context, max_context_chars),
+            "expected_output": expected_output,
+            "allowed_tools": allowed_tools,
+            "referenced_skills": referenced_skills,
+            "max_iterations": max_iterations,
+            "timeout_seconds": timeout_seconds,
+        }, None
+
+    def _validate_subagent_allowed_tools(
+        self,
+        raw: Any,
+    ) -> tuple[list[str] | None, str | None]:
+        parent_tools = set(self._tools.list_enabled())
+        if raw is None:
+            return sorted(parent_tools), None
+        if not isinstance(raw, list):
+            return None, "spawn_subagent args.allowed_tools must be an array of tool names."
+        result: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                return None, "spawn_subagent args.allowed_tools must contain only tool names."
+            name = entry.strip()
+            if name == _SPAWN_SUBAGENT_TOOL_NAME:
+                return None, "spawn_subagent cannot be delegated to a child (no recursion)."
+            if name not in parent_tools:
+                return None, (
+                    "spawn_subagent args.allowed_tools includes a tool not enabled for "
+                    f"the parent: {name}."
+                )
+            if name not in result:
+                result.append(name)
+        return sorted(result), None
+
+    def _validate_subagent_referenced_skills(
+        self,
+        raw: Any,
+    ) -> tuple[list[str] | None, str | None]:
+        if raw is None:
+            return [], None
+        if not isinstance(raw, list):
+            return None, "spawn_subagent args.referenced_skills must be an array of skill names."
+        result: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                return None, (
+                    "spawn_subagent args.referenced_skills must contain only skill names."
+                )
+            name = entry.strip()
+            if name not in result:
+                result.append(name)
+        return result, None
+
+    def _clamp_subagent_int(
+        self,
+        raw: Any,
+        *,
+        cap: int,
+        field: str,
+    ) -> tuple[int | None, str | None]:
+        if raw is None:
+            return cap, None
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None, f"spawn_subagent args.{field} must be a positive integer when provided."
+        if raw <= 0:
+            return None, f"spawn_subagent args.{field} must be a positive integer when provided."
+        return min(raw, cap), None
+
+    def _emit_subagent_observation(
+        self,
+        *,
+        args: dict[str, Any],
+        envelope: dict[str, Any],
+        plan: Any,
+    ) -> dict[str, Any]:
+        shaped = self._shape_subagent_envelope(envelope)
+        wrapped = wrap_external_data(shaped)
+        result = ToolResult(
+            exit_code=0 if bool(envelope.get("success")) else 1,
+            stdout=wrapped,
+            stderr="",
+        )
+        action_event = {
+            "type": "action",
+            "tool": _SPAWN_SUBAGENT_TOOL_NAME,
+            "args": dict(args),
+            "result": asdict(result),
+        }
+        self._send(action_event)
+        return {"done": False, "plan": plan, "observation": action_event}
+
+    def _shape_subagent_envelope(self, envelope: Any) -> dict[str, Any]:
+        """Reduce a child result envelope to the bounded view the parent observes."""
+        if not isinstance(envelope, dict):
+            return {
+                "success": False,
+                "status": "child_failed",
+                "reason": "subagent returned an invalid result.",
+            }
+        limit = _read_pos_int_field(self._subagents_settings, "max_result_chars", 20000)
+        shaped: dict[str, Any] = {
+            "success": bool(envelope.get("success")),
+            "status": str(envelope.get("status", "child_failed")),
+        }
+        for key in ("reason", "reply", "state_summary"):
+            if key in envelope and envelope.get(key) is not None:
+                shaped[key] = _truncate_to(str(envelope.get(key)), limit)
+        files = envelope.get("files")
+        if isinstance(files, list):
+            shaped["files"] = [
+                {
+                    "path": str(item.get("path", "")),
+                    "size_bytes": int(item.get("size_bytes", 0) or 0),
+                }
+                for item in files
+                if isinstance(item, dict)
+            ]
+        events = envelope.get("events_summary")
+        if isinstance(events, list):
+            shaped["events_summary"] = events[:_SUBAGENT_EVENTS_SUMMARY_MAX]
+        return shaped
 
     def _emit_control_action_error(
         self,
@@ -942,10 +1209,12 @@ def _first_json_object_or_array(text: str) -> dict[str, Any] | list[Any] | None:
 
 def _build_execution_action_surface(
     capability_tool_schemas: list[dict[str, Any]],
+    *,
+    extra_schemas: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     surface: list[dict[str, Any]] = []
     seen_names: set[str] = set()
-    for schema in [*capability_tool_schemas, *_CONTROL_TOOL_SCHEMAS]:
+    for schema in [*capability_tool_schemas, *_CONTROL_TOOL_SCHEMAS, *(extra_schemas or [])]:
         name_raw = schema.get("name")
         params = schema.get("parameters")
         if not isinstance(name_raw, str) or not name_raw.strip():
@@ -1041,6 +1310,47 @@ def _read_context_int(agent_config: dict[str, Any], key: str, *, fallback: int) 
     if value <= 0:
         return fallback
     return value
+
+
+def _read_subagents_settings(agent_config: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(agent_config, dict):
+        return {}
+    settings = agent_config.get("subagents")
+    return dict(settings) if isinstance(settings, dict) else {}
+
+
+def _read_subagents_enabled(agent_config: dict[str, Any] | None) -> bool:
+    if not isinstance(agent_config, dict):
+        return False
+    tools_cfg = agent_config.get("tools")
+    spawn_toggle = (
+        bool(tools_cfg.get("spawn_subagent", False)) if isinstance(tools_cfg, dict) else False
+    )
+    subagents_cfg = agent_config.get("subagents")
+    if isinstance(subagents_cfg, dict):
+        enabled = bool(subagents_cfg.get("enabled", False))
+    else:
+        enabled = False
+    return spawn_toggle and enabled
+
+
+def _read_pos_int_field(mapping: dict[str, Any], key: str, fallback: int) -> int:
+    if not isinstance(mapping, dict):
+        return fallback
+    raw = mapping.get(key, fallback)
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if value > 0 else fallback
+
+
+def _truncate_to(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[truncated {len(text) - limit} chars]..."
 
 
 def _read_host_service_llm_timeout(agent_config: dict[str, Any]) -> float:

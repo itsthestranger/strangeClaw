@@ -246,7 +246,7 @@ class Tools:
             )
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
-        wrapped = _wrap_external_data(result)
+        wrapped = wrap_external_data(result)
         success = result.get("success")
         if success is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
@@ -272,7 +272,7 @@ class Tools:
             result = self._broker.call("broker", {"action": "web_fetch", "url": url.strip()})
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
-        wrapped = _wrap_external_data(result)
+        wrapped = wrap_external_data(result)
         success = result.get("success")
         if success is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
@@ -369,7 +369,7 @@ class Tools:
                 stderr="invalid broker response for http_request: missing success envelope.",
             )
         result_payload = dict(result)
-        wrapped = _wrap_external_data(result_payload)
+        wrapped = wrap_external_data(result_payload)
         if result_payload.get("success") is False:
             return ToolResult(exit_code=1, stdout=wrapped, stderr="")
         return ToolResult(exit_code=0, stdout=wrapped, stderr="")
@@ -401,6 +401,6 @@ def _truncate_output(text: str, *, chunk_size: int = _OUTPUT_CHUNK_SIZE) -> str:
     )
 
 
-def _wrap_external_data(payload: dict[str, Any]) -> str:
+def wrap_external_data(payload: dict[str, Any]) -> str:
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     return f"--- BEGIN DATA ---\n{body}\n--- END DATA ---"
