@@ -13,7 +13,7 @@ import yaml
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 LOGGER = logging.getLogger(__name__)
-_KNOWN_TOOL_NAMES = {"shell", "web_search", "web_fetch", "http_request"}
+_KNOWN_TOOL_NAMES = {"shell", "web_search", "web_fetch", "http_request", "spawn_subagent"}
 
 REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("mode",),
@@ -130,6 +130,7 @@ def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_legacy_integrations_field(config)
     _validate_llm_optional_fields(config)
     _validate_coordinator_optional_fields(config)
+    _validate_subagents_optional_fields(config)
     _validate_tools_optional_fields(config)
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
@@ -189,6 +190,66 @@ def _validate_coordinator_optional_fields(config: dict[str, Any]) -> None:
     coordinator_section["max_active_sessions"] = max_active_sessions
 
 
+def _validate_subagents_optional_fields(config: dict[str, Any]) -> None:
+    defaults: dict[str, Any] = {
+        "enabled": False,
+        "max_children_per_task": 3,
+        "max_iterations": 20,
+        "timeout_seconds": 600,
+        "max_context_chars": 20000,
+        "max_result_chars": 20000,
+        "max_files_bytes": 10 * 1024 * 1024,
+        "journal_events": "summary",
+    }
+    section = config.get("subagents")
+    if section is None:
+        config["subagents"] = dict(defaults)
+        return
+    if not isinstance(section, dict):
+        raise ConfigError("Config field subagents must be a mapping.")
+
+    enabled = section.get("enabled", defaults["enabled"])
+    if not isinstance(enabled, bool):
+        raise ConfigError("Config field subagents.enabled must be a boolean.")
+
+    normalized: dict[str, Any] = {"enabled": enabled}
+    for key in (
+        "max_children_per_task",
+        "max_iterations",
+        "timeout_seconds",
+        "max_context_chars",
+        "max_result_chars",
+        "max_files_bytes",
+    ):
+        normalized[key] = _require_positive_int(
+            section.get(key, defaults[key]), f"subagents.{key}"
+        )
+
+    journal_events_raw = section.get("journal_events", defaults["journal_events"])
+    if not isinstance(journal_events_raw, str):
+        raise ConfigError("Config field subagents.journal_events must be a string.")
+    journal_events = journal_events_raw.strip().lower()
+    if journal_events not in {"none", "summary", "full"}:
+        raise ConfigError(
+            "Config field subagents.journal_events must be one of: none, summary, full."
+        )
+    normalized["journal_events"] = journal_events
+
+    config["subagents"] = normalized
+
+
+def _require_positive_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ConfigError(f"Config field {field_name} must be an integer.")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Config field {field_name} must be an integer.") from exc
+    if result <= 0:
+        raise ConfigError(f"Config field {field_name} must be greater than zero.")
+    return result
+
+
 def _validate_tools_optional_fields(config: dict[str, Any]) -> None:
     tools_section = config.get("tools")
     default_tools = {
@@ -196,6 +257,7 @@ def _validate_tools_optional_fields(config: dict[str, Any]) -> None:
         "web_search": True,
         "web_fetch": True,
         "http_request": True,
+        "spawn_subagent": False,
     }
     if tools_section is None:
         config["tools"] = default_tools

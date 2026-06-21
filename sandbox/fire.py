@@ -1658,6 +1658,9 @@ def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
     context = payload.get("context")
     if context is not None and not isinstance(context, Mapping):
         raise FirecrackerConfigError("config.context must be an object when provided.")
+    subagents = payload.get("subagents")
+    if subagents is not None and not isinstance(subagents, Mapping):
+        raise FirecrackerConfigError("config.subagents must be an object when provided.")
     host_services = payload.get("host_services")
     if host_services is not None:
         if not isinstance(host_services, Mapping):
@@ -1705,6 +1708,7 @@ def _coerce_agent_config_template(
                 "web_search": True,
                 "web_fetch": True,
                 "http_request": True,
+                "spawn_subagent": False,
             },
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
@@ -1719,6 +1723,16 @@ def _coerce_agent_config_template(
                 "token_budget": 4000,
                 "summary_threshold": 10,
                 "max_output_chars": 8000,
+            },
+            "subagents": {
+                "enabled": False,
+                "max_children_per_task": 3,
+                "max_iterations": 20,
+                "timeout_seconds": 600,
+                "max_context_chars": 20000,
+                "max_result_chars": 20000,
+                "max_files_bytes": 10 * 1024 * 1024,
+                "journal_events": "summary",
             },
             "host_services": {
                 "llm_timeout_seconds": 120,
@@ -1736,12 +1750,14 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
             name: bool(tools_raw.get(name, True))
             for name in ("shell", "web_search", "web_fetch", "http_request")
         }
+        tools["spawn_subagent"] = bool(tools_raw.get("spawn_subagent", False))
     else:
         tools = {
             "shell": True,
             "web_search": True,
             "web_fetch": True,
             "http_request": True,
+            "spawn_subagent": False,
         }
 
     web_search_raw = config.get("web_search")
@@ -1842,10 +1858,51 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         "approval_mode": approval_mode,
         "max_iterations": max_iterations,
         "context": context,
+        "subagents": _sanitize_subagents_for_mmds(config),
         "host_services": {"llm_timeout_seconds": llm_timeout_seconds},
     }
     _validate_agent_config_payload(payload)
     return payload
+
+
+def _sanitize_subagents_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Produce the non-secret subagent settings delivered to the guest via MMDS."""
+    raw = config.get("subagents")
+    src: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+
+    def _pos_int(key: str, default: int) -> int:
+        value = src.get(key, default)
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value if value > 0 else default
+        if isinstance(value, float):
+            candidate = int(value)
+            return candidate if candidate > 0 else default
+        if isinstance(value, str):
+            try:
+                candidate = int(value)
+            except ValueError:
+                return default
+            return candidate if candidate > 0 else default
+        return default
+
+    journal_raw = src.get("journal_events", "summary")
+    if isinstance(journal_raw, str) and journal_raw.strip().lower() in {"none", "summary", "full"}:
+        journal_events = journal_raw.strip().lower()
+    else:
+        journal_events = "summary"
+
+    return {
+        "enabled": bool(src.get("enabled", False)),
+        "max_children_per_task": _pos_int("max_children_per_task", 3),
+        "max_iterations": _pos_int("max_iterations", 20),
+        "timeout_seconds": _pos_int("timeout_seconds", 600),
+        "max_context_chars": _pos_int("max_context_chars", 20000),
+        "max_result_chars": _pos_int("max_result_chars", 20000),
+        "max_files_bytes": _pos_int("max_files_bytes", 10 * 1024 * 1024),
+        "journal_events": journal_events,
+    }
 
 
 def _assert_no_secrets(

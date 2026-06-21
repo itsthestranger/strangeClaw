@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,17 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
         "web_search": True,
         "web_fetch": True,
         "http_request": True,
+        "spawn_subagent": False,
+    }
+    assert loaded["subagents"] == {
+        "enabled": False,
+        "max_children_per_task": 3,
+        "max_iterations": 20,
+        "timeout_seconds": 600,
+        "max_context_chars": 20000,
+        "max_result_chars": 20000,
+        "max_files_bytes": 10 * 1024 * 1024,
+        "journal_events": "summary",
     }
     assert loaded["web_search"] == {
         "endpoint": "https://api.search.brave.com/res/v1/web/search",
@@ -416,3 +428,99 @@ def test_load_config_rejects_invalid_session_journal_fields(tmp_path: Path) -> N
     _write_config(config_path, config)
     with pytest.raises(ConfigError, match=r"session_journal\.max_bytes"):
         load_config(config_path)
+
+
+def test_load_config_subagents_overrides(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["tools"] = {"shell": True, "spawn_subagent": True}
+    config["subagents"] = {
+        "enabled": True,
+        "max_children_per_task": 1,
+        "max_iterations": 5,
+        "timeout_seconds": 30,
+        "max_context_chars": 1000,
+        "max_result_chars": 2000,
+        "max_files_bytes": 4096,
+        "journal_events": "FULL",
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["tools"]["spawn_subagent"] is True
+    assert loaded["subagents"] == {
+        "enabled": True,
+        "max_children_per_task": 1,
+        "max_iterations": 5,
+        "timeout_seconds": 30,
+        "max_context_chars": 1000,
+        "max_result_chars": 2000,
+        "max_files_bytes": 4096,
+        "journal_events": "full",
+    }
+
+
+def test_load_config_spawn_subagent_defaults_false_when_tools_present(tmp_path: Path) -> None:
+    config = _base_config(api_key="plain-key")
+    config["tools"] = {"shell": True}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["tools"]["spawn_subagent"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "pattern"),
+    [
+        ("enabled", "yes", r"subagents\.enabled"),
+        ("max_children_per_task", 0, r"subagents\.max_children_per_task"),
+        ("max_iterations", True, r"subagents\.max_iterations"),
+        ("timeout_seconds", -1, r"subagents\.timeout_seconds"),
+        ("max_files_bytes", "huge", r"subagents\.max_files_bytes"),
+        ("journal_events", "verbose", r"subagents\.journal_events"),
+    ],
+)
+def test_load_config_rejects_invalid_subagents_fields(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    pattern: str,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["subagents"] = {field: value}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=pattern):
+        load_config(config_path)
+
+
+def test_fire_mmds_payload_includes_subagent_settings_and_no_secrets(tmp_path: Path) -> None:
+    from sandbox.fire import _sanitize_agent_config_for_mmds
+
+    config = _base_config(api_key="super-secret-llm-key")
+    config["tools"] = {"shell": True, "spawn_subagent": True}
+    config["subagents"] = {"enabled": True, "max_iterations": 7}
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+    fire_payload = _sanitize_agent_config_for_mmds(loaded)
+
+    assert fire_payload["tools"]["spawn_subagent"] is True
+    assert fire_payload["subagents"] == {
+        "enabled": True,
+        "max_children_per_task": 3,
+        "max_iterations": 7,
+        "timeout_seconds": 600,
+        "max_context_chars": 20000,
+        "max_result_chars": 20000,
+        "max_files_bytes": 10 * 1024 * 1024,
+        "journal_events": "summary",
+    }
+    # No credential or LLM provider material is delivered to the guest.
+    assert "llm" not in fire_payload
+    assert "super-secret-llm-key" not in json.dumps(fire_payload)

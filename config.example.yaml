@@ -47,6 +47,7 @@ tools:
   web_search: true              # Low risk: search endpoint queries
   web_fetch: true               # Low risk: URL retrieval (raw HTTP response)
   http_request: true            # Medium risk: arbitrary HTTP API calls
+  spawn_subagent: false         # Orchestration: delegate a subtask to a child agent
 
 web_search:
   # Quick-start: Brave API endpoint.
@@ -88,6 +89,20 @@ loop:
 
 coordinator:
   max_active_sessions: 8       # global active-session cap (Fire counts active sandboxes)
+
+subagents:
+  # Sequential in-VM subagents. Disabled by default. Both subagents.enabled and
+  # tools.spawn_subagent must be true before the parent can delegate to a child.
+  # Children run in the same VM/session, use a subset of the parent's tools,
+  # are non-interactive (no clarification channel), and one runs at a time.
+  enabled: false
+  max_children_per_task: 3     # max children the parent may spawn per task
+  max_iterations: 20           # child loop iteration cap
+  timeout_seconds: 600         # child budget (enforced at iteration boundaries)
+  max_context_chars: 20000     # cap on parent-supplied child context
+  max_result_chars: 20000      # cap on the child report returned to the parent
+  max_files_bytes: 10485760    # cap on total child output file bytes
+  journal_events: summary      # none | summary | full
 
 session_journal:
   enabled: false               # write per-session events.jsonl when true
