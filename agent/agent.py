@@ -1212,7 +1212,7 @@ class Agent:
                 "activated_skills": activated_skills,
                 "history_summary": summary,
                 "recent_history": recent_history,
-                "output_instruction": "Place any files for the user in /output/.",
+                "output_instruction": f"Place any files for the user in {self._output_dir}/.",
             }
             messages = [
                 {

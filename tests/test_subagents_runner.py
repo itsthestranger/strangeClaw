@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import shlex
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import agent.subagents as subagents_module
 from agent.agent import Agent
 from agent.llm_types import LLMResponse, ToolCall
 from agent.subagents import SubagentRunner
@@ -164,6 +169,114 @@ def test_compose_goal_includes_context_and_expected_output(tmp_path: Path) -> No
     assert "background info" in goal
     assert "a summary" in goal
     assert "web-research" in goal
+
+
+def _fix_child_id(monkeypatch: pytest.MonkeyPatch) -> str:
+    fixed = uuid.UUID("00000000-0000-4000-8000-0000000abcde")
+    monkeypatch.setattr(subagents_module.uuid, "uuid4", lambda: fixed)
+    return fixed.hex[:12]
+
+
+def _shell(command: str) -> LLMResponse:
+    return LLMResponse(text="", action=ToolCall(tool="shell", args={"command": command}))
+
+
+def _done(reply: str = "done") -> LLMResponse:
+    return LLMResponse(text="", action=ToolCall(tool="agent_done", args={"reply": reply}))
+
+
+def test_runner_returns_child_files_with_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_id = _fix_child_id(monkeypatch)
+    out_file = tmp_path / "output" / "subagents" / child_id / "report.txt"
+    llm = _ScriptedLLM(
+        [_plan(), _shell(f"printf hello > {shlex.quote(str(out_file))}"), _done()]
+    )
+    runner = _make_runner(llm, tmp_path)
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["status"] == "completed"
+    assert [f["path"] for f in envelope["files"]] == [f"subagents/{child_id}/report.txt"]
+
+
+def test_runner_excludes_files_outside_child_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fix_child_id(monkeypatch)
+    outside = tmp_path / "outside.txt"
+    llm = _ScriptedLLM(
+        [_plan(), _shell(f"printf leak > {shlex.quote(str(outside))}"), _done()]
+    )
+    runner = _make_runner(llm, tmp_path)
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["status"] == "completed"
+    assert envelope["files"] == []
+
+
+def test_runner_skips_symlinked_child_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_id = _fix_child_id(monkeypatch)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    link = tmp_path / "output" / "subagents" / child_id / "link.txt"
+    llm = _ScriptedLLM(
+        [
+            _plan(),
+            _shell(f"ln -s {shlex.quote(str(secret))} {shlex.quote(str(link))}"),
+            _done(),
+        ]
+    )
+    runner = _make_runner(llm, tmp_path)
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    # A symlink that escapes the child dir is skipped, never exported.
+    assert envelope["files"] == []
+
+
+def test_runner_oversized_child_output_is_bounded_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_id = _fix_child_id(monkeypatch)
+    big = tmp_path / "output" / "subagents" / child_id / "big.bin"
+    llm = _ScriptedLLM(
+        [_plan(), _shell(f"printf 0123456789abcdef > {shlex.quote(str(big))}"), _done()]
+    )
+    runner = _make_runner(
+        llm,
+        tmp_path,
+        limits={"max_iterations": 5, "timeout_seconds": 600, "max_files_bytes": 8},
+    )
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["success"] is False
+    assert envelope["status"] == "child_failed"
+    assert "exceeds output limit" in envelope["reply"]
+
+
+def test_child_output_instruction_points_at_child_dir(tmp_path: Path) -> None:
+    _host, agent_transport = InProcessTransport.pair()
+    child_dir = tmp_path / "output" / "subagents" / "c1"
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config={"llm": {"model": "f", "api_key": "k"}},
+        output_dir=str(child_dir),
+        llm_runtime=_ScriptedLLM([]),
+    )
+
+    messages = agent.build_execution_prompt(
+        goal="g", plan={"steps": []}, history=[], activated_skills={}
+    )
+    payload = json.loads(messages[1]["content"])
+
+    assert str(child_dir) in payload["output_instruction"]
 
 
 def test_collect_child_files_prefixes_paths() -> None:

@@ -66,6 +66,7 @@ class SubagentRunner:
         timeout_seconds = float(
             request.get("timeout_seconds") or self._limits.get("timeout_seconds", 600)
         )
+        max_files_bytes = int(self._limits.get("max_files_bytes") or 10 * 1024 * 1024)
 
         host_transport, agent_transport = InProcessTransport.pair()
         child = Agent(
@@ -74,6 +75,7 @@ class SubagentRunner:
             agent_config=self._build_child_config(request, max_iterations),
             max_iterations=max_iterations,
             output_dir=str(child_output_dir),
+            max_output_total_bytes=max_files_bytes,
             llm_runtime=self._llm_runtime,
             broker=self._broker,
             clarify_enabled=False,
