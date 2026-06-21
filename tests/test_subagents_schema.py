@@ -231,6 +231,48 @@ def test_max_children_per_task_cap_blocks_further_spawns() -> None:
     assert len(runner.requests) == 2  # the blocked spawn never reaches the runner
 
 
+def test_clarify_present_for_parent_by_default() -> None:
+    # Top-level agents keep clarify (clarify_enabled defaults to True).
+    assert "agent_clarify" in _surface_names(_make_agent(_config(gates_on=False)))
+
+
+def test_clarify_excluded_from_child_action_surface() -> None:
+    _host, agent_transport = InProcessTransport.pair()
+    child = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config=_config(gates_on=False),
+        llm_runtime=_NullLLM(),
+        clarify_enabled=False,
+    )
+    assert "agent_clarify" not in [s["name"] for s in child._execution_action_surface]
+
+
+def test_child_clarify_degrades_to_decision_error_without_blocking() -> None:
+    _host, agent_transport = InProcessTransport.pair()
+    child = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config=_config(gates_on=False),
+        llm_runtime=_NullLLM(),
+        clarify_enabled=False,
+    )
+    outcome = child._handle_control_decision(
+        decision=ToolCall(tool="agent_clarify", args={"question": "what?"}),
+        control_tool="agent_clarify",
+        goal="g",
+        approval_mode="auto",
+        current_plan={"steps": []},
+        activated_skills={},
+        history=[],
+    )
+    observation = outcome["observation"]
+    assert outcome["done"] is False
+    assert observation["tool"] == "agent_clarify"
+    assert observation["result"]["exit_code"] == 1
+    assert "clarification is unavailable" in observation["result"]["stderr"]
+
+
 def test_runner_exception_becomes_child_failed_observation() -> None:
     class _BoomRunner:
         def run(self, request: dict[str, Any]) -> dict[str, Any]:

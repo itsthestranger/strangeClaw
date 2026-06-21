@@ -260,6 +260,21 @@ def test_runner_oversized_child_output_is_bounded_failure(
     assert "exceeds output limit" in envelope["reply"]
 
 
+def test_child_clarify_degrades_and_child_still_completes(tmp_path: Path) -> None:
+    # A child that tries to clarify must not block on a (nonexistent) user reply;
+    # the stray clarify degrades to a decision error and the child carries on.
+    clarify = LLMResponse(text="", action=ToolCall(tool="agent_clarify", args={"question": "?"}))
+    llm = _ScriptedLLM([_plan(), clarify, _done("finished without asking")])
+    runner = _make_runner(llm, tmp_path)
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["status"] == "completed"
+    assert envelope["reply"] == "finished without asking"
+    clarify_entries = [e for e in envelope["events_summary"] if e["tool"] == "agent_clarify"]
+    assert clarify_entries and clarify_entries[0]["exit_code"] == 1
+
+
 def test_child_output_instruction_points_at_child_dir(tmp_path: Path) -> None:
     _host, agent_transport = InProcessTransport.pair()
     child_dir = tmp_path / "output" / "subagents" / "c1"
