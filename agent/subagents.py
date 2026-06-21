@@ -17,6 +17,7 @@ returns without emitting a `done`, and the runner maps a missing `done` to a
 
 from __future__ import annotations
 
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,7 @@ class SubagentRunner:
             "approval_mode": "auto",
         }
 
+        started = time.monotonic()
         try:
             host_transport.send(task_event)
             child.run()
@@ -97,8 +99,9 @@ class SubagentRunner:
         finally:
             host_transport.close()
             agent_transport.close()
+        duration = time.monotonic() - started
 
-        return self._build_envelope(child_id=child_id, events=events)
+        return self._build_envelope(child_id=child_id, events=events, duration=duration)
 
     def _build_child_config(self, request: dict[str, Any], max_iterations: int) -> dict[str, Any]:
         allowed = {
@@ -151,42 +154,47 @@ class SubagentRunner:
         *,
         child_id: str,
         events: list[dict[str, Any]],
+        duration: float,
     ) -> dict[str, Any]:
         done: dict[str, Any] | None = None
         for event in events:
             if event.get("type") == "done":
                 done = event
-        events_summary = self._summarize_events(events)
-        files = self._collect_child_files(child_id, done)
+        mode = str(self._limits.get("journal_events", "summary")).lower()
+        if mode not in {"none", "summary", "full"}:
+            mode = "summary"
+        base: dict[str, Any] = {
+            "child_id": child_id,
+            "duration_seconds": round(duration, 3),
+            "files": self._collect_child_files(child_id, done),
+            "events_summary": self._summarize_events(events, mode),
+        }
 
         if done is None:
             # The child loop returns without a done event only when it reaches its
             # time budget at an iteration boundary (Agent._run_task).
             return {
+                **base,
                 "success": False,
                 "status": "timeout",
                 "reply": "Subagent exceeded its time budget before finishing.",
                 "state_summary": "",
-                "files": files,
-                "events_summary": events_summary,
             }
         if bool(done.get("success")):
             return {
+                **base,
                 "success": True,
                 "status": "completed",
                 "reply": str(done.get("reply", "")),
                 "state_summary": self._state_summary(done),
-                "files": files,
-                "events_summary": events_summary,
             }
         status = "max_iterations" if done.get("reply") == MAX_ITERATIONS_REPLY else "child_failed"
         return {
+            **base,
             "success": False,
             "status": status,
             "reply": str(done.get("reply", "")),
             "state_summary": self._state_summary(done),
-            "files": files,
-            "events_summary": events_summary,
         }
 
     @staticmethod
@@ -199,14 +207,34 @@ class SubagentRunner:
         return ""
 
     @staticmethod
-    def _summarize_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _summarize_events(events: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+        """Bounded child-event summary for the observation and journal.
+
+        ``none`` omits per-event detail; ``summary`` lists tool calls and exit
+        codes; ``full`` lists every captured event's type/role/tool (still without
+        payloads, so it stays size-bounded). All modes are capped.
+        """
+        if mode == "none":
+            return []
         summary: list[dict[str, Any]] = []
         for event in events:
-            if event.get("type") != "action":
+            event_type = event.get("type")
+            if mode == "summary":
+                if event_type != "action":
+                    continue
+                result = event.get("result")
+                exit_code = result.get("exit_code") if isinstance(result, dict) else None
+                summary.append({"tool": event.get("tool"), "exit_code": exit_code})
                 continue
-            result = event.get("result")
-            exit_code = result.get("exit_code") if isinstance(result, dict) else None
-            summary.append({"tool": event.get("tool"), "exit_code": exit_code})
+            entry: dict[str, Any] = {"type": event_type}
+            if event_type == "action":
+                entry["tool"] = event.get("tool")
+                result = event.get("result")
+                if isinstance(result, dict):
+                    entry["exit_code"] = result.get("exit_code")
+            elif event_type == "message":
+                entry["role"] = event.get("role")
+            summary.append(entry)
         return summary[-_EVENTS_SUMMARY_CAP:]
 
     @staticmethod

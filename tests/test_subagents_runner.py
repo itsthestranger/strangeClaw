@@ -294,6 +294,48 @@ def test_child_output_instruction_points_at_child_dir(tmp_path: Path) -> None:
     assert str(child_dir) in payload["output_instruction"]
 
 
+def test_envelope_includes_child_id_and_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_id = _fix_child_id(monkeypatch)
+    runner = _make_runner(_ScriptedLLM([_plan(), _done()]), tmp_path)
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["child_id"] == child_id
+    assert isinstance(envelope["duration_seconds"], float)
+
+
+def test_journal_events_none_omits_events_summary(tmp_path: Path) -> None:
+    llm = _ScriptedLLM([_plan(), _shell("echo hi"), _done()])
+    runner = _make_runner(
+        llm,
+        tmp_path,
+        limits={"max_iterations": 5, "timeout_seconds": 600, "journal_events": "none"},
+    )
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    assert envelope["events_summary"] == []
+
+
+def test_journal_events_full_includes_event_types(tmp_path: Path) -> None:
+    llm = _ScriptedLLM([_plan(), _shell("echo hi"), _done()])
+    runner = _make_runner(
+        llm,
+        tmp_path,
+        limits={"max_iterations": 5, "timeout_seconds": 600, "journal_events": "full"},
+    )
+
+    envelope = runner.run(_request(max_iterations=5))
+
+    types = {entry.get("type") for entry in envelope["events_summary"]}
+    assert "message" in types  # the child's plan message is captured in full mode
+    assert "action" in types
+    # Still bounded: no raw payloads (stdout/content) are carried.
+    assert all("stdout" not in entry for entry in envelope["events_summary"])
+
+
 def test_collect_child_files_prefixes_paths() -> None:
     done = {"files": [{"path": "out.txt", "size_bytes": 3, "content_b64": "QUJD"}]}
     files = SubagentRunner._collect_child_files("abc123", done)

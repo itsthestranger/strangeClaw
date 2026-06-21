@@ -1044,6 +1044,10 @@ class Agent:
             "success": bool(envelope.get("success")),
             "status": str(envelope.get("status", "child_failed")),
         }
+        if envelope.get("child_id"):
+            shaped["child_id"] = str(envelope.get("child_id"))
+        if envelope.get("duration_seconds") is not None:
+            shaped["duration_seconds"] = envelope.get("duration_seconds")
         for key in ("reason", "reply", "state_summary"):
             if key in envelope and envelope.get(key) is not None:
                 shaped[key] = _truncate_to(str(envelope.get(key)), limit)
