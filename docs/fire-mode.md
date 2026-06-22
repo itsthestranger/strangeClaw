@@ -74,6 +74,22 @@ times out or returns an error, the proxy raises `LLMRuntimeError`; the agent
 turns that into an `agent_decision_error` observation, appends it to history, and
 lets the model decide the next step on a later turn.
 
+## Subagents
+
+When subagents are enabled, a child agent runs inside the **same** Firecracker VM
+and session as the parent. It shares the guest filesystem (so it can read files
+an earlier task or the parent created in the same session) and uses the **same**
+host-side broker and LLM proxy as the parent. This introduces no host
+credentials and no new host permissions: credential injection and LLM provider
+access stay host-only, exactly as for the parent.
+
+Children run one at a time, synchronously, so their broker and LLM calls use the
+same vsock host-services channel with never more than one outstanding request.
+`broker_request`/`broker_response` events and the child's internal events are not
+shown to adapters and are not written to session state. Non-secret `subagents`
+settings are delivered to the guest via MMDS; credentials and the LLM API key are
+not. See [Architecture](architecture.md#subagents) for the full model.
+
 ## Request Broker
 
 All authenticated API access goes through the host request broker. Credentials

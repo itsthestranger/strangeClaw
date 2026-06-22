@@ -119,6 +119,66 @@ uses already-enabled tools. Bundled files are loaded on demand through
 `agent_read_skill_file`; bundled scripts are only inert files until the model
 uses the `shell` tool to run them.
 
+## Subagents
+
+Subagents let the parent agent delegate a separable subtask to a child agent.
+They are opt-in and disabled by default.
+
+### What they are for
+
+In this release subagents are about **context economy and focus, not speed**.
+Because a child runs sequentially in the parent's thread, delegation is, if
+anything, slightly *slower* (the child does its own planning). The value comes
+from elsewhere:
+
+- Context-window economy: a child does its noisy work (many tool calls, large
+  tool outputs) in its own fresh context and returns only a compact result, so
+  the parent's history grows by one bounded observation instead of dozens of raw
+  outputs. This lets one agent take on larger tasks without its own context
+  collapsing into summaries.
+- Focus: a child gets a narrow goal, a tool subset, and specific skills, with no
+  distraction from the parent's broader history.
+- Least-privilege per subtask: a child can be handed exactly the tools a subtask
+  needs (for example, research with `web_fetch` but no `shell`), shrinking the
+  blast radius of that unit of work.
+- Disposable failure context: a child's dead ends stay in the child; the parent
+  sees one bounded result and can retry narrower or move on.
+
+It is not a speedup, and for tasks that are not context-heavy or separable it is
+pure overhead — which is why it is disabled by default. Parallel subagents (the
+actual speedup) are a future direction; the sequential design here is the safe
+foundation for them.
+
+### How they work
+
+- Capability, not a skill: `spawn_subagent` is an agent-dispatched capability
+  gated by two switches that must both be true — `tools.spawn_subagent` (the
+  model sees it) and `subagents.enabled` (the runtime runs it).
+- Sequential and blocking: one child runs at a time. The child runs
+  synchronously in the parent's thread, so the parent is suspended until the
+  child finishes and then observes one structured result. Parallelism is not
+  implemented yet.
+- Same sandbox and session: the child runs in the same Yolo process or Fire VM
+  as the parent and shares its filesystem, so it can read files an earlier task
+  or the parent created in the same session.
+- Subset-only permissions: a child may use only a subset of the parent's enabled
+  tools, can never gain a tool, integration, or credential the parent lacks, and
+  cannot spawn its own children (no recursion in this release).
+- Non-interactive: a child cannot ask the user anything. If it lacks
+  information it finishes and reports the gap in its reply; the parent decides
+  what to do next.
+- Isolated output: each child writes to `/output/subagents/<child_id>/`. The
+  parent receives the child's report and file metadata as a single observation,
+  and the child's internal events never reach adapters.
+- Shared credential boundary: the child uses the same host-side broker and, in
+  Fire mode, the same LLM proxy as the parent. No new credentials or host
+  permissions are introduced.
+
+Use subagents for separable investigation or implementation subtasks where a
+child can work in its own context and return a compact result. Keep each child's
+task and context explicit and minimal. Configuration fields are documented in
+[Configuration](configuration.md#subagents).
+
 ## Host Services
 
 Host services are request/response handlers reachable from the sandbox through

@@ -6,9 +6,9 @@ strangeClaw is a small autonomous agent built from scratch (no agent framework) 
 
 In **Fire mode**, the agent loop runs inside a Firecracker microVM with no host filesystem access and no secrets. When it needs an authenticated API call, the request goes to a **host-side broker** that checks policy, injects credentials, redacts the response, and hands back only the result. The agent observes denials instead of holding keys. Risky work stays inside the VM.
 
-> **Status:** Work in progress, not production-ready. It's a personal project, but a working one — Yolo mode, Fire mode, and the request broker all run today.
+> **Status:** Work in progress, not production-ready. It's a personal project, but a working one — Yolo mode, Fire mode, the request broker, and optional sequential subagents all run today.
 >
-> **Next up:** subagents.
+> **Next up:** parallel subagents.
 
 ## Why This Exists
 
@@ -66,8 +66,32 @@ HOST
 - Host-side LLM proxy in Fire mode, so LLM credentials stay off the guest.
 - Host-side request broker for `web_search`, `web_fetch`, and `http_request`.
 - Skills loaded from `skills/<name>/SKILL.md` using the Agent Skills format.
+- Optional sequential subagents: the agent can delegate a subtask to a child
+  agent in the same sandbox (disabled by default).
 - Per-session state, output files, optional event journals, and Fire runtime log
   export.
+
+## Subagents
+
+The agent can delegate a separable subtask to a child agent that runs in the
+same sandbox and returns a single result. Subagents are **disabled by default**
+and gated by two switches that must both be true:
+
+```yaml
+tools:
+  spawn_subagent: false   # the model can see the capability
+subagents:
+  enabled: false          # the runtime will run a child
+```
+
+Children run **sequentially** (one at a time, in the parent's thread), use only a
+**subset** of the parent's tools, cannot recurse, and cannot ask the user. In
+this release they help with **context economy and focus, not speed** — a child
+does noisy work in its own context and hands back a compact result, so the parent
+can take on larger tasks without its own context collapsing. Parallel subagents
+(the actual speedup) are future work. See
+[Architecture](docs/architecture.md#subagents) and
+[Configuration](docs/configuration.md#subagents).
 
 ## Quick Start
 
@@ -116,6 +140,7 @@ walkthrough.
   APIs.
 - Improve custom skill delivery in Fire mode without rebuilding the rootfs.
 - Add more adapters and better observability for session replay and debugging.
+- Parallel subagents, building on the current sequential foundation.
 
 ## License
 
