@@ -174,6 +174,9 @@ ip route replace default via "${REAL_GATEWAY}" dev "${MMDS_IFACE}"
 cat "${RESOLV_PATH}" > /etc/resolv.conf
 
 export PATH="/opt/strangeclaw/.venv/bin:${PATH}"
+# Unbuffered stdio so guest agent logs/tracebacks reach the serial console
+# (captured host-side) even if the process is killed before a buffer flush.
+export PYTHONUNBUFFERED=1
 cd /opt/strangeclaw
 log "Starting agent runtime"
-exec /opt/strangeclaw/.venv/bin/python -m agent.agent --vsock-port 5000
+exec /opt/strangeclaw/.venv/bin/python -u -m agent.agent --vsock-port 5000

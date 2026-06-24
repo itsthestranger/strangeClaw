@@ -239,7 +239,9 @@ class PopenProcess(Protocol):
 class PopenFactory(Protocol):
     """Factory for spawning Firecracker processes."""
 
-    def __call__(self, args: list[str]) -> PopenProcess: ...
+    def __call__(
+        self, args: list[str], *, console_path: str | None = None
+    ) -> PopenProcess: ...
 
 
 class ConnectedSocket(Protocol):
@@ -307,14 +309,31 @@ def _default_command_runner(args: list[str]) -> subprocess.CompletedProcess[str]
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-def _default_popen_factory(args: list[str]) -> PopenProcess:
-    return subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def _default_popen_factory(
+    args: list[str], *, console_path: str | None = None
+) -> PopenProcess:
+    # The guest serial console (console=ttyS0) is forwarded to Firecracker's
+    # stdout. Capturing it to a file is the only way to see guest-side failures
+    # (Python tracebacks, kernel panics, OOM) after the fact; otherwise they are
+    # lost to DEVNULL and the host only sees an opaque vsock disconnect.
+    stdout: Any = subprocess.DEVNULL
+    console_file = None
+    if console_path is not None:
+        console_file = open(console_path, "wb")  # noqa: SIM115 - fd is duped into the child
+        stdout = console_file
+    try:
+        return subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        # Popen has already duped the fd into the child; the parent copy is no
+        # longer needed and must not linger.
+        if console_file is not None:
+            console_file.close()
 
 
 def _default_unix_socket_factory() -> ConnectedSocket:
@@ -944,6 +963,7 @@ class FireSandbox:
         self._api_socket_path: Path | None = None
         self._vsock_uds_path: Path | None = None
         self._log_path: Path | None = None
+        self._console_log_path: Path | None = None
         self._session_temp_dir: Path | None = None
         self._rootfs_copy_path: Path | None = None
         self._session_id: str | None = None
@@ -1111,6 +1131,7 @@ class FireSandbox:
             self._api_socket_path = None
             self._vsock_uds_path = None
             self._log_path = None
+            self._console_log_path = None
             self._rootfs_copy_path = None
             self._session_id = None
             self._recv_buffer = ""
@@ -1152,11 +1173,14 @@ class FireSandbox:
                 if self._stopping:
                     return None
                 exit_code = self._process.poll() if self._process is not None else None
+                console = self._guest_console_diagnostics()
                 if exit_code is None:
-                    raise RuntimeError("Guest vsock connection closed unexpectedly.")
+                    raise RuntimeError(
+                        f"Guest vsock connection closed unexpectedly.{console}"
+                    )
                 raise RuntimeError(
                     "Guest vsock connection closed (firecracker exited with code "
-                    f"{exit_code})."
+                    f"{exit_code}).{console}"
                 )
 
             self._recv_buffer += chunk.decode("utf-8", errors="strict")
@@ -1209,6 +1233,7 @@ class FireSandbox:
         self._api_socket_path = self._session_temp_dir / "firecracker.socket"
         self._vsock_uds_path = self._session_temp_dir / "fire.vsock"
         self._log_path = self._session_temp_dir / "firecracker.log"
+        self._console_log_path = self._session_temp_dir / "console.log"
         self._rootfs_copy_path = self._session_temp_dir / "rootfs.ext4"
 
     def _copy_rootfs(self) -> None:
@@ -1236,7 +1261,8 @@ class FireSandbox:
             "--api-sock",
             str(self._api_socket_path),
         ]
-        self._process = self._popen_factory(args)
+        console_path = str(self._console_log_path) if self._console_log_path else None
+        self._process = self._popen_factory(args, console_path=console_path)
 
     def _wait_for_api_socket(self, *, timeout_seconds: float) -> None:
         if self._api_socket_path is None:
@@ -1409,9 +1435,36 @@ class FireSandbox:
         log_tail = self._read_log_tail_best_effort()
         if self._log_path is not None:
             parts.append(f"firecracker log tail: {self._redact_log_text(log_tail) or '<empty>'}")
+        console_tail = self._read_console_tail_best_effort(max_bytes=4096)
+        if console_tail:
+            parts.append(f"guest console tail: {self._redact_log_text(console_tail)}")
         if not parts:
             return ""
         return " | " + " | ".join(parts)
+
+    def _guest_console_diagnostics(self) -> str:
+        """Redacted tail of the guest serial console for runtime-failure messages."""
+        console_tail = self._read_console_tail_best_effort(max_bytes=4096)
+        if not console_tail:
+            return ""
+        return f" Guest console tail: {self._redact_log_text(console_tail)}"
+
+    def _read_console_tail_best_effort(self, *, max_bytes: int) -> str:
+        path = self._console_log_path
+        if max_bytes <= 0 or path is None or not path.exists():
+            return ""
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                to_read = min(size, max_bytes)
+                if to_read <= 0:
+                    return ""
+                handle.seek(-to_read, os.SEEK_END)
+                data = handle.read(to_read)
+        except Exception:
+            return ""
+        return data.decode("utf-8", errors="replace").strip()
 
     def _read_process_stderr_best_effort(self) -> str:
         process = self._process
@@ -1455,21 +1508,36 @@ class FireSandbox:
             return
         if self._session_id is None:
             return
-        log_tail = self._read_log_tail_bytes_best_effort(
-            max_bytes=self._firecracker_config.log_export_max_bytes
-        )
-        if not log_tail:
-            return
-
+        max_bytes = self._firecracker_config.log_export_max_bytes
         session_outputs_dir = (
             Path.home() / ".strangeclaw" / "sessions" / self._session_id / "outputs" / "system"
         )
-        session_outputs_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = session_outputs_dir / "firecracker.log.tail.txt"
-        redacted_text = self._redact_log_text(log_tail.decode("utf-8", errors="replace")).strip()
+
+        log_tail = self._read_log_tail_bytes_best_effort(max_bytes=max_bytes)
+        self._write_log_artifact(
+            session_outputs_dir=session_outputs_dir,
+            filename="firecracker.log.tail.txt",
+            raw=log_tail,
+        )
+
+        console_tail = self._read_console_tail_best_effort(max_bytes=max_bytes)
+        if console_tail:
+            self._write_log_artifact(
+                session_outputs_dir=session_outputs_dir,
+                filename="guest-console.tail.txt",
+                raw=console_tail.encode("utf-8"),
+            )
+
+    def _write_log_artifact(
+        self, *, session_outputs_dir: Path, filename: str, raw: bytes
+    ) -> None:
+        if not raw:
+            return
+        redacted_text = self._redact_log_text(raw.decode("utf-8", errors="replace")).strip()
         if not redacted_text:
             return
-        artifact_path.write_text(redacted_text + "\n", encoding="utf-8")
+        session_outputs_dir.mkdir(parents=True, exist_ok=True)
+        (session_outputs_dir / filename).write_text(redacted_text + "\n", encoding="utf-8")
 
     def _redact_log_text(self, text: str) -> str:
         redacted = text

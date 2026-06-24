@@ -172,6 +172,29 @@ def test_valid_request_delegates_to_runner_with_normalized_fields() -> None:
     assert request["timeout_seconds"] == 5  # under the cap, preserved
 
 
+def test_tiny_overrides_are_raised_to_the_floor() -> None:
+    # A child needs room to act AND report; max_iterations=1 can never finish,
+    # so it is raised to the floor instead of being passed through.
+    runner = _FakeRunner({"success": True, "status": "completed"})
+    agent = _make_agent(_config(), runner=runner)
+
+    _dispatch_spawn(agent, {"task": "t", "max_iterations": 1, "timeout_seconds": 1})
+
+    request = runner.requests[0]
+    assert request["max_iterations"] == 3
+    assert request["timeout_seconds"] == 3
+
+
+def test_floor_never_exceeds_configured_cap() -> None:
+    # If the operator caps iterations below the floor, the cap still wins.
+    runner = _FakeRunner({"success": True, "status": "completed"})
+    agent = _make_agent(_config(max_iterations=2), runner=runner)
+
+    _dispatch_spawn(agent, {"task": "t", "max_iterations": 1})
+
+    assert runner.requests[0]["max_iterations"] == 2
+
+
 def test_allowed_tools_defaults_to_parent_enabled_subset() -> None:
     runner = _FakeRunner({"success": True, "status": "completed"})
     agent = _make_agent(_config(), runner=runner)

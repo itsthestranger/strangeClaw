@@ -292,7 +292,12 @@ def test_yolo_subagent_timeout_then_parent_resumes(
         slow_call_index=2,
         slow_seconds=1.2,
     )
-    sandbox = _yolo_sandbox(llm, tmp_path)
+    # Cap the per-call timeout at 1s so the override floor (which would otherwise
+    # raise timeout_seconds to a safe minimum) is bounded down to the cap and the
+    # 1.2s sleep still trips the deadline.
+    config = _subagent_config()
+    config["subagents"]["timeout_seconds"] = 1
+    sandbox = _yolo_sandbox(llm, tmp_path, config)
     sandbox.run(_task())
     try:
         events = _collect_yolo(sandbox)

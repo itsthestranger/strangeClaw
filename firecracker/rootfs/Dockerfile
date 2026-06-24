@@ -30,7 +30,7 @@ WORKDIR /opt/strangeclaw
 # (agent/llm.py) is intentionally host-only and is not copied into the guest.
 RUN mkdir -p agent
 COPY agent/__init__.py agent/agent.py agent/broker_client.py agent/llm_proxy.py agent/llm_types.py \
-     agent/protocol.py agent/skills.py agent/tools.py agent/transport.py ./agent/
+     agent/protocol.py agent/skills.py agent/subagents.py agent/tools.py agent/transport.py ./agent/
 COPY skills ./skills
 COPY firecracker/rootfs/entrypoint.sh /tmp/entrypoint.sh
 

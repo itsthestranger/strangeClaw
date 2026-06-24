@@ -1791,3 +1791,53 @@ def test_agent_main_rejects_guest_llm_config(
                 str(config_path),
             ]
         )
+
+
+def test_unexpected_task_error_yields_clean_failed_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected (non-observation) error becomes a clean failed done.
+
+    Recoverable conditions are handled inside the loop as observations; this
+    covers the last-resort safety net for genuinely unexpected errors, which
+    must not kill the agent process or leave the host without a terminal event.
+    """
+
+    class _RaisingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self,
+            messages: list[dict[str, Any]],
+            action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
+        ) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(text='{"steps":["x"]}', action=None, usage=None)
+            raise RuntimeError("boom-unexpected")
+
+        def count_tokens(self, messages: list[dict[str, Any]]) -> int:
+            del messages
+            return 1
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        agent_config=_agent_config(),
+        llm_runtime=_RaisingLLM(),
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+
+    # The worker exits cleanly (no crash/hang) and the host gets a failed done.
+    assert worker.is_alive() is False
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["success"] is False
+    assert "Internal error: boom-unexpected" in done["reply"]

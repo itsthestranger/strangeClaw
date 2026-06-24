@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import faulthandler
 import json
+import logging
 import re
+import sys
 import time
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,6 +21,12 @@ from agent.llm_types import LLMResponse, LLMRuntime, LLMRuntimeError, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools, wrap_external_data
 from agent.transport import VsockTransport
+
+# Quiet by default: emits nothing unless a handler is configured. The Fire guest
+# entrypoint (`main`) configures it to stream INFO to stderr -> serial console,
+# so the host can see how far the loop got before a silent guest death. Yolo
+# constructs `Agent` directly and never configures this, so it stays silent.
+LOGGER = logging.getLogger(__name__)
 
 PLANNING_SYSTEM_PROMPT = (
     "You are strangeclaw, a self-hosted autonomous agent. "
@@ -115,6 +125,11 @@ _CONTROL_TOOL_NAMES = {schema["name"] for schema in _CONTROL_TOOL_SCHEMAS}
 
 _SPAWN_SUBAGENT_TOOL_NAME = "spawn_subagent"
 _SUBAGENT_EVENTS_SUMMARY_MAX = 50
+# A child needs at least one turn to act and one to report via agent_done; a
+# decision error can also cost a turn. Per-call overrides below this floor are
+# raised so a delegated child always has room to finish. Applied to both
+# max_iterations and timeout_seconds (seconds), bounded by the configured caps.
+_SUBAGENT_MIN_OVERRIDE = 3
 
 # Final reply emitted when the execution loop exhausts its iteration budget.
 # Shared so the subagent runner can map this outcome to a `max_iterations` status.
@@ -135,8 +150,23 @@ _SPAWN_SUBAGENT_SCHEMA: dict[str, Any] = {
             "expected_output": {"type": "string"},
             "allowed_tools": {"type": "array", "items": {"type": "string"}},
             "referenced_skills": {"type": "array", "items": {"type": "string"}},
-            "max_iterations": {"type": "integer"},
-            "timeout_seconds": {"type": "integer"},
+            "max_iterations": {
+                "type": "integer",
+                "description": (
+                    "Maximum decision turns the child may take, including the final "
+                    "agent_done turn that reports its result. Budget at least one turn "
+                    "per planned tool call plus one to report (so a search-and-report "
+                    "task needs 2+). Omit to use the configured default; very small "
+                    "values are raised to a safe floor."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": (
+                    "Wall-clock budget in seconds for the whole child run. Omit to use "
+                    "the configured default."
+                ),
+            },
         },
         "required": ["task"],
         "additionalProperties": False,
@@ -275,7 +305,7 @@ class Agent:
         task_event = self._wait_for_task_event()
         if task_event is None:
             return
-        self._run_task(task_event)
+        self._run_task_guarded(task_event)
 
     def run_forever(self) -> None:
         """Run tasks from transport input until a stop event arrives while idle."""
@@ -283,7 +313,32 @@ class Agent:
             task_event = self._wait_for_task_event()
             if task_event is None:
                 return
+            self._run_task_guarded(task_event)
+
+    def _run_task_guarded(self, task_event: dict[str, Any]) -> None:
+        """Run one task, converting any unexpected error into a clean failed done.
+
+        Expected, recoverable conditions (broker denials, child failures, LLM
+        runtime errors) are already handled inside the loop as observations. This
+        is a last-resort safety net for genuinely unexpected errors: it keeps the
+        agent process (and, in Fire mode, the session VM) alive and gives the host
+        a terminal `done` event instead of an opaque transport disconnect. The
+        full traceback is still logged for diagnosis.
+        """
+        try:
             self._run_task(task_event)
+        except Exception as exc:
+            LOGGER.exception("Unhandled error during task execution")
+            goal = str(task_event.get("text", "")) if isinstance(task_event, dict) else ""
+            self._send(
+                self._build_done_event(
+                    goal=goal,
+                    plan=None,
+                    history=[],
+                    success=False,
+                    reply=f"Internal error: {exc}",
+                )
+            )
 
     def _run_task(self, task_event: dict[str, Any]) -> None:
         """Run one task event using this agent instance."""
@@ -331,7 +386,13 @@ class Agent:
 
         # Strict Inspect -> Choose -> Act -> Observe -> Repeat loop.
         # Exactly one model-issued structured decision is required per turn.
-        for _ in range(self._max_iterations):
+        for iteration in range(self._max_iterations):
+            LOGGER.info(
+                "execution iteration %d/%d rss=%s",
+                iteration + 1,
+                self._max_iterations,
+                _format_self_rss(),
+            )
             if self._deadline is not None and time.monotonic() >= self._deadline:
                 # Time budget reached at an iteration boundary (a subagent timeout).
                 # Return without a done event; the caller (SubagentRunner) maps a
@@ -347,6 +408,7 @@ class Agent:
             if decision is None:
                 continue
 
+            LOGGER.info("decision tool=%s", decision.tool)
             outcome = self._act_on_decision(
                 decision=decision,
                 goal=goal,
@@ -864,10 +926,22 @@ class Agent:
             )
 
         self._subagent_children_spawned += 1
+        LOGGER.info(
+            "spawn_subagent: starting child %d/%d rss=%s",
+            self._subagent_children_spawned,
+            max_children,
+            _format_self_rss(),
+        )
         try:
             envelope = runner.run(request)
         except Exception as exc:  # child failures are observations, never parent crashes
+            LOGGER.warning("spawn_subagent: child raised: %s", exc)
             envelope = {"success": False, "status": "child_failed", "reason": str(exc)}
+        LOGGER.info(
+            "spawn_subagent: child returned status=%s rss=%s",
+            envelope.get("status") if isinstance(envelope, dict) else "?",
+            _format_self_rss(),
+        )
         return self._emit_subagent_observation(args=args, envelope=envelope, plan=current_plan)
 
     def _resolve_subagent_runner(self) -> SubagentRunnerProtocol | None:
@@ -924,6 +998,7 @@ class Agent:
             args.get("max_iterations"),
             cap=_read_pos_int_field(self._subagents_settings, "max_iterations", 20),
             field="max_iterations",
+            floor=_SUBAGENT_MIN_OVERRIDE,
         )
         if iter_error is not None:
             return None, iter_error
@@ -932,6 +1007,7 @@ class Agent:
             args.get("timeout_seconds"),
             cap=_read_pos_int_field(self._subagents_settings, "timeout_seconds", 600),
             field="timeout_seconds",
+            floor=_SUBAGENT_MIN_OVERRIDE,
         )
         if timeout_error is not None:
             return None, timeout_error
@@ -999,6 +1075,7 @@ class Agent:
         *,
         cap: int,
         field: str,
+        floor: int = 1,
     ) -> tuple[int | None, str | None]:
         if raw is None:
             return cap, None
@@ -1006,7 +1083,10 @@ class Agent:
             return None, f"spawn_subagent args.{field} must be a positive integer when provided."
         if raw <= 0:
             return None, f"spawn_subagent args.{field} must be a positive integer when provided."
-        return min(raw, cap), None
+        # Raise tiny overrides to the floor so a child can act and report, but
+        # never above the configured cap.
+        effective_floor = min(floor, cap)
+        return max(min(raw, cap), effective_floor), None
 
     def _emit_subagent_observation(
         self,
@@ -1453,6 +1533,18 @@ def _read_host_service_llm_timeout(agent_config: dict[str, Any]) -> float:
     return timeout
 
 
+def _format_self_rss() -> str:
+    """Best-effort resident-set size of this process, for OOM diagnostics."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        return "n/a"
+    return "n/a"
+
+
 def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
     serialized = json.dumps(messages, ensure_ascii=True, default=str)
     return max(1, len(serialized) // 4)
@@ -1507,6 +1599,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint for guest execution."""
+    # Guest-only observability: stream INFO logs to stderr (-> serial console,
+    # captured host-side) and dump a native traceback on fatal C-level signals
+    # (segfault, SIGABRT). This is the host's only window into a guest that dies
+    # without a Python-level exception.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="[agent] %(levelname)s %(name)s: %(message)s",
+    )
+    faulthandler.enable()
+
     args = _parse_args(argv)
     if args.vsock_port is None:
         raise ValueError("Missing required --vsock-port for guest execution.")
@@ -1539,7 +1642,17 @@ def main(argv: list[str] | None = None) -> None:
             llm_runtime=llm_runtime,
             broker=broker,
         )
-        agent.run_forever()
+        try:
+            agent.run_forever()
+        except BaseException:
+            # The guest serial console is the host's only window into a guest
+            # crash. Emit a clearly-marked, flushed traceback before the process
+            # dies and the vsock closes, so the host surfaces where it failed
+            # instead of an opaque "connection closed unexpectedly".
+            sys.stderr.write("=== STRANGECLAW GUEST FATAL ===\n")
+            traceback.print_exc()
+            sys.stderr.flush()
+            raise
     finally:
         transport.close()
 

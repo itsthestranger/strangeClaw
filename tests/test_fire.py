@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 from collections.abc import Mapping
@@ -172,6 +173,47 @@ def test_default_popen_factory_detaches_stdin(monkeypatch: pytest.MonkeyPatch) -
     assert captured["kwargs"]["stdout"] is subprocess.DEVNULL
     assert captured["kwargs"]["stderr"] is subprocess.PIPE
     assert captured["kwargs"]["text"] is True
+
+
+def test_default_popen_factory_captures_guest_console(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeProcess:
+        stderr = None
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            return
+
+        def kill(self) -> None:
+            return
+
+    def fake_popen(args: list[str], **kwargs: Any) -> _FakeProcess:
+        captured["kwargs"] = dict(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr("sandbox.fire.subprocess.Popen", fake_popen)
+
+    console_path = tmp_path / "console.log"
+    process = _default_popen_factory(
+        ["firecracker", "--api-sock", "/tmp/fc.sock"], console_path=str(console_path)
+    )
+
+    assert isinstance(process, _FakeProcess)
+    # Firecracker stdout (the guest serial console) is redirected to the file...
+    stdout = captured["kwargs"]["stdout"]
+    assert getattr(stdout, "name", None) == str(console_path)
+    # ...the file is created, and the parent's handle is closed (fd lives in child).
+    assert console_path.exists()
+    assert stdout.closed is True
 
 
 def test_configure_microvm_preboot_calls_put_in_required_sequence(tmp_path: Path) -> None:
@@ -806,6 +848,69 @@ def test_fire_sandbox_start_send_task_stop_lifecycle(tmp_path: Path) -> None:
     assert sandbox.is_running() is False
     assert iptables_manager.cleaned is True
     assert tap_manager.destroyed == [_build_allocation().tap_name]
+
+
+def _console_diagnostics_sandbox(
+    tmp_path: Path,
+) -> tuple[FireSandbox, _FakePopenFactory, _FakeSocketFactory]:
+    process_factory = _FakePopenFactory()
+    socket_factory = _FakeSocketFactory(
+        sockets=[_FakeConnectedSocket(recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'])]
+    )
+    sandbox = FireSandbox(
+        firecracker_config=_build_firecracker_config(tmp_path),
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini", api_key="sk-host", max_tokens=1024, temperature=0.2
+        ),
+        tap_manager=_FakeTapManager(_build_allocation()),
+        iptables_manager=_FakeIptablesManager(),
+        cid_manager=_FakeCidManager(cid=52),
+        api_client_factory=_FakeApiFactory().make,
+        command_runner=_CopyingCommandRunner(),
+        popen_factory=process_factory,
+        unix_socket_factory=socket_factory,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+    return sandbox, process_factory, socket_factory
+
+
+def test_fire_sandbox_threads_console_path_to_factory(tmp_path: Path) -> None:
+    sandbox, process_factory, _ = _console_diagnostics_sandbox(tmp_path)
+    sandbox.start(session_id="sess-1")
+    try:
+        assert len(process_factory.console_paths) == 1
+        console_path = process_factory.console_paths[0]
+        assert console_path is not None
+        assert console_path.endswith("console.log")
+    finally:
+        sandbox.stop()
+
+
+def test_unexpected_disconnect_surfaces_redacted_guest_console_tail(tmp_path: Path) -> None:
+    sandbox, _, _ = _console_diagnostics_sandbox(tmp_path)
+    sandbox.start(session_id="sess-1")
+    try:
+        # Simulate the guest writing a fatal traceback to its serial console
+        # (captured by the host) right before the agent process dies.
+        assert sandbox._console_log_path is not None
+        sandbox._console_log_path.write_text(
+            "=== STRANGECLAW GUEST FATAL ===\n"
+            "Traceback (most recent call last):\n"
+            '  File "agent/subagents.py", line 99, in run\n'
+            "RuntimeError: boom token=sk-should-be-redacted\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            sandbox.receive()
+        message = str(exc_info.value)
+        assert "Guest vsock connection closed unexpectedly." in message
+        assert "STRANGECLAW GUEST FATAL" in message
+        assert "agent/subagents.py" in message
+        # The redaction patterns still apply to console content.
+        assert "sk-should-be-redacted" not in message
+    finally:
+        sandbox.stop()
 
 
 def test_fire_sandbox_reuses_started_vm_for_sequential_tasks(tmp_path: Path) -> None:
@@ -2438,18 +2543,21 @@ class _SecretApiClient(_FakeApiClient):
 class _FakePopenFactory:
     def __init__(self) -> None:
         self.processes: list[_FakeProcess] = []
+        self.console_paths: list[str | None] = []
 
-    def __call__(self, args: list[str]) -> _FakeProcess:
+    def __call__(self, args: list[str], *, console_path: str | None = None) -> _FakeProcess:
         api_index = args.index("--api-sock") + 1
         api_path = Path(args[api_index])
         api_path.write_text("", encoding="utf-8")
+        self.console_paths.append(console_path)
         process = _FakeProcess()
         self.processes.append(process)
         return process
 
 
 class _SecretPopenFactory:
-    def __call__(self, args: list[str]) -> _FakeProcess:
+    def __call__(self, args: list[str], *, console_path: str | None = None) -> _FakeProcess:
+        del console_path
         api_index = args.index("--api-sock") + 1
         api_path = Path(args[api_index])
         api_path.write_text("", encoding="utf-8")
@@ -2544,3 +2652,38 @@ class _RaisingTapManager:
     def destroy(self, tap_name: str) -> None:
         del tap_name
         raise RuntimeError("destroy failed")
+
+
+def test_guest_rootfs_dockerfile_ships_all_guest_agent_modules() -> None:
+    """Every agent module must be shipped to the guest rootfs or explicitly host-only.
+
+    The Fire guest runs the agent code baked into the rootfs by the Dockerfile,
+    which copies an explicit allowlist of ``agent/*.py`` files. A module that
+    exists in ``agent/`` but is neither in that allowlist nor declared host-only
+    would import fine in Yolo yet raise ``ModuleNotFoundError`` in the guest
+    (exactly how ``agent/subagents.py`` once crashed Fire-mode spawns).
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    agent_dir = project_root / "agent"
+    dockerfile = (project_root / "firecracker" / "rootfs" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+
+    # Intentionally host-only modules (e.g. the direct LiteLLM client) that must
+    # never be copied into the minimal guest. Keep in sync with the Dockerfile.
+    host_only = {"llm.py"}
+
+    all_modules = {path.name for path in agent_dir.glob("*.py")}
+    # Ignore comment lines so a host-only module mentioned in prose (e.g. the
+    # note explaining why agent/llm.py is excluded) is not mistaken for a COPY.
+    copy_text = "\n".join(
+        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
+    )
+    shipped = set(re.findall(r"agent/([A-Za-z0-9_]+\.py)", copy_text))
+
+    expected_guest_modules = all_modules - host_only
+    missing = sorted(expected_guest_modules - shipped)
+    assert not missing, f"agent modules not shipped to guest rootfs: {missing}"
+
+    # And nothing host-only sneaks into the guest image.
+    assert not (shipped & host_only), "host-only module copied into guest rootfs"
