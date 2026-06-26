@@ -12,8 +12,6 @@ Pre-1.0 semantic versioning: minor versions may add features.
   per-call iteration/timeout caps and a per-task fan-out cap.
 - Child output is isolated under `subagents/<child_id>/` with traversal/symlink
   rejection and a size cap; subagent journaling supports `none`/`summary`/`full`.
-
-### Changed
 - Children are non-interactive and may use only a subset of the parent's tools;
   `spawn_subagent` recursion is disabled.
 
