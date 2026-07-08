@@ -250,60 +250,23 @@ class Tools:
                 stdout="",
                 stderr="web_search.max_results must be a positive integer.",
             )
-        if self._broker is None:
-            return ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr="host service broker is not configured for web_search.",
-            )
-        try:
-            result = self._broker.call(
-                "broker",
-                {
-                    "action": "web_search",
-                    "query": query.strip(),
-                    "max_results": max_results,
-                },
-            )
-        except HostServiceError as exc:
-            return ToolResult(exit_code=1, stdout="", stderr=str(exc))
-        wrapped = wrap_external_data(result)
-        success = result.get("success")
-        if success is False:
-            return ToolResult(exit_code=1, stdout=wrapped, stderr="")
-        if success is not True:
-            return ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr="invalid broker response for web_search: missing success envelope.",
-            )
-        return ToolResult(exit_code=0, stdout=wrapped, stderr="")
+        return self._dispatch_broker_action(
+            {
+                "action": "web_search",
+                "query": query.strip(),
+                "max_results": max_results,
+            },
+            label="web_search",
+        )
 
     def _execute_web_fetch(self, args: dict[str, Any]) -> ToolResult:
         url = args.get("url")
         if not isinstance(url, str) or not url.strip():
             return ToolResult(exit_code=1, stdout="", stderr="web_fetch.url must be a string.")
-        if self._broker is None:
-            return ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr="host service broker is not configured for web_fetch.",
-            )
-        try:
-            result = self._broker.call("broker", {"action": "web_fetch", "url": url.strip()})
-        except HostServiceError as exc:
-            return ToolResult(exit_code=1, stdout="", stderr=str(exc))
-        wrapped = wrap_external_data(result)
-        success = result.get("success")
-        if success is False:
-            return ToolResult(exit_code=1, stdout=wrapped, stderr="")
-        if success is not True:
-            return ToolResult(
-                exit_code=1,
-                stdout="",
-                stderr="invalid broker response for web_fetch: missing success envelope.",
-            )
-        return ToolResult(exit_code=0, stdout=wrapped, stderr="")
+        return self._dispatch_broker_action(
+            {"action": "web_fetch", "url": url.strip()},
+            label="web_fetch",
+        )
 
     def _execute_http_request(self, args: dict[str, Any]) -> ToolResult:
         method_raw = args.get("method")
@@ -361,25 +324,33 @@ class Tools:
                 stdout="",
                 stderr="http_request.body must be a string or null.",
             )
+        return self._dispatch_broker_action(
+            {
+                "action": "http_request",
+                "integration": integration_raw,
+                "method": method,
+                "url": target_url,
+                "headers": normalized_headers,
+                "body": body,
+            },
+            label="http_request",
+        )
+
+    def _dispatch_broker_action(self, payload: dict[str, Any], *, label: str) -> ToolResult:
+        """Send a broker action and map its success envelope to a ToolResult.
+
+        Shared tail for all broker-backed tools: enforces broker availability,
+        surfaces transport failures, validates the success envelope, and wraps the
+        response as external data. Per-tool error strings use ``label``.
+        """
         if self._broker is None:
             return ToolResult(
                 exit_code=1,
                 stdout="",
-                stderr="host service broker is not configured for http_request.",
+                stderr=f"host service broker is not configured for {label}.",
             )
-
         try:
-            result = self._broker.call(
-                "broker",
-                {
-                    "action": "http_request",
-                    "integration": integration_raw,
-                    "method": method,
-                    "url": target_url,
-                    "headers": normalized_headers,
-                    "body": body,
-                },
-            )
+            result = self._broker.call("broker", payload)
         except HostServiceError as exc:
             return ToolResult(exit_code=1, stdout="", stderr=str(exc))
         success = result.get("success")
@@ -387,13 +358,13 @@ class Tools:
             return ToolResult(
                 exit_code=1,
                 stdout="",
-                stderr="invalid broker response for http_request: missing success envelope.",
+                stderr=f"invalid broker response for {label}: missing success envelope.",
             )
-        result_payload = dict(result)
-        wrapped = wrap_external_data(result_payload)
-        if result_payload.get("success") is False:
-            return ToolResult(exit_code=1, stdout=wrapped, stderr="")
-        return ToolResult(exit_code=0, stdout=wrapped, stderr="")
+        return ToolResult(
+            exit_code=0 if success else 1,
+            stdout=wrap_external_data(result),
+            stderr="",
+        )
 
     def _configured_max_results(self) -> int | None:
         web_search_cfg = self._config.get("web_search", {})
