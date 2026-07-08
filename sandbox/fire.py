@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 
 from agent.broker_client import HostServiceError
 from agent.protocol import decode_event, encode_event
+from agent.tools import CAPABILITY_TOOL_NAMES, default_tool_toggles
 from host_secrets import load_secrets
 from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
@@ -1771,13 +1772,7 @@ def _coerce_agent_config_template(
         llm_candidate = dict(llm_config)
         return {
             "llm": llm_candidate,
-            "tools": {
-                "shell": True,
-                "web_search": True,
-                "web_fetch": True,
-                "http_request": True,
-                "spawn_subagent": False,
-            },
+            "tools": default_tool_toggles(),
             "web_search": {
                 "endpoint": "https://api.search.brave.com/res/v1/web/search",
                 "format": "brave",
@@ -1814,19 +1809,14 @@ def _coerce_agent_config_template(
 def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]:
     tools_raw = config.get("tools")
     if isinstance(tools_raw, Mapping):
+        # Security-relevant whitelist: only known tool keys cross into the guest
+        # via MMDS. Capability tools default on; spawn_subagent defaults off.
         tools = {
-            name: bool(tools_raw.get(name, True))
-            for name in ("shell", "web_search", "web_fetch", "http_request")
+            name: bool(tools_raw.get(name, True)) for name in CAPABILITY_TOOL_NAMES
         }
         tools["spawn_subagent"] = bool(tools_raw.get("spawn_subagent", False))
     else:
-        tools = {
-            "shell": True,
-            "web_search": True,
-            "web_fetch": True,
-            "http_request": True,
-            "spawn_subagent": False,
-        }
+        tools = default_tool_toggles()
 
     web_search_raw = config.get("web_search")
     web_search: dict[str, Any]

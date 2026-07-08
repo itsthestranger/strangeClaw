@@ -10,10 +10,14 @@ from typing import Any, cast
 
 import yaml
 
+from agent.tools import default_tool_toggles
+
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 LOGGER = logging.getLogger(__name__)
-_KNOWN_TOOL_NAMES = {"shell", "web_search", "web_fetch", "http_request", "spawn_subagent"}
+# Config-toggleable tool names = capability tools + the spawn_subagent toggle,
+# derived from the canonical registry in agent.tools so the two never drift.
+_KNOWN_TOOL_NAMES = set(default_tool_toggles())
 
 REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("mode",),
@@ -252,13 +256,7 @@ def _require_positive_int(value: Any, field_name: str) -> int:
 
 def _validate_tools_optional_fields(config: dict[str, Any]) -> None:
     tools_section = config.get("tools")
-    default_tools = {
-        "shell": True,
-        "web_search": True,
-        "web_fetch": True,
-        "http_request": True,
-        "spawn_subagent": False,
-    }
+    default_tools = default_tool_toggles()
     if tools_section is None:
         config["tools"] = default_tools
         return

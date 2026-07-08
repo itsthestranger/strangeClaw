@@ -13,7 +13,28 @@ from agent.llm_types import ToolCall
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
 _HTTP_REQUEST_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
-_KNOWN_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
+
+# Canonical registry of built-in capability tools. This is the single source of
+# truth for which tools `Tools` implements; every other module that needs the
+# capability tool set (subagent tool narrowing, config validation, Fire MMDS
+# sanitization) imports from here so adding a tool means editing one place.
+# `spawn_subagent` is an agent-dispatched orchestration capability, not a `Tools`
+# method, so it is intentionally excluded here and layered on by callers that
+# expose the config toggle (see `default_tool_toggles`).
+CAPABILITY_TOOL_NAMES: tuple[str, ...] = ("shell", "web_search", "web_fetch", "http_request")
+
+_SPAWN_SUBAGENT_TOGGLE = "spawn_subagent"
+
+
+def default_tool_toggles() -> dict[str, bool]:
+    """Default enable/disable state for every config-toggleable tool.
+
+    Capability tools default on; the `spawn_subagent` orchestration capability
+    defaults off (both it and `subagents.enabled` must be set to run children).
+    """
+    toggles: dict[str, bool] = {name: True for name in CAPABILITY_TOOL_NAMES}
+    toggles[_SPAWN_SUBAGENT_TOGGLE] = False
+    return toggles
 
 
 @dataclass(slots=True)
@@ -35,11 +56,11 @@ class Tools:
         if isinstance(raw_tools, dict):
             enabled: set[str] = {
                 name
-                for name in _KNOWN_TOOLS
+                for name in CAPABILITY_TOOL_NAMES
                 if bool(raw_tools.get(name, True))
             }
         else:
-            enabled = set(_KNOWN_TOOLS)
+            enabled = set(CAPABILITY_TOOL_NAMES)
         self._enabled = enabled
 
     def list_enabled(self) -> list[str]:

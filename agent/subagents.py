@@ -25,9 +25,9 @@ from typing import Any
 from agent.agent import MAX_ITERATIONS_REPLY, Agent
 from agent.broker_client import BrokerClient
 from agent.llm_types import LLMRuntime
+from agent.tools import CAPABILITY_TOOL_NAMES
 from agent.transport import InProcessTransport
 
-_KNOWN_CAPABILITY_TOOLS = ("shell", "web_search", "web_fetch", "http_request")
 _EVENTS_SUMMARY_CAP = 50
 
 
@@ -109,7 +109,7 @@ class SubagentRunner:
             for tool in request.get("allowed_tools", [])
             if tool in self._parent_enabled_tools
         }
-        child_tools = {name: (name in allowed) for name in _KNOWN_CAPABILITY_TOOLS}
+        child_tools = {name: (name in allowed) for name in CAPABILITY_TOOL_NAMES}
         child_tools["spawn_subagent"] = False
 
         config = dict(self._base_config)
