@@ -1799,6 +1799,16 @@ def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
                 raise FirecrackerConfigError(
                     "config.host_services.llm_timeout_seconds must be greater than zero."
                 )
+        frame_cap = host_services.get("max_frame_bytes")
+        if frame_cap is not None:
+            if isinstance(frame_cap, bool) or not isinstance(frame_cap, int):
+                raise FirecrackerConfigError(
+                    "config.host_services.max_frame_bytes must be an integer."
+                )
+            if frame_cap <= 0:
+                raise FirecrackerConfigError(
+                    "config.host_services.max_frame_bytes must be greater than zero."
+                )
 
     approval_mode = payload.get("approval_mode")
     if approval_mode is not None and not isinstance(approval_mode, str):
@@ -1984,7 +1994,12 @@ def _sanitize_agent_config_for_mmds(config: Mapping[str, Any]) -> dict[str, Any]
         "max_iterations": max_iterations,
         "context": context,
         "subagents": _sanitize_subagents_for_mmds(config),
-        "host_services": {"llm_timeout_seconds": llm_timeout_seconds},
+        # The frame cap crosses into the guest so both readers bound their
+        # buffers at the same configured value instead of silently diverging.
+        "host_services": {
+            "llm_timeout_seconds": llm_timeout_seconds,
+            "max_frame_bytes": _max_frame_bytes(config),
+        },
     }
     _validate_agent_config_payload(payload)
     return payload

@@ -212,7 +212,7 @@ host_services:
 ```
 
 - `llm_timeout_seconds` is how long the guest waits for a host-proxied model
-  call. It is the only `host_services` field that crosses into the guest.
+  call. It crosses into the guest through MMDS, as does `max_frame_bytes`.
 - `llm_max_request_bytes` is a policy cap on a decoded LLM proxy request. It is
   checked after the frame has been buffered and parsed, so it limits what the
   host will act on, not what the host will buffer.
@@ -227,9 +227,10 @@ host_services:
 
 The host reader is the security-critical direction: it is fed by bytes from the
 guest, across the microVM trust boundary, and the host may be running other
-sandboxes. The guest-side reader is capped symmetrically; it uses the built-in
-default rather than a configured value, since `max_frame_bytes` is not published
-to the guest through MMDS.
+sandboxes. The guest-side reader is capped symmetrically at the same configured
+value: `max_frame_bytes` is published to the guest through MMDS, so the two ends
+cannot diverge. A guest booted by a host that predates the key falls back to the
+built-in 4 MiB default.
 
 ## Telegram
 

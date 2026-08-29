@@ -18,7 +18,7 @@ from agent.agent import Agent
 from agent.broker_client import BrokerClient
 from agent.llm import LLMClient
 from agent.llm_types import LLMResponse, LLMRuntimeError, ToolCall
-from agent.transport import InProcessTransport
+from agent.transport import DEFAULT_MAX_FRAME_BYTES, InProcessTransport
 from sandbox.host_services import HostServiceServer
 
 
@@ -1708,15 +1708,19 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     config_path.write_text(
         json.dumps(
             {
-                "host_services": {"llm_timeout_seconds": 123},
+                "host_services": {
+                    "llm_timeout_seconds": 123,
+                    "max_frame_bytes": 16 * 1024 * 1024,
+                },
             }
         ),
         encoding="utf-8",
     )
 
     class FakeVsockTransport:
-        def __init__(self, *, guest_port: int) -> None:
+        def __init__(self, *, guest_port: int, max_frame_bytes: int) -> None:
             captured["guest_port"] = guest_port
+            captured["max_frame_bytes"] = max_frame_bytes
             captured["closed"] = False
 
         def close(self) -> None:
@@ -1751,6 +1755,8 @@ def test_agent_main_vsock_entrypoint_wires_transport_and_agent(
     )
 
     assert captured["guest_port"] == 5000
+    # The guest transport enforces the configured cap, not the module default.
+    assert captured["max_frame_bytes"] == 16 * 1024 * 1024
     assert captured["ran_forever"] is True
     assert captured["closed"] is True
 
@@ -2016,3 +2022,36 @@ def test_decision_error_falls_back_to_generic_message_without_a_reason() -> None
         error_actions[0]["result"]["stderr"]
     )
     assert events[-1]["success"] is True
+
+
+@pytest.mark.parametrize(
+    ("host_services", "expected"),
+    [
+        ({"llm_timeout_seconds": 120, "max_frame_bytes": 16 * 1024 * 1024}, 16 * 1024 * 1024),
+        ({"llm_timeout_seconds": 120, "max_frame_bytes": 1024}, 1024),
+        # Version skew: a host that predates the key leaves the guest on the default.
+        ({"llm_timeout_seconds": 120}, DEFAULT_MAX_FRAME_BYTES),
+        # Malformed values never widen or zero out the guest's bound.
+        ({"max_frame_bytes": 0}, DEFAULT_MAX_FRAME_BYTES),
+        ({"max_frame_bytes": -1}, DEFAULT_MAX_FRAME_BYTES),
+        ({"max_frame_bytes": True}, DEFAULT_MAX_FRAME_BYTES),
+        ({"max_frame_bytes": "4194304"}, DEFAULT_MAX_FRAME_BYTES),
+        ({"max_frame_bytes": 4194304.5}, DEFAULT_MAX_FRAME_BYTES),
+    ],
+)
+def test_read_host_service_max_frame_bytes(
+    host_services: dict[str, Any],
+    expected: int,
+) -> None:
+    assert (
+        agent_module._read_host_service_max_frame_bytes({"host_services": host_services})
+        == expected
+    )
+
+
+def test_read_host_service_max_frame_bytes_without_host_services() -> None:
+    assert agent_module._read_host_service_max_frame_bytes({}) == DEFAULT_MAX_FRAME_BYTES
+    assert (
+        agent_module._read_host_service_max_frame_bytes({"host_services": "nope"})
+        == DEFAULT_MAX_FRAME_BYTES
+    )

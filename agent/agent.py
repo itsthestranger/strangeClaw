@@ -20,7 +20,7 @@ from agent.llm_proxy import LLMProxyRuntime
 from agent.llm_types import LLMResponse, LLMRuntime, LLMRuntimeError, ToolCall
 from agent.skills import Skills, SkillsError
 from agent.tools import ToolResult, Tools, wrap_external_data
-from agent.transport import VsockTransport
+from agent.transport import DEFAULT_MAX_FRAME_BYTES, VsockTransport
 
 # Quiet by default: emits nothing unless a handler is configured. The Fire guest
 # entrypoint (`main`) configures it to stream INFO to stderr -> serial console,
@@ -1550,6 +1550,22 @@ def _read_host_service_llm_timeout(agent_config: dict[str, Any]) -> float:
     return timeout
 
 
+def _read_host_service_max_frame_bytes(agent_config: dict[str, Any]) -> int:
+    """Read the transport frame cap the host published for this guest.
+
+    Mirrors ``sandbox.fire._max_frame_bytes`` so both readers bound their
+    buffers identically. A host that predates the key simply omits it, so the
+    module default keeps version skew working.
+    """
+    host_services = agent_config.get("host_services")
+    if not isinstance(host_services, dict):
+        return DEFAULT_MAX_FRAME_BYTES
+    raw_value = host_services.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value <= 0:
+        return DEFAULT_MAX_FRAME_BYTES
+    return raw_value
+
+
 def _format_self_rss() -> str:
     """Best-effort resident-set size of this process, for OOM diagnostics."""
     try:
@@ -1634,7 +1650,10 @@ def main(argv: list[str] | None = None) -> None:
 
     agent_config = _load_agent_config_file(Path(config_path))
     _validate_guest_proxy_config(agent_config, Path(config_path))
-    transport = VsockTransport(guest_port=int(args.vsock_port))
+    transport = VsockTransport(
+        guest_port=int(args.vsock_port),
+        max_frame_bytes=_read_host_service_max_frame_bytes(agent_config),
+    )
     try:
         broker = BrokerClient(
             mode="fire",

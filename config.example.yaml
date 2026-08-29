@@ -74,13 +74,15 @@ broker:
     # http_request call.
 
 host_services:
-  # Host-side service limits. Fire guests receive only llm_timeout_seconds;
-  # llm_max_request_bytes is enforced by the host-side LLM service.
+  # Host-side service limits. Fire guests receive llm_timeout_seconds and
+  # max_frame_bytes; llm_max_request_bytes is enforced by the host-side LLM
+  # service.
   llm_timeout_seconds: 120
   llm_max_request_bytes: 2097152
   # Hard cap (bytes) on a single newline-delimited transport frame. Enforced
   # while bytes are buffered, before parsing, so a peer that never sends a
   # newline fails fast instead of growing the host buffer without limit.
+  # Enforced identically by the host reader and the guest transport.
   # Must be greater than llm_max_request_bytes.
   max_frame_bytes: 4194304
 

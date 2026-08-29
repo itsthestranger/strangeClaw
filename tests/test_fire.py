@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 import responses
 
+from agent.agent import _read_host_service_max_frame_bytes
 from agent.protocol import decode_event, encode_event
 from sandbox.fire import (
     DEFAULT_BOOT_ARGS,
@@ -29,6 +30,8 @@ from sandbox.fire import (
     VMBootError,
     _assert_no_secrets,
     _default_popen_factory,
+    _max_frame_bytes,
+    _sanitize_agent_config_for_mmds,
     configure_microvm_preboot,
     load_firecracker_config,
 )
@@ -779,7 +782,10 @@ def test_fire_sandbox_run_sends_task_after_agent_ready(tmp_path: Path) -> None:
         "format": "brave",
         "max_results": 10,
     }
-    assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
+    assert mmds_payload["config"]["host_services"] == {
+        "llm_timeout_seconds": 120,
+        "max_frame_bytes": 4 * 1024 * 1024,
+    }
     assert "llm_max_request_bytes" not in mmds_payload["config"]["host_services"]
     assert "llm" not in mmds_payload["config"]
     assert "api_key" not in mmds_payload["config"]["web_search"]
@@ -1253,7 +1259,10 @@ def test_fire_sandbox_autonomous_event_stream_replan_read_and_done(tmp_path: Pat
         assert b'"llm"' not in sent_payloads[1]
         assert "llm" not in mmds_payload["config"]
         assert mmds_payload["config"]["skills"]["max_file_chars"] == 20000
-        assert mmds_payload["config"]["host_services"] == {"llm_timeout_seconds": 120}
+        assert mmds_payload["config"]["host_services"] == {
+            "llm_timeout_seconds": 120,
+            "max_frame_bytes": 4 * 1024 * 1024,
+        }
 
         # Deterministic autonomous loop stream includes replan, skill-file read, and done.
         plan_events = [
@@ -1619,7 +1628,8 @@ def test_fire_sandbox_broker_http_fetch_search_end_to_end(
         assert "sk-host-fire-llm-key" not in rendered_mmds
         assert "llm" not in api_factory.payload_for("/mmds")["config"]
         assert api_factory.payload_for("/mmds")["config"]["host_services"] == {
-            "llm_timeout_seconds": 120
+            "llm_timeout_seconds": 120,
+            "max_frame_bytes": 4 * 1024 * 1024,
         }
     finally:
         sandbox.stop()
@@ -2860,3 +2870,47 @@ def test_fire_max_frame_bytes_defaults_when_unconfigured(tmp_path: Path) -> None
     )
     assert sandbox._max_frame_bytes == 4 * 1024 * 1024
     assert sandbox._max_frame_bytes > DEFAULT_LLM_MAX_REQUEST_BYTES
+
+
+def _frame_cap_agent_config(max_frame_bytes: int | None) -> dict[str, Any]:
+    agent_config = _agent_config(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-host",
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    host_services: dict[str, Any] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 2 * 1024 * 1024,
+    }
+    if max_frame_bytes is not None:
+        host_services["max_frame_bytes"] = max_frame_bytes
+    agent_config["host_services"] = host_services
+    return agent_config
+
+
+def test_mmds_sanitizer_publishes_configured_max_frame_bytes() -> None:
+    """The frame cap must survive MMDS sanitization, or the guest cannot honour it."""
+    sanitized = _sanitize_agent_config_for_mmds(_frame_cap_agent_config(16 * 1024 * 1024))
+
+    assert sanitized["host_services"]["max_frame_bytes"] == 16 * 1024 * 1024
+    # Host-only policy limits still stay behind the boundary.
+    assert "llm_max_request_bytes" not in sanitized["host_services"]
+
+
+def test_mmds_sanitizer_falls_back_to_default_max_frame_bytes() -> None:
+    sanitized = _sanitize_agent_config_for_mmds(_frame_cap_agent_config(None))
+
+    assert sanitized["host_services"]["max_frame_bytes"] == 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize("configured", [None, 1024 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024])
+def test_host_and_guest_frame_caps_cannot_diverge(configured: int | None) -> None:
+    """Whatever the host reader enforces is exactly what the guest transport enforces."""
+    agent_config = _frame_cap_agent_config(configured)
+    sanitized = _sanitize_agent_config_for_mmds(agent_config)
+
+    host_cap = _max_frame_bytes(agent_config)
+    guest_cap = _read_host_service_max_frame_bytes(sanitized)
+
+    assert guest_cap == host_cap
