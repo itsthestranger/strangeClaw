@@ -63,6 +63,15 @@ class FailingSandbox(FakeSandbox):
         raise RuntimeError("boom")
 
 
+class FailingStartSandbox(FakeSandbox):
+    """Sandbox stub that fails on start()."""
+
+    def start(self, session_id: str | None = None) -> None:
+        self.start_calls += 1
+        self.start_session_ids.append(session_id)
+        raise RuntimeError("boom on start")
+
+
 class BlockingStopFireSandbox(FireSandbox):
     """Fire sandbox stub whose stop() blocks until explicitly released."""
 
@@ -1006,6 +1015,41 @@ def test_coordinator_emits_done_on_sandbox_runtime_error(tmp_path: Path, monkeyp
     assert "Sandbox runtime error" in str(done["reply"])
 
     journal_path = tmp_path / ".strangeclaw" / "sessions" / "sess-err" / "events.jsonl"
+    assert journal_path.exists()
+    journal_text = journal_path.read_text(encoding="utf-8")
+    assert "Sandbox runtime error" in journal_text
+
+
+def test_coordinator_emits_done_on_sandbox_start_error(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sandbox = FailingStartSandbox(events=[])
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+        session_journal={"enabled": True, "max_bytes": 4096},
+    )
+    seen_events: list[dict[str, Any]] = []
+
+    status = coordinator.start_task(
+        session_id="sess-start-err", text="task", sink=seen_events.append
+    )
+    assert status == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in seen_events))
+
+    done = [event for event in seen_events if event.get("type") == "done"][-1]
+    assert done["success"] is False
+    assert "Sandbox runtime error" in str(done["reply"])
+
+    # The sandbox never finished starting, so send_task() must not have been called
+    # and stop() must not have been called either (nothing to tear down).
+    assert sandbox.send_task_calls == 0
+    assert sandbox.stop_calls == 0
+
+    # The sandbox must not be left registered on the session record.
+    assert coordinator._sessions["sess-start-err"].sandbox is None  # type: ignore[attr-defined]
+
+    journal_path = tmp_path / ".strangeclaw" / "sessions" / "sess-start-err" / "events.jsonl"
     assert journal_path.exists()
     journal_text = journal_path.read_text(encoding="utf-8")
     assert "Sandbox runtime error" in journal_text

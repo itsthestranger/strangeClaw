@@ -165,7 +165,6 @@ class Coordinator:
 
         if start_error is not None:
             self._handle_worker_error(session_id=session_id, error=start_error)
-            return "started"
         return "started"
 
     def pending_role(self, *, session_id: str) -> ReplyRole | None:

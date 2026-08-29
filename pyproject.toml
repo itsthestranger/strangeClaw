@@ -44,6 +44,7 @@ python_version = "3.11"
 files = [
   "main.py",
   "config.py",
+  "coordinator.py",
   "session.py",
   "host_secrets.py",
   "agent",
