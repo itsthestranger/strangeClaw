@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 import litellm
 
 from agent.llm_types import LLMResponse, ToolCall
+
+# Appended to every rejection reason so the model is told the rule it broke, not
+# just the symptom. The one-decision-per-turn invariant itself never relaxes.
+ONE_DECISION_RULE = "Emit exactly one structured decision per turn."
+
+# Longest fragment of a model-authored payload echoed back inside a rejection
+# reason. Long enough to be recognisable, short enough not to flood the prompt.
+_REASON_PREVIEW_LIMIT = 160
+
+
+@dataclass(slots=True)
+class LLMDecisionResponse(LLMResponse):
+    """``LLMResponse`` that also reports why no decision could be extracted.
+
+    ``action_error`` states the concrete violation (wrong number of tool calls,
+    unparseable arguments, ...) whenever ``action`` is ``None`` and a structured
+    decision was requested. It is ``None`` on success. Consumers should read it
+    defensively (``getattr``) because other ``LLMRuntime`` implementations return
+    a plain :class:`~agent.llm_types.LLMResponse`.
+    """
+
+    action_error: str | None = None
 
 
 class LLMClient:
@@ -106,7 +129,7 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
-    ) -> LLMResponse:
+    ) -> LLMDecisionResponse:
         """Produce one normalized response."""
         response_action_mode = "none"
         completion_kwargs: dict[str, Any] = {
@@ -148,12 +171,18 @@ class LLMClient:
         text = _extract_text(response)
         usage = _extract_usage(response)
         action: ToolCall | None = None
+        action_error: str | None = None
         if action_schema is not None:
             if response_action_mode == "native":
-                action = _extract_native_tool_call(response)
+                action, action_error = _extract_native_tool_call(response)
             else:
-                action = _extract_prompt_tool_call(text)
-        return LLMResponse(text=text, action=action, usage=usage)
+                action, action_error = _extract_prompt_tool_call(text)
+        return LLMDecisionResponse(
+            text=text,
+            action=action,
+            usage=usage,
+            action_error=action_error,
+        )
 
     def _resolve_native_tool_choice_mode(self) -> str | None:
         configured_mode = _required_action_tool_choice_mode(self.native_tool_choice)
@@ -202,7 +231,7 @@ class LLMClient:
         }
         try:
             response = litellm.completion(**probe_kwargs)
-            return _extract_native_tool_call(response) is not None
+            return _extract_native_tool_call(response)[0] is not None
         except Exception as exc:
             status_code = _exception_status_code(exc)
             if status_code is not None and 400 <= status_code < 500:
@@ -329,17 +358,27 @@ def _exception_status_code(exc: Exception) -> int | None:
     return None
 
 
-def _extract_native_tool_call(response: Any) -> ToolCall | None:
+def _extract_native_tool_call(response: Any) -> tuple[ToolCall | None, str | None]:
+    """Return the single structured decision, or why the response had none.
+
+    The second element is a model-facing reason naming the concrete violation.
+    It is never a substitute for the one-decision-per-turn rule: a response
+    carrying several tool calls is still rejected, it is now just told why.
+    """
     choices = _get_value(response, "choices")
     if not isinstance(choices, list) or not choices:
-        return None
+        return None, "The model response contained no completion choices."
 
     first_choice = choices[0]
     message = _get_value(first_choice, "message")
     tool_calls = _get_value(message, "tool_calls")
+    # Set when a lone tool call was present but unreadable. The content-block
+    # branch below still gets its chance (unchanged behaviour); if it also
+    # fails, this more specific reason wins over the generic one.
+    pending_reason: str | None = None
     if isinstance(tool_calls, list) and tool_calls:
         if len(tool_calls) != 1:
-            return None
+            return None, _tool_call_count_reason(len(tool_calls))
         first_call = tool_calls[0]
         function_block = _get_value(first_call, "function")
         function_name = _get_value(function_block, "name")
@@ -347,10 +386,11 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
         if isinstance(function_name, str) and function_name and function_name != "submit_tool_call":
             parsed_args = _parse_native_function_args(raw_args)
             if parsed_args is not None:
-                return ToolCall(tool=function_name, args=parsed_args, reason=None)
+                return ToolCall(tool=function_name, args=parsed_args, reason=None), None
         payload = _parse_action_payload(raw_args)
         if payload is not None:
-            return payload
+            return payload, None
+        pending_reason = _unparseable_arguments_reason(function_name, raw_args)
 
     content = _get_value(message, "content")
     if isinstance(content, list):
@@ -360,17 +400,55 @@ def _extract_native_tool_call(response: Any) -> ToolCall | None:
             if isinstance(item, dict) and item.get("type") == "tool_use"
         ]
         if len(tool_use_items) != 1:
-            return None
+            return None, pending_reason or _tool_call_count_reason(len(tool_use_items))
         item = tool_use_items[0]
-        payload = _action_from_dict(_get_value(item, "input"))
+        input_payload = _get_value(item, "input")
+        payload = _action_from_dict(input_payload)
         if payload is None:
             name = item.get("name")
-            input_payload = _get_value(item, "input")
             if isinstance(name, str) and name and isinstance(input_payload, dict):
                 payload = ToolCall(tool=name, args=input_payload, reason=None)
         if payload is not None:
-            return payload
-    return None
+            return payload, None
+        return None, pending_reason or _unparseable_arguments_reason(
+            item.get("name"),
+            input_payload,
+        )
+    return None, pending_reason or _tool_call_count_reason(0)
+
+
+def _tool_call_count_reason(count: int) -> str:
+    if count == 0:
+        return f"You emitted no tool calls. {ONE_DECISION_RULE}"
+    return f"You emitted {count} tool calls. {ONE_DECISION_RULE}"
+
+
+def _unparseable_arguments_reason(function_name: Any, raw_args: Any) -> str:
+    if isinstance(function_name, str) and function_name:
+        subject = f"Your tool call '{function_name}' had"
+    else:
+        subject = "Your tool call had"
+    return (
+        f"{subject} arguments that could not be read as a JSON object with a "
+        f"string tool and an object args: {_reason_preview(raw_args)}. "
+        f"{ONE_DECISION_RULE}"
+    )
+
+
+def _reason_preview(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=True, default=str)
+        except (TypeError, ValueError):
+            text = repr(value)
+    text = " ".join(text.split())
+    if not text:
+        return "(empty)"
+    if len(text) > _REASON_PREVIEW_LIMIT:
+        return f"{text[:_REASON_PREVIEW_LIMIT]}..."
+    return text
 
 
 def _inject_prompt_action_schema(
@@ -393,17 +471,31 @@ def _inject_prompt_action_schema(
     return [{"role": "system", "content": instruction}, *messages]
 
 
-def _extract_prompt_tool_call(text: str) -> ToolCall | None:
+def _extract_prompt_tool_call(text: str) -> tuple[ToolCall | None, str | None]:
+    """Return the decision parsed from prose mode, or why there was none."""
     stripped = text.strip()
     if not stripped:
-        return None
+        return None, f"You returned an empty response with no tool call. {ONE_DECISION_RULE}"
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        return None
+        return None, (
+            "Your response was not valid JSON: "
+            f"{_reason_preview(stripped)}. Return only a JSON object with "
+            f"a string tool and an object args. {ONE_DECISION_RULE}"
+        )
     if not isinstance(payload, dict):
-        return None
-    return _action_from_dict(payload)
+        return None, (
+            "Your response parsed as JSON but was not an object with tool and args: "
+            f"{_reason_preview(payload)}. {ONE_DECISION_RULE}"
+        )
+    action = _action_from_dict(payload)
+    if action is None:
+        return None, (
+            "Your JSON response was missing a string tool or an object args: "
+            f"{_reason_preview(payload)}. {ONE_DECISION_RULE}"
+        )
+    return action, None
 
 
 def _parse_action_payload(raw_args: Any) -> ToolCall | None:

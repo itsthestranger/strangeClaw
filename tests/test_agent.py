@@ -1841,3 +1841,178 @@ def test_unexpected_task_error_yields_clean_failed_done(
     assert done["type"] == "done"
     assert done["success"] is False
     assert "Internal error: boom-unexpected" in done["reply"]
+
+
+_ONE_DECISION_RULE = "Emit exactly one structured decision per turn."
+
+_SHELL_CALL = {
+    "type": "function",
+    "function": {"name": "shell", "arguments": '{"command":"pwd"}'},
+}
+
+
+@pytest.mark.parametrize(
+    ("bad_message", "expected_reason"),
+    [
+        (
+            {"content": "", "tool_calls": [_SHELL_CALL, _SHELL_CALL, _SHELL_CALL]},
+            f"You emitted 3 tool calls. {_ONE_DECISION_RULE}",
+        ),
+        (
+            {"content": "Let me think about this some more."},
+            f"You emitted no tool calls. {_ONE_DECISION_RULE}",
+        ),
+        (
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": '{"command": "pwd"'},
+                    }
+                ],
+            },
+            (
+                "Your tool call 'shell' had arguments that could not be read as a "
+                'JSON object with a string tool and an object args: {"command": "pwd". '
+                f"{_ONE_DECISION_RULE}"
+            ),
+        ),
+    ],
+    ids=["multiple_tool_calls", "zero_tool_calls", "unparseable_arguments"],
+)
+def test_decision_error_observation_names_the_concrete_violation(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_message: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    execution_turn = 0
+    execution_payloads: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        nonlocal execution_turn
+        messages = kwargs.get("messages")
+        if "tools" not in kwargs:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"goal":"g","steps":["attempt"],"referenced_skills":[]}'
+                        }
+                    }
+                ]
+            }
+        execution_turn += 1
+        if isinstance(messages, list) and messages and isinstance(messages[-1], dict):
+            user_payload = messages[-1].get("content")
+            if isinstance(user_payload, str):
+                execution_payloads.append(json.loads(user_payload))
+        if execution_turn == 1:
+            return {"choices": [{"message": bad_message}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "agent_done",
+                                    "arguments": '{"reply":"recovered"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=LLMClient.from_config(
+            {**_agent_config()["llm"], "native_probe": False}
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event.get("type") == "action" and event.get("tool") == "agent_decision_error"
+    ]
+    assert len(error_actions) == 1
+    stderr = str(error_actions[0]["result"]["stderr"])
+    assert error_actions[0]["result"]["exit_code"] == 1
+    assert stderr.startswith(f"Decision parse error: {expected_reason} ")
+
+    # The rejection is still a rejection: no shell action ran from the bad turn.
+    assert not [
+        event
+        for event in events
+        if event.get("type") == "action" and event.get("tool") == "shell"
+    ]
+
+    # The concrete reason reaches the next turn's prompt, which is the point.
+    assert len(execution_payloads) == 2
+    assert any(
+        isinstance(item, dict)
+        and expected_reason in str(item.get("result", {}).get("stderr", ""))
+        for item in execution_payloads[1]["recent_history"]
+    )
+
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+    assert events[-1]["reply"] == "recovered"
+
+
+def test_decision_error_falls_back_to_generic_message_without_a_reason() -> None:
+    host_transport, agent_transport = InProcessTransport.pair()
+    llm = ScriptedLLM(
+        [
+            LLMResponse(text='{"goal":"g","steps":["s"],"referenced_skills":[]}', action=None),
+            LLMResponse(text="", action=None),
+            LLMResponse(
+                text="",
+                action=ToolCall(tool="agent_done", args={"reply": "recovered"}),
+            ),
+        ]
+    )
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=llm,
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event.get("type") == "action" and event.get("tool") == "agent_decision_error"
+    ]
+    assert len(error_actions) == 1
+    assert agent_module.DECISION_REJECTION_FALLBACK in str(
+        error_actions[0]["result"]["stderr"]
+    )
+    assert events[-1]["success"] is True

@@ -174,6 +174,25 @@ _SPAWN_SUBAGENT_SCHEMA: dict[str, Any] = {
 }
 
 
+DECISION_REJECTION_FALLBACK = (
+    "LLM response did not contain exactly one structured execution decision."
+)
+
+
+def _decision_rejection_message(response: LLMResponse) -> str:
+    """Name the concrete reason a response carried no usable decision.
+
+    ``LLMClient`` reports it on ``action_error`` (see
+    ``agent.llm.LLMDecisionResponse``). Read defensively: other ``LLMRuntime``
+    implementations, including the Fire-mode host-service proxy, return a plain
+    ``LLMResponse`` and fall back to the generic message.
+    """
+    reason = getattr(response, "action_error", None)
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return DECISION_REJECTION_FALLBACK
+
+
 class AgentError(RuntimeError):
     """Raised for invalid runtime events/configuration."""
 
@@ -613,9 +632,7 @@ class Agent:
         )
         if response.action is not None:
             return response.action
-        raise AgentError(
-            "LLM response did not contain exactly one structured execution decision."
-        )
+        raise AgentError(_decision_rejection_message(response))
 
     def _choose_next_decision(
         self,

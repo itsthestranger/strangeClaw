@@ -824,6 +824,206 @@ def test_native_structured_output_rejects_multiple_tool_calls(
     )
 
     assert result.action is None
+    assert result.action_error == (
+        "You emitted 2 tool calls. Emit exactly one structured decision per turn."
+    )
+
+
+def _native_client() -> LLMClient:
+    return LLMClient(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-test",
+        structured_output="native",
+        native_tool_choice="required",
+        native_probe=False,
+    )
+
+
+def _native_action_error(
+    monkeypatch: pytest.MonkeyPatch,
+    message: dict[str, Any],
+) -> str | None:
+    monkeypatch.setattr(
+        "agent.llm.litellm.completion",
+        lambda **_: {"choices": [{"message": message}]},
+    )
+    result = _native_client().complete(
+        messages=[{"role": "user", "content": "Use one tool"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+    assert result.action is None
+    return result.action_error
+
+
+def test_native_three_tool_calls_reason_names_the_count_and_the_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = [
+        {
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"command":"pwd"}'},
+        }
+        for _ in range(3)
+    ]
+
+    reason = _native_action_error(monkeypatch, {"content": "", "tool_calls": calls})
+
+    assert reason == (
+        "You emitted 3 tool calls. Emit exactly one structured decision per turn."
+    )
+
+
+def test_native_zero_tool_calls_reason_is_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = _native_action_error(monkeypatch, {"content": "I will think about it."})
+
+    assert reason == (
+        "You emitted no tool calls. Emit exactly one structured decision per turn."
+    )
+
+
+def test_native_unparseable_arguments_reason_is_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = _native_action_error(
+        monkeypatch,
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": '{"command": "pwd"'},
+                }
+            ],
+        },
+    )
+
+    assert reason is not None
+    assert reason.startswith(
+        "Your tool call 'shell' had arguments that could not be read as a JSON "
+        "object with a string tool and an object args:"
+    )
+    assert '{"command": "pwd"' in reason
+    assert reason.endswith("Emit exactly one structured decision per turn.")
+
+
+def test_native_rejection_reasons_are_pairwise_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_call = {
+        "type": "function",
+        "function": {"name": "shell", "arguments": '{"command":"pwd"}'},
+    }
+    reasons = {
+        _native_action_error(
+            monkeypatch,
+            {"content": "", "tool_calls": [one_call, one_call]},
+        ),
+        _native_action_error(monkeypatch, {"content": "thinking"}),
+        _native_action_error(
+            monkeypatch,
+            {
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "shell", "arguments": "oops"}}
+                ],
+            },
+        ),
+    }
+
+    assert len(reasons) == 3
+
+
+def test_native_rejection_reason_preview_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = _native_action_error(
+        monkeypatch,
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "x" * 4000},
+                }
+            ],
+        },
+    )
+
+    assert reason is not None
+    assert len(reason) < 400
+    assert "..." in reason
+
+
+def test_native_successful_decision_carries_no_action_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent.llm.litellm.completion",
+        lambda **_: {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": '{"command":"pwd"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+    )
+
+    result = _native_client().complete(
+        messages=[{"role": "user", "content": "Use one tool"}],
+        action_schema=TOOLS_SCHEMA,
+    )
+
+    assert result.action is not None
+    assert result.action_error is None
+
+
+def test_prompt_structured_output_reports_distinct_rejection_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _prompt_action_error(content: str) -> str | None:
+        monkeypatch.setattr(
+            "agent.llm.litellm.completion",
+            lambda **_: {"choices": [{"message": {"content": content}}]},
+        )
+        result = LLMClient(
+            model="ollama/llama3.1",
+            api_key="",
+            structured_output="prompt",
+        ).complete(
+            messages=[{"role": "user", "content": "Fetch data"}],
+            action_schema=ACTION_SCHEMA,
+        )
+        assert result.action is None
+        return result.action_error
+
+    empty_reason = _prompt_action_error("   ")
+    invalid_json_reason = _prompt_action_error("I will proceed now.")
+    wrong_shape_reason = _prompt_action_error('{"skill":"http-request","args":{}}')
+
+    assert empty_reason == (
+        "You returned an empty response with no tool call. "
+        "Emit exactly one structured decision per turn."
+    )
+    assert invalid_json_reason is not None
+    assert invalid_json_reason.startswith("Your response was not valid JSON:")
+    assert wrong_shape_reason is not None
+    assert wrong_shape_reason.startswith(
+        "Your JSON response was missing a string tool or an object args:"
+    )
+    assert len({empty_reason, invalid_json_reason, wrong_shape_reason}) == 3
 
 
 def test_prompt_structured_output_rejects_legacy_skill_action_shape(
