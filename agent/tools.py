@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,15 @@ from agent.llm_types import ToolCall
 _OUTPUT_CHUNK_SIZE = 4000
 _DEFAULT_SHELL_TIMEOUT_SECONDS = 60.0
 _HTTP_REQUEST_ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
+
+# Environment variables the shell tool hands to the command it runs. The child
+# environment is built from this allowlist instead of being inherited, so a
+# value exported only into the parent process (a one-shot token from a wrapper
+# script, say) is not readable by a model-authored command. Operators widen the
+# list with `shell.env_passthrough`. An allowlisted name that is missing from
+# the parent is omitted rather than passed as an empty string: an empty `HOME`
+# or `PATH` is a different, worse thing than an unset one.
+SHELL_ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "LANG", "TERM", "TZ")
 
 # Canonical registry of built-in capability tools. This is the single source of
 # truth for which tools `Tools` implements; every other module that needs the
@@ -146,6 +156,7 @@ class Tools:
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
+                env=self._shell_env(),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout if isinstance(exc.stdout, str) else ""
@@ -164,6 +175,28 @@ class Tools:
             exit_code=completed.returncode,
             stdout=_truncate_output(completed.stdout),
             stderr=_truncate_output(completed.stderr),
+        )
+
+    def _shell_env(self) -> dict[str, str]:
+        """Build the shell child environment from the allowlist, not by inheritance."""
+        env: dict[str, str] = {}
+        for name in (*SHELL_ENV_ALLOWLIST, *self._configured_env_passthrough()):
+            value = os.environ.get(name)
+            if value is None:
+                continue
+            env[name] = value
+        return env
+
+    def _configured_env_passthrough(self) -> tuple[str, ...]:
+        """Operator-added passthrough variable names from `shell.env_passthrough`."""
+        shell_cfg = self._config.get("shell")
+        if not isinstance(shell_cfg, dict):
+            return ()
+        raw_names = shell_cfg.get("env_passthrough")
+        if not isinstance(raw_names, list):
+            return ()
+        return tuple(
+            name.strip() for name in raw_names if isinstance(name, str) and name.strip()
         )
 
     @staticmethod

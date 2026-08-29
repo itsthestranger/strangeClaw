@@ -104,6 +104,12 @@ runtime and can be enabled or disabled in config:
 
 Disabled tools are removed from the model's action surface.
 
+The `shell` tool builds its child environment from an explicit allowlist
+(`PATH`, `HOME`, `LANG`, `TERM`, `TZ`, plus `shell.env_passthrough`) instead of
+inheriting the agent process environment, so that property does not depend on
+which sandbox the tool happens to run in. In Fire mode the guest environment is
+already built from scratch by guest init, so this changes nothing there.
+
 `web_fetch` is intentionally a pass-through tool: the broker returns
 `status_code`, `headers`, decoded UTF-8 `body`, and `truncated`. The host does
 not parse or summarize fetched content.

@@ -9,7 +9,7 @@ import pytest
 
 from agent.broker_client import HostServiceError
 from agent.llm_types import ToolCall
-from agent.tools import Tools
+from agent.tools import SHELL_ENV_ALLOWLIST, Tools
 
 
 class _RecordingBroker:
@@ -70,6 +70,86 @@ def test_tools_shell_output_truncates_long_text() -> None:
     assert result.exit_code == 0
     assert "...[truncated" in result.stdout
     assert len(result.stdout) < 9005
+
+
+def test_tools_shell_does_not_leak_unallowlisted_parent_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_API_KEY", "sk-do-not-leak")
+    tools = Tools(config={})
+
+    result = tools.execute(
+        ToolCall(tool="shell", args={"command": 'echo "seen=[${FAKE_API_KEY-unset}]"'})
+    )
+
+    assert result.exit_code == 0
+    assert "sk-do-not-leak" not in result.stdout
+    assert result.stdout.strip() == "seen=[unset]"
+
+
+def test_tools_shell_runs_real_command_under_stripped_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_API_KEY", "sk-do-not-leak")
+    tools = Tools(config={})
+
+    # `cat` is resolved through PATH, so this fails if the allowlist strips the
+    # environment down to something bash cannot work in.
+    result = tools.execute(ToolCall(tool="shell", args={"command": "echo ready | cat"}))
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "ready"
+    assert result.stderr == ""
+
+
+def test_tools_shell_passes_allowlisted_parent_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "UTC")
+    tools = Tools(config={})
+
+    result = tools.execute(ToolCall(tool="shell", args={"command": 'echo "tz=${TZ-unset}"'}))
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "tz=UTC"
+
+
+def test_tools_shell_forwards_configured_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SC_EXTRA_PASSTHROUGH", "forwarded")
+    tools = Tools(config={"shell": {"env_passthrough": ["SC_EXTRA_PASSTHROUGH"]}})
+
+    result = tools.execute(
+        ToolCall(tool="shell", args={"command": 'echo "extra=${SC_EXTRA_PASSTHROUGH-unset}"'})
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "extra=forwarded"
+
+
+def test_shell_env_omits_allowlisted_variable_absent_from_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("FAKE_API_KEY", "sk-do-not-leak")
+    tools = Tools(config={})
+
+    env = tools._shell_env()
+
+    # Absent means unset in the child, not set to an empty string.
+    assert "TZ" not in env
+    assert env["PATH"] == "/usr/bin"
+    assert "FAKE_API_KEY" not in env
+    assert set(env) <= set(SHELL_ENV_ALLOWLIST)
+
+
+def test_shell_env_ignores_malformed_passthrough_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SC_EXTRA_PASSTHROUGH", "forwarded")
+    tools = Tools(config={"shell": {"env_passthrough": "SC_EXTRA_PASSTHROUGH"}})
+
+    assert "SC_EXTRA_PASSTHROUGH" not in tools._shell_env()
 
 
 def test_tools_web_search_calls_broker_with_expected_payload() -> None:

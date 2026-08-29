@@ -15,6 +15,7 @@ from agent.transport import derive_max_frame_bytes
 
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LOGGER = logging.getLogger(__name__)
 # Config-toggleable tool names = capability tools + the spawn_subagent toggle,
 # derived from the canonical registry in agent.tools so the two never drift.
@@ -137,6 +138,7 @@ def _validate_optional_fields(config: dict[str, Any]) -> None:
     _validate_coordinator_optional_fields(config)
     _validate_subagents_optional_fields(config)
     _validate_tools_optional_fields(config)
+    _validate_shell_optional_fields(config)
     _validate_web_search_optional_fields(config)
     _validate_web_fetch_optional_fields(config)
     _validate_skills_optional_fields(config)
@@ -279,6 +281,40 @@ def _validate_tools_optional_fields(config: dict[str, Any]) -> None:
             continue
         normalized[key] = value
     config["tools"] = normalized
+
+
+def _validate_shell_optional_fields(config: dict[str, Any]) -> None:
+    """Normalize `shell.env_passthrough`, the operator-added shell env allowlist.
+
+    The shell tool builds its child environment from a fixed allowlist rather
+    than inheriting the parent environment; this list names the extra variables
+    an operator wants forwarded. It defaults to empty.
+    """
+    shell_section = config.get("shell")
+    if shell_section is None:
+        config["shell"] = {"env_passthrough": []}
+        return
+    if not isinstance(shell_section, dict):
+        raise ConfigError("Config field shell must be a mapping.")
+
+    raw_names = shell_section.get("env_passthrough")
+    if raw_names is None:
+        shell_section["env_passthrough"] = []
+        return
+    if not isinstance(raw_names, list):
+        raise ConfigError("Config field shell.env_passthrough must be a list.")
+
+    normalized: list[str] = []
+    for entry in raw_names:
+        if not isinstance(entry, str) or not ENV_VAR_NAME_PATTERN.match(entry.strip()):
+            raise ConfigError(
+                "Config field shell.env_passthrough entries must be environment "
+                "variable names."
+            )
+        name = entry.strip()
+        if name not in normalized:
+            normalized.append(name)
+    shell_section["env_passthrough"] = normalized
 
 
 def _validate_web_search_optional_fields(config: dict[str, Any]) -> None:

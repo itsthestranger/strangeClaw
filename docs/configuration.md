@@ -45,6 +45,28 @@ Disabled tools are removed from the model-facing action surface. `spawn_subagent
 is an orchestration capability rather than a normal tool; see
 [Subagents](#subagents).
 
+## Shell Environment
+
+The `shell` tool does not inherit the agent process environment. It builds the
+child environment from a fixed allowlist — `PATH`, `HOME`, `LANG`, `TERM`, `TZ`
+— so a value exported only as an environment variable (a one-shot token from a
+wrapper script, for example) is not readable by a model-authored command.
+
+Add extra variables an operator wants forwarded:
+
+```yaml
+shell:
+  env_passthrough: []
+```
+
+Names listed here are appended to the allowlist. An allowlisted name that is
+absent from the parent environment is left unset in the child rather than being
+passed as an empty string.
+
+This is least-privilege hygiene, not an isolation boundary: Yolo mode runs
+directly on the host, and the shell tool can still read any file the operating
+system user can read. Use Fire mode when isolation is the requirement.
+
 ## Web Search
 
 `web_search` uses `config.yaml` for endpoint selection and

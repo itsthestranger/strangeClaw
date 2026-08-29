@@ -49,6 +49,14 @@ tools:
   http_request: true            # Medium risk: arbitrary HTTP API calls
   spawn_subagent: false         # Orchestration: delegate a subtask to a child agent
 
+shell:
+  # The shell tool builds its child environment from a fixed allowlist
+  # (PATH, HOME, LANG, TERM, TZ) instead of inheriting this process's
+  # environment, so a value exported only as an env var is not readable by a
+  # model-authored command. List extra variable names here to forward them.
+  # Allowlisted names missing from the parent environment stay unset.
+  env_passthrough: []
+
 web_search:
   # Quick-start: Brave API endpoint.
   # Self-hosted recommendation: set endpoint to SearXNG and format to "searxng".

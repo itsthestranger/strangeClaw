@@ -97,6 +97,47 @@ def test_load_config_reports_missing_environment_variable(tmp_path: Path) -> Non
         load_config(config_path)
 
 
+def test_load_config_normalizes_shell_env_passthrough(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config = _base_config(api_key="plain-key")
+    config["shell"] = {"env_passthrough": [" SC_TOKEN ", "SC_TOKEN", "GIT_SSH_COMMAND"]}
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["shell"]["env_passthrough"] == ["SC_TOKEN", "GIT_SSH_COMMAND"]
+
+
+def test_load_config_rejects_non_list_shell_env_passthrough(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config = _base_config(api_key="plain-key")
+    config["shell"] = {"env_passthrough": "SC_TOKEN"}
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match="shell.env_passthrough must be a list"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_shell_env_passthrough_entry(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config = _base_config(api_key="plain-key")
+    config["shell"] = {"env_passthrough": ["SC_TOKEN=value"]}
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match="environment variable names"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_mapping_shell_section(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config = _base_config(api_key="plain-key")
+    config["shell"] = ["SC_TOKEN"]
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match="Config field shell must be a mapping"):
+        load_config(config_path)
+
+
 def test_load_config_reports_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="Config file not found"):
         load_config(tmp_path / "does-not-exist.yaml")
@@ -131,6 +172,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
         "format": "brave",
         "max_results": 10,
     }
+    assert loaded["shell"] == {"env_passthrough": []}
     assert loaded["web_fetch"] == {"max_response_bytes": 524288}
     assert loaded["skills"] == {"directory": "./skills", "max_file_chars": 20000}
     assert loaded["host_services"] == {
