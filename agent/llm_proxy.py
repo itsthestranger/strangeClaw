@@ -40,6 +40,7 @@ class LLMProxyRuntime:
             text=str(response.get("text", "")),
             action=_deserialize_tool_call(response.get("action")),
             usage=_deserialize_usage(response.get("usage")),
+            action_error=_deserialize_action_error(response.get("action_error")),
         )
 
     def count_tokens(self, messages: list[dict[str, Any]]) -> int:
@@ -60,6 +61,19 @@ class LLMProxyRuntime:
         if not isinstance(tokens, int):
             raise LLMRuntimeError("llm count_tokens response missing integer tokens")
         return tokens
+
+
+def _deserialize_action_error(value: Any) -> str | None:
+    """Read the host's decision-rejection reason, tolerating its absence.
+
+    A host predating this field simply omits it, so ``None`` is a valid answer
+    and the guest falls back to the generic rejection message.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise LLMRuntimeError("llm complete response action_error must be a string or null")
+    return value
 
 
 def _deserialize_tool_call(value: Any) -> ToolCall | None:

@@ -182,12 +182,11 @@ DECISION_REJECTION_FALLBACK = (
 def _decision_rejection_message(response: LLMResponse) -> str:
     """Name the concrete reason a response carried no usable decision.
 
-    ``LLMClient`` reports it on ``action_error`` (see
-    ``agent.llm.LLMDecisionResponse``). Read defensively: other ``LLMRuntime``
-    implementations, including the Fire-mode host-service proxy, return a plain
-    ``LLMResponse`` and fall back to the generic message.
+    Every ``LLMRuntime`` carries it on ``LLMResponse.action_error``: ``LLMClient``
+    sets it when extraction fails, and the Fire-mode proxy relays the host's copy.
+    A runtime that leaves it unset falls back to the generic message.
     """
-    reason = getattr(response, "action_error", None)
+    reason = response.action_error
     if isinstance(reason, str) and reason.strip():
         return reason.strip()
     return DECISION_REJECTION_FALLBACK

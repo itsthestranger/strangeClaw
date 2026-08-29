@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import litellm
@@ -17,20 +16,6 @@ ONE_DECISION_RULE = "Emit exactly one structured decision per turn."
 # Longest fragment of a model-authored payload echoed back inside a rejection
 # reason. Long enough to be recognisable, short enough not to flood the prompt.
 _REASON_PREVIEW_LIMIT = 160
-
-
-@dataclass(slots=True)
-class LLMDecisionResponse(LLMResponse):
-    """``LLMResponse`` that also reports why no decision could be extracted.
-
-    ``action_error`` states the concrete violation (wrong number of tool calls,
-    unparseable arguments, ...) whenever ``action`` is ``None`` and a structured
-    decision was requested. It is ``None`` on success. Consumers should read it
-    defensively (``getattr``) because other ``LLMRuntime`` implementations return
-    a plain :class:`~agent.llm_types.LLMResponse`.
-    """
-
-    action_error: str | None = None
 
 
 class LLMClient:
@@ -129,7 +114,7 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         action_schema: dict[str, Any] | list[dict[str, Any]] | None = None,
-    ) -> LLMDecisionResponse:
+    ) -> LLMResponse:
         """Produce one normalized response."""
         response_action_mode = "none"
         completion_kwargs: dict[str, Any] = {
@@ -177,7 +162,7 @@ class LLMClient:
                 action, action_error = _extract_native_tool_call(response)
             else:
                 action, action_error = _extract_prompt_tool_call(text)
-        return LLMDecisionResponse(
+        return LLMResponse(
             text=text,
             action=action,
             usage=usage,

@@ -65,11 +65,16 @@ class LLMService:
         )
 
         response = self._llm.complete(messages, action_schema=action_schema)
+        # `action_error` can quote model-authored text (the unparseable-arguments
+        # case embeds a truncated payload preview), so it goes through the same
+        # redaction pass as error strings before crossing to the guest.
+        action_error = response.action_error
         return {
             "success": True,
             "text": response.text,
             "action": _serialize_tool_call(response.action),
             "usage": response.usage,
+            "action_error": None if action_error is None else self._redact(action_error),
         }
 
     def _handle_count_tokens(self, payload: dict[str, Any]) -> dict[str, Any]:

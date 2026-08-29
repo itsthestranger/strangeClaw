@@ -18,6 +18,7 @@ class FakeLLMClient:
         self.complete_calls: list[tuple[list[dict[str, Any]], Any]] = []
         self.count_token_calls: list[list[dict[str, Any]]] = []
         self.fail_with: Exception | None = None
+        self.action_error: str | None = None
 
     def complete(
         self,
@@ -27,6 +28,8 @@ class FakeLLMClient:
         self.complete_calls.append((messages, action_schema))
         if self.fail_with is not None:
             raise self.fail_with
+        if self.action_error is not None:
+            return LLMResponse(text="", action=None, usage=None, action_error=self.action_error)
         return LLMResponse(
             text="use shell",
             action=ToolCall(tool="shell", args={"command": "pwd"}, reason="inspect"),
@@ -66,8 +69,36 @@ def test_llm_service_complete_returns_normalized_shape() -> None:
         "text": "use shell",
         "action": {"tool": "shell", "args": {"command": "pwd"}, "reason": "inspect"},
         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        "action_error": None,
     }
     assert fake.complete_calls == [(messages, action_schema)]
+
+
+def test_llm_service_complete_forwards_decision_rejection_reason() -> None:
+    fake = FakeLLMClient()
+    fake.action_error = "You emitted 2 tool calls. Emit exactly one structured decision per turn."
+    service = LLMService(_config(), llm_client=fake)
+
+    result = service.handle(
+        {"action": "complete", "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert result["action_error"] == (
+        "You emitted 2 tool calls. Emit exactly one structured decision per turn."
+    )
+
+
+def test_llm_service_redacts_api_key_in_decision_rejection_reason() -> None:
+    fake = FakeLLMClient()
+    fake.action_error = 'Could not parse arguments: {"token":"sk-test-key"}'
+    service = LLMService(_config(api_key="sk-test-key"), llm_client=fake)
+
+    result = service.handle(
+        {"action": "complete", "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert result["action_error"] == 'Could not parse arguments: {"token":"[REDACTED]"}'
+    assert "sk-test-key" not in str(result)
 
 
 def test_llm_service_count_tokens_returns_token_count() -> None:

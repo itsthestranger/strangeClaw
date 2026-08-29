@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import threading
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,12 @@ import agent.agent as agent_module
 from agent.agent import Agent
 from agent.broker_client import BrokerClient
 from agent.llm import LLMClient
+from agent.llm_proxy import LLMProxyRuntime
 from agent.llm_types import LLMResponse, LLMRuntimeError, ToolCall
+from agent.protocol import decode_event, encode_event, validate_event
 from agent.transport import DEFAULT_MAX_FRAME_BYTES, InProcessTransport
 from sandbox.host_services import HostServiceServer
+from sandbox.llm_service import LLMService
 
 
 class ScriptedLLM:
@@ -1971,6 +1975,124 @@ def test_decision_error_observation_names_the_concrete_violation(
         for event in events
         if event.get("type") == "action" and event.get("tool") == "shell"
     ]
+
+    # The concrete reason reaches the next turn's prompt, which is the point.
+    assert len(execution_payloads) == 2
+    assert any(
+        isinstance(item, dict)
+        and expected_reason in str(item.get("result", {}).get("stderr", ""))
+        for item in execution_payloads[1]["recent_history"]
+    )
+
+    assert events[-1]["type"] == "done"
+    assert events[-1]["success"] is True
+    assert events[-1]["reply"] == "recovered"
+
+
+def test_fire_mode_decision_error_observation_names_the_concrete_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rejection reason survives the Fire host-service round trip.
+
+    Wires the guest exactly as Fire does -- ``LLMProxyRuntime`` over a fire-mode
+    ``BrokerClient`` -- and pushes every frame through ``encode_event`` /
+    ``validate_event`` / ``decode_event`` so the protocol layer is exercised too.
+    The guest must see the host's concrete reason, not the generic fallback.
+    """
+    expected_reason = f"You emitted 2 tool calls. {_ONE_DECISION_RULE}"
+    execution_turn = 0
+    execution_payloads: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs: Any) -> dict[str, Any]:
+        nonlocal execution_turn
+        messages = kwargs.get("messages")
+        if "tools" not in kwargs:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"goal":"g","steps":["attempt"],"referenced_skills":[]}'
+                        }
+                    }
+                ]
+            }
+        execution_turn += 1
+        if isinstance(messages, list) and messages and isinstance(messages[-1], dict):
+            user_payload = messages[-1].get("content")
+            if isinstance(user_payload, str):
+                execution_payloads.append(json.loads(user_payload))
+        if execution_turn == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [_SHELL_CALL] * 2}}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "agent_done",
+                                    "arguments": '{"reply":"recovered"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("agent.llm.litellm.completion", fake_completion)
+    monkeypatch.setattr("agent.llm.litellm.token_counter", lambda **_: 1)
+
+    server = HostServiceServer()
+    server.register(
+        "llm",
+        LLMService(
+            {"llm": {**_agent_config()["llm"], "native_probe": False}},
+            llm_client=LLMClient.from_config({**_agent_config()["llm"], "native_probe": False}),
+        ).handle,
+    )
+    inbound: deque[dict[str, Any]] = deque()
+
+    def send_fn(event: dict[str, Any]) -> None:
+        validate_event(event)
+        request = decode_event(encode_event(event))
+        response = server.handle_incoming(request)
+        validate_event(response)
+        inbound.append(decode_event(encode_event(response)))
+
+    def receive_fn(timeout_seconds: float | None) -> dict[str, Any] | None:
+        del timeout_seconds
+        return inbound.popleft() if inbound else None
+
+    host_transport, agent_transport = InProcessTransport.pair()
+    agent = Agent(
+        transport=agent_transport,
+        skills_dir=str(_skills_root()),
+        llm_runtime=LLMProxyRuntime(
+            BrokerClient(mode="fire", send_fn=send_fn, receive_fn=receive_fn)
+        ),
+        max_iterations=5,
+    )
+
+    worker = threading.Thread(target=agent.run)
+    worker.start()
+    host_transport.send(_task_event())
+
+    events = _collect_until_done(host_transport)
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+    error_actions = [
+        event
+        for event in events
+        if event.get("type") == "action" and event.get("tool") == "agent_decision_error"
+    ]
+    assert len(error_actions) == 1
+    stderr = str(error_actions[0]["result"]["stderr"])
+    assert stderr.startswith(f"Decision parse error: {expected_reason} ")
+    assert agent_module.DECISION_REJECTION_FALLBACK not in stderr
 
     # The concrete reason reaches the next turn's prompt, which is the point.
     assert len(execution_payloads) == 2

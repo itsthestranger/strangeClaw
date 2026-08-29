@@ -119,3 +119,64 @@ def test_llm_proxy_rejects_malformed_complete_action() -> None:
 
     with pytest.raises(LLMRuntimeError, match="tool and args"):
         runtime.complete([])
+
+
+def test_llm_proxy_complete_carries_decision_rejection_reason() -> None:
+    reason = "You emitted 2 tool calls. Emit exactly one structured decision per turn."
+    runtime = LLMProxyRuntime(
+        cast(
+            BrokerClient,
+            _FakeClient(
+                lambda _service, _payload: {
+                    "success": True,
+                    "text": "",
+                    "action": None,
+                    "usage": None,
+                    "action_error": reason,
+                }
+            ),
+        )
+    )
+
+    response = runtime.complete([])
+
+    assert response.action is None
+    assert response.action_error == reason
+
+
+def test_llm_proxy_tolerates_host_omitting_action_error() -> None:
+    """An older host predating the field must not break a newer guest."""
+    runtime = LLMProxyRuntime(
+        cast(
+            BrokerClient,
+            _FakeClient(
+                lambda _service, _payload: {
+                    "success": True,
+                    "text": "",
+                    "action": None,
+                    "usage": None,
+                }
+            ),
+        )
+    )
+
+    assert runtime.complete([]).action_error is None
+
+
+def test_llm_proxy_rejects_non_string_action_error() -> None:
+    runtime = LLMProxyRuntime(
+        cast(
+            BrokerClient,
+            _FakeClient(
+                lambda _service, _payload: {
+                    "success": True,
+                    "text": "",
+                    "action": None,
+                    "action_error": {"reason": "nope"},
+                }
+            ),
+        )
+    )
+
+    with pytest.raises(LLMRuntimeError, match="action_error must be a string"):
+        runtime.complete([])

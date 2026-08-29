@@ -17,11 +17,18 @@ class ToolCall:
 
 @dataclass(slots=True)
 class LLMResponse:
-    """Normalized model response."""
+    """Normalized model response.
+
+    ``action_error`` states the concrete violation (wrong number of tool calls,
+    unparseable arguments, ...) whenever ``action`` is ``None`` and a structured
+    decision was requested. It is ``None`` on success and whenever no structured
+    decision was asked for.
+    """
 
     text: str
     action: ToolCall | None
     usage: dict[str, int] | None = None
+    action_error: str | None = None
 
 
 class LLMRuntimeError(RuntimeError):
