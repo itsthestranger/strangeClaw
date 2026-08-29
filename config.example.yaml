@@ -83,7 +83,8 @@ host_services:
   # while bytes are buffered, before parsing, so a peer that never sends a
   # newline fails fast instead of growing the host buffer without limit.
   # Enforced identically by the host reader and the guest transport.
-  # Must be greater than llm_max_request_bytes.
+  # Must be greater than llm_max_request_bytes. Omit this key to derive it as
+  # max(4194304, llm_max_request_bytes * 2).
   max_frame_bytes: 4194304
 
 context:

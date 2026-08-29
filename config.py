@@ -382,13 +382,25 @@ def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
     skills["max_file_chars"] = max_file_chars
 
 
+def _derive_max_frame_bytes(llm_max_request_bytes: int) -> int:
+    """Frame cap for a config that never set one explicitly.
+
+    ``max_frame_bytes`` post-dates ``llm_max_request_bytes``, so a config that
+    raised the request cap and has no frame key at all must still load. The
+    implicit default therefore scales with the request cap instead of
+    conflicting with it, while never dropping below the built-in default.
+    """
+    return max(DEFAULT_MAX_FRAME_BYTES, llm_max_request_bytes * 2)
+
+
 def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
     host_services = config.get("host_services")
     if host_services is None:
+        default_llm_max_request_bytes = 2 * 1024 * 1024
         config["host_services"] = {
             "llm_timeout_seconds": 120,
-            "llm_max_request_bytes": 2 * 1024 * 1024,
-            "max_frame_bytes": DEFAULT_MAX_FRAME_BYTES,
+            "llm_max_request_bytes": default_llm_max_request_bytes,
+            "max_frame_bytes": _derive_max_frame_bytes(default_llm_max_request_bytes),
         }
         return
     if not isinstance(host_services, dict):
@@ -424,7 +436,9 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
         )
     host_services["llm_max_request_bytes"] = llm_max_request_bytes
 
-    max_frame_bytes_raw = host_services.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
+    max_frame_bytes_raw = host_services.get(
+        "max_frame_bytes", _derive_max_frame_bytes(llm_max_request_bytes)
+    )
     if isinstance(max_frame_bytes_raw, bool):
         raise ConfigError("Config field host_services.max_frame_bytes must be an integer.")
     if not isinstance(max_frame_bytes_raw, int):
@@ -435,8 +449,10 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
             "Config field host_services.max_frame_bytes must be greater than zero."
         )
     if max_frame_bytes <= llm_max_request_bytes:
-        # The frame cap bounds the whole JSON envelope, so it has to leave room
-        # for the largest legitimate payload the LLM proxy will accept.
+        # Only reachable when the operator set both keys in conflict: the
+        # derived default always clears the request cap. The frame cap bounds
+        # the whole JSON envelope, so it has to leave room for the largest
+        # legitimate payload the LLM proxy will accept.
         raise ConfigError(
             "Config field host_services.max_frame_bytes must be greater than "
             "host_services.llm_max_request_bytes."

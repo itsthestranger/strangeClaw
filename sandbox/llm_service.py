@@ -14,7 +14,9 @@ LOGGER = logging.getLogger(__name__)
 # Policy cap on the decoded request payload. This runs after the frame has been
 # buffered and parsed, so it is not a resource guard; the transport's
 # `max_frame_bytes` (see agent.transport.DEFAULT_MAX_FRAME_BYTES) bounds
-# buffering and must stay strictly above this value.
+# buffering and must stay strictly above this value. When an operator raises
+# this cap without setting `max_frame_bytes`, config loading derives the frame
+# cap from it rather than rejecting the config.
 DEFAULT_LLM_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 

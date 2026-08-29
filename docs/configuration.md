@@ -223,7 +223,10 @@ host_services:
   reader resets its decoder state, drops the connection, and raises; the failed
   stream is never resumed. It must be greater than `llm_max_request_bytes`,
   since it bounds the whole JSON event envelope around the largest legitimate
-  payload — a config where it is not is rejected at load time.
+  payload — a config where the operator sets both keys in conflict is rejected
+  at load time. When `max_frame_bytes` is left out, it is derived as
+  `max(4194304, llm_max_request_bytes * 2)`, so raising `llm_max_request_bytes`
+  alone keeps loading and still leaves headroom for the envelope.
 
 The host reader is the security-critical direction: it is fed by bytes from the
 guest, across the microVM trust boundary, and the host may be running other

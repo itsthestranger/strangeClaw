@@ -9,7 +9,9 @@ from typing import Any
 import pytest
 import yaml
 
+from agent.agent import _read_host_service_max_frame_bytes
 from config import ConfigError, load_config
+from sandbox.fire import _max_frame_bytes, _sanitize_agent_config_for_mmds
 
 
 def _base_config(api_key: str = "${ANTHROPIC_API_KEY}") -> dict[str, Any]:
@@ -236,6 +238,84 @@ def test_load_config_rejects_invalid_host_services(
     _write_config(config_path, config)
 
     with pytest.raises(ConfigError, match=r"host_services"):
+        load_config(config_path)
+
+
+def test_load_config_derives_max_frame_bytes_from_raised_request_cap(tmp_path: Path) -> None:
+    """A config predating max_frame_bytes that raised the request cap must still load."""
+    config = _base_config(api_key="plain-key")
+    config["host_services"] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 8 * 1024 * 1024,
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["host_services"]["max_frame_bytes"] == 16 * 1024 * 1024
+    assert loaded["host_services"]["max_frame_bytes"] > 8 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("llm_max_request_bytes", "expected_max_frame_bytes"),
+    [
+        (1024, 4 * 1024 * 1024),
+        (2 * 1024 * 1024, 4 * 1024 * 1024),
+        (4 * 1024 * 1024, 8 * 1024 * 1024),
+        (8 * 1024 * 1024, 16 * 1024 * 1024),
+    ],
+)
+def test_load_config_derived_max_frame_bytes_always_clears_request_cap(
+    tmp_path: Path,
+    llm_max_request_bytes: int,
+    expected_max_frame_bytes: int,
+) -> None:
+    config = _base_config(api_key="plain-key")
+    config["host_services"] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": llm_max_request_bytes,
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded["host_services"]["max_frame_bytes"] == expected_max_frame_bytes
+    assert loaded["host_services"]["max_frame_bytes"] > llm_max_request_bytes
+
+
+def test_derived_max_frame_bytes_is_what_host_and_guest_enforce(tmp_path: Path) -> None:
+    """The derived cap, not the bare constant, reaches both transport readers."""
+    config = _base_config(api_key="plain-key")
+    config["host_services"] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 8 * 1024 * 1024,
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    loaded = load_config(config_path)
+
+    host_cap = _max_frame_bytes(loaded)
+    guest_cap = _read_host_service_max_frame_bytes(_sanitize_agent_config_for_mmds(loaded))
+
+    assert host_cap == 16 * 1024 * 1024
+    assert guest_cap == host_cap
+
+
+def test_load_config_rejects_explicitly_conflicting_frame_cap(tmp_path: Path) -> None:
+    """An operator who sets both keys in conflict still gets a hard failure."""
+    config = _base_config(api_key="plain-key")
+    config["host_services"] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 8 * 1024 * 1024,
+        "max_frame_bytes": 4 * 1024 * 1024,
+    }
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, config)
+
+    with pytest.raises(ConfigError, match=r"max_frame_bytes must be greater than"):
         load_config(config_path)
 
 
