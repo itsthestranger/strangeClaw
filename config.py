@@ -11,7 +11,7 @@ from typing import Any, cast
 import yaml
 
 from agent.tools import default_tool_toggles
-from agent.transport import DEFAULT_MAX_FRAME_BYTES
+from agent.transport import derive_max_frame_bytes
 
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -382,17 +382,6 @@ def _validate_skills_optional_fields(config: dict[str, Any]) -> None:
     skills["max_file_chars"] = max_file_chars
 
 
-def _derive_max_frame_bytes(llm_max_request_bytes: int) -> int:
-    """Frame cap for a config that never set one explicitly.
-
-    ``max_frame_bytes`` post-dates ``llm_max_request_bytes``, so a config that
-    raised the request cap and has no frame key at all must still load. The
-    implicit default therefore scales with the request cap instead of
-    conflicting with it, while never dropping below the built-in default.
-    """
-    return max(DEFAULT_MAX_FRAME_BYTES, llm_max_request_bytes * 2)
-
-
 def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
     host_services = config.get("host_services")
     if host_services is None:
@@ -400,7 +389,7 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
         config["host_services"] = {
             "llm_timeout_seconds": 120,
             "llm_max_request_bytes": default_llm_max_request_bytes,
-            "max_frame_bytes": _derive_max_frame_bytes(default_llm_max_request_bytes),
+            "max_frame_bytes": derive_max_frame_bytes(default_llm_max_request_bytes),
         }
         return
     if not isinstance(host_services, dict):
@@ -437,7 +426,7 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
     host_services["llm_max_request_bytes"] = llm_max_request_bytes
 
     max_frame_bytes_raw = host_services.get(
-        "max_frame_bytes", _derive_max_frame_bytes(llm_max_request_bytes)
+        "max_frame_bytes", derive_max_frame_bytes(llm_max_request_bytes)
     )
     if isinstance(max_frame_bytes_raw, bool):
         raise ConfigError("Config field host_services.max_frame_bytes must be an integer.")

@@ -19,6 +19,20 @@ from agent.protocol import decode_event, encode_event
 DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024
 
 
+def derive_max_frame_bytes(llm_max_request_bytes: int) -> int:
+    """Frame cap for a caller that never set one explicitly.
+
+    ``max_frame_bytes`` post-dates ``llm_max_request_bytes``, so a config that
+    raised the request cap and has no frame key at all must still load. The
+    implicit default therefore scales with the request cap instead of
+    conflicting with it, while never dropping below the built-in default.
+
+    Lives beside the constant it falls back to so that every implicit cap in the
+    project derives the same way and the two cannot drift apart.
+    """
+    return max(DEFAULT_MAX_FRAME_BYTES, llm_max_request_bytes * 2)
+
+
 class InProcessTransport:
     """Queue-based in-process transport."""
 

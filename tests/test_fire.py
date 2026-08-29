@@ -16,6 +16,7 @@ import responses
 
 from agent.agent import _read_host_service_max_frame_bytes
 from agent.protocol import decode_event, encode_event
+from agent.transport import DEFAULT_MAX_FRAME_BYTES, derive_max_frame_bytes
 from sandbox.fire import (
     DEFAULT_BOOT_ARGS,
     FirecrackerAPIClient,
@@ -29,6 +30,7 @@ from sandbox.fire import (
     TapNetworkAllocation,
     VMBootError,
     _assert_no_secrets,
+    _coerce_agent_config_template,
     _default_popen_factory,
     _max_frame_bytes,
     _sanitize_agent_config_for_mmds,
@@ -2902,6 +2904,36 @@ def test_mmds_sanitizer_falls_back_to_default_max_frame_bytes() -> None:
     sanitized = _sanitize_agent_config_for_mmds(_frame_cap_agent_config(None))
 
     assert sanitized["host_services"]["max_frame_bytes"] == 4 * 1024 * 1024
+
+
+def test_llm_config_fallback_template_derives_its_own_frame_cap() -> None:
+    """The llm_config fallback template must derive its cap, not hardcode a literal.
+
+    It is the one host_services block that never passes through config.py, so a
+    hardcoded constant here would silently stop matching the derivation rule if
+    either default moved.
+    """
+    template = _coerce_agent_config_template(
+        llm_config={"model": "m", "api_key": "k"}, agent_config=None
+    )
+    host_services = template["host_services"]
+
+    assert host_services["llm_max_request_bytes"] == DEFAULT_LLM_MAX_REQUEST_BYTES
+    assert host_services["max_frame_bytes"] == derive_max_frame_bytes(
+        DEFAULT_LLM_MAX_REQUEST_BYTES
+    )
+    # The invariant config.py enforces must hold here too.
+    assert host_services["max_frame_bytes"] > host_services["llm_max_request_bytes"]
+
+
+def test_fallback_template_and_config_agree_on_the_implicit_cap() -> None:
+    """Both implicit-cap paths derive identically, so the two cannot drift apart."""
+    template_cap = _coerce_agent_config_template(
+        llm_config={"model": "m", "api_key": "k"}, agent_config=None
+    )["host_services"]["max_frame_bytes"]
+
+    assert template_cap == derive_max_frame_bytes(DEFAULT_LLM_MAX_REQUEST_BYTES)
+    assert _max_frame_bytes({"host_services": {}}) == DEFAULT_MAX_FRAME_BYTES
 
 
 @pytest.mark.parametrize("configured", [None, 1024 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024])

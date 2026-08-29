@@ -25,11 +25,11 @@ from typing import Any, Protocol, cast
 from agent.broker_client import HostServiceError
 from agent.protocol import decode_event, encode_event
 from agent.tools import CAPABILITY_TOOL_NAMES, default_tool_toggles
-from agent.transport import DEFAULT_MAX_FRAME_BYTES
+from agent.transport import DEFAULT_MAX_FRAME_BYTES, derive_max_frame_bytes
 from host_secrets import load_secrets
 from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
-from sandbox.llm_service import LLMService
+from sandbox.llm_service import DEFAULT_LLM_MAX_REQUEST_BYTES, LLMService
 
 DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
 _HOST_IFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
@@ -1875,8 +1875,8 @@ def _coerce_agent_config_template(
             },
             "host_services": {
                 "llm_timeout_seconds": 120,
-                "llm_max_request_bytes": 2 * 1024 * 1024,
-                "max_frame_bytes": DEFAULT_MAX_FRAME_BYTES,
+                "llm_max_request_bytes": DEFAULT_LLM_MAX_REQUEST_BYTES,
+                "max_frame_bytes": derive_max_frame_bytes(DEFAULT_LLM_MAX_REQUEST_BYTES),
             },
         }
 
