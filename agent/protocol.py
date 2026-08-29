@@ -5,17 +5,22 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-EVENT_TYPES = {
-    "task",
-    "user_reply",
-    "stop",
-    "agent_ready",
-    "message",
-    "action",
-    "done",
-    "broker_request",
-    "broker_response",
+# Closed key schema: every event type declares the full set of top-level keys it
+# may carry (required and optional alike). Any key outside its set is rejected,
+# so a field cannot be smuggled across the guest/host boundary by riding along on
+# an otherwise valid event.
+EVENT_KEYS: dict[str, frozenset[str]] = {
+    "task": frozenset({"type", "text", "session_id", "approval_mode", "state"}),
+    "user_reply": frozenset({"type", "text", "approved"}),
+    "stop": frozenset({"type"}),
+    "agent_ready": frozenset({"type"}),
+    "message": frozenset({"type", "role", "content"}),
+    "action": frozenset({"type", "tool", "args", "result"}),
+    "done": frozenset({"type", "success", "reply", "state", "files"}),
+    "broker_request": frozenset({"type", "request_id", "service", "payload"}),
+    "broker_response": frozenset({"type", "request_id", "success", "payload", "error"}),
 }
+EVENT_TYPES = frozenset(EVENT_KEYS)
 MESSAGE_ROLES = {"plan", "clarification", "status", "reply"}
 
 
@@ -53,15 +58,12 @@ def validate_event(event: dict[str, Any]) -> None:
     if event_type not in EVENT_TYPES:
         raise ProtocolError(f"Unsupported event type: {event_type}")
 
+    _reject_unknown_keys(event, event_type)
+
     if event_type == "task":
         _require_str(event, "text")
         _require_str(event, "session_id")
         _require_str(event, "approval_mode")
-        if "llm" in event:
-            raise ProtocolError(
-                "Event field 'llm' is not supported on task events. "
-                "Pass LLM config at agent construction time."
-            )
         return
 
     if event_type == "user_reply":
@@ -112,6 +114,18 @@ def validate_event(event: dict[str, Any]) -> None:
             return
         _require_str(event, "error")
         return
+
+
+def _reject_unknown_keys(event: dict[str, Any], event_type: str) -> None:
+    allowed = EVENT_KEYS[event_type]
+    unknown = sorted(key for key in event if key not in allowed)
+    if not unknown:
+        return
+    named = ", ".join(f"'{key}'" for key in unknown)
+    raise ProtocolError(
+        f"Event field {named} is not allowed on {event_type} events. "
+        f"Allowed fields: {', '.join(sorted(allowed))}."
+    )
 
 
 def _require_str(event: dict[str, Any], key: str) -> str:
