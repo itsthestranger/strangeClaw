@@ -1073,3 +1073,61 @@ def test_coordinator_can_disable_fire_lifecycle_status_messages(
     ]
     assert statuses == []
     assert seen_events[-1].get("type") == "done"
+
+
+def test_coordinator_worker_error_does_not_clobber_persisted_state(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    persisted_state = {
+        "goal": "g",
+        "plan": {"steps": ["one"]},
+        "history": [{"type": "action"}],
+        "summary": "accumulated notes so far",
+    }
+    sandbox = FakeSandbox(
+        events=[
+            {
+                "type": "done",
+                "success": True,
+                "reply": "first",
+                "state": persisted_state,
+                "files": [],
+            }
+        ]
+    )
+    coordinator = Coordinator(
+        sandbox_factory=lambda: sandbox,
+        approval_mode="review",
+        llm_config={"model": "x", "api_key": "k"},
+    )
+    seen_events: list[dict[str, Any]] = []
+
+    status = coordinator.start_task(session_id="sess-1", text="first", sink=seen_events.append)
+    assert status == "started"
+    assert _wait_until(lambda: any(event.get("type") == "done" for event in seen_events))
+
+    state_path = tmp_path / ".strangeclaw" / "sessions" / "sess-1" / "state.json"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == persisted_state
+    assert coordinator._sessions["sess-1"].latest_state == persisted_state  # type: ignore[attr-defined]
+
+    # Simulate a sandbox-start failure on a later, unrelated task in the same
+    # session (e.g. a Firecracker boot hiccup) — this synthesizes a "done"
+    # event with no usable state, which must not clobber durable session state.
+    coordinator._handle_worker_error(  # type: ignore[attr-defined]
+        session_id="sess-1", error=RuntimeError("simulated Firecracker boot failure")
+    )
+
+    failure_events = [
+        event
+        for event in seen_events
+        if event.get("type") == "done" and event.get("success") is False
+    ]
+    assert len(failure_events) == 1
+    assert "simulated Firecracker boot failure" in str(failure_events[0]["reply"])
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == persisted_state
+    assert coordinator._sessions["sess-1"].latest_state == persisted_state  # type: ignore[attr-defined]
+
+    coordinator.stop_all()

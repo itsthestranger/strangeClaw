@@ -20,7 +20,7 @@ def persist_done_event(*, session_id: str, done_event: dict[str, Any]) -> dict[s
     follow-up state has the same secret-safety guarantees as persisted state.
     """
     state = done_event.get("state")
-    if not isinstance(state, dict):
+    if not isinstance(state, dict) or not state:
         return None
 
     redacted_state: dict[str, Any] = redact_sensitive(state)
