@@ -190,6 +190,21 @@ the existing event stream:
 In Yolo mode, host-service calls are in-process. In Fire mode, they are
 multiplexed over the same vsock JSONL stream as agent events.
 
+## Transport Framing
+
+Events are newline-delimited JSON. Both readers — `VsockTransport.receive` in
+the guest and `FireSandbox._receive_raw_event` on the host — buffer partial
+reads in instance state that survives a receive timeout, so the buffer is
+bounded by `host_services.max_frame_bytes` (4 MiB by default) as bytes arrive,
+before anything is parsed. Exceeding the cap with no delimiter, or reaching EOF
+with a partial frame still buffered, is a fatal framing error: the reader clears
+its buffer, closes the connection, and raises an error naming the condition and
+the number of truncated bytes. A stream that has failed this way is never
+resumed.
+
+This matters most in the host direction, where the buffered bytes are guest-
+controlled and cross the microVM trust boundary.
+
 ## Credential Boundaries
 
 External API/search credentials live in `~/.strangeclaw/secrets.yaml` and are

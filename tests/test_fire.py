@@ -32,6 +32,7 @@ from sandbox.fire import (
     configure_microvm_preboot,
     load_firecracker_config,
 )
+from sandbox.llm_service import DEFAULT_LLM_MAX_REQUEST_BYTES
 
 
 def test_load_firecracker_config_validates_and_resolves(tmp_path: Path) -> None:
@@ -2687,3 +2688,175 @@ def test_guest_rootfs_dockerfile_ships_all_guest_agent_modules() -> None:
 
     # And nothing host-only sneaks into the guest image.
     assert not (shipped & host_only), "host-only module copied into guest rootfs"
+
+
+class _EndlessNoNewlineSocket:
+    """A peer that streams bytes forever and never sends a frame delimiter."""
+
+    def __init__(self, chunk: bytes = b"x" * 4096) -> None:
+        self._chunk = chunk
+        self.recv_calls = 0
+        self.closed = False
+        self.sent: list[bytes] = []
+
+    def settimeout(self, timeout: float | None) -> None:
+        del timeout
+
+    def connect(self, address: Any) -> None:
+        del address
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    def recv(self, bufsize: int) -> bytes:
+        del bufsize
+        self.recv_calls += 1
+        return self._chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _frame_reader_sandbox(tmp_path: Path, *, max_frame_bytes: int) -> FireSandbox:
+    agent_config = _agent_config(
+        model="openai/gpt-4.1-mini",
+        api_key="sk-host",
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    agent_config["host_services"] = {
+        "llm_timeout_seconds": 120,
+        "llm_max_request_bytes": 1024,
+        "max_frame_bytes": max_frame_bytes,
+    }
+    return FireSandbox(
+        firecracker_config=_build_firecracker_config(tmp_path),
+        agent_config=agent_config,
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+
+
+def test_fire_recv_buffer_is_bounded_for_stream_without_newline(tmp_path: Path) -> None:
+    """A guest that never sends a newline must fail fast, not grow the host buffer."""
+    cap = 64 * 1024
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=cap)
+    conn = _EndlessNoNewlineSocket()
+    sandbox._vsock_conn = cast(Any, conn)
+
+    with pytest.raises(RuntimeError, match=r"exceeded max_frame_bytes \(65536\)"):
+        sandbox._receive_raw_event(timeout_seconds=30.0)
+
+    # Bounded: the reader stopped within one chunk of the cap instead of looping.
+    assert conn.recv_calls <= (cap // 4096) + 1
+    # Clean: decoder state is reset and the connection is dropped.
+    assert sandbox._recv_buffer == ""
+    assert conn.closed is True
+    assert sandbox._vsock_conn is None
+    # The failed stream is never resumed.
+    with pytest.raises(RuntimeError, match=r"exceeded max_frame_bytes"):
+        sandbox._receive_raw_event(timeout_seconds=30.0)
+
+
+def test_fire_recv_buffer_cap_survives_receive_timeouts(tmp_path: Path) -> None:
+    """The cap applies to buffer state accumulated across separate receive calls."""
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=8192)
+    sandbox._recv_buffer = "y" * 8000
+    conn = _EndlessNoNewlineSocket(chunk=b"z" * 500)
+    sandbox._vsock_conn = cast(Any, conn)
+
+    with pytest.raises(RuntimeError, match=r"exceeded max_frame_bytes"):
+        sandbox._receive_raw_event(timeout_seconds=30.0)
+
+    assert conn.recv_calls == 1
+    assert sandbox._recv_buffer == ""
+
+
+def test_fire_receive_reports_truncated_final_frame_on_eof(tmp_path: Path) -> None:
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=64 * 1024)
+    conn = _FakeConnectedSocket(recv_chunks=[b'{"type":"do'])
+    sandbox._vsock_conn = cast(Any, conn)
+
+    with pytest.raises(RuntimeError, match=r"truncated final frame of 11 bytes"):
+        sandbox._receive_raw_event(timeout_seconds=30.0)
+    assert sandbox._recv_buffer == ""
+
+
+def test_fire_receive_reports_clean_eof_without_truncation_note(tmp_path: Path) -> None:
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=64 * 1024)
+    conn = _FakeConnectedSocket(recv_chunks=[])
+    sandbox._vsock_conn = cast(Any, conn)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sandbox._receive_raw_event(timeout_seconds=30.0)
+    assert "closed unexpectedly" in str(excinfo.value)
+    assert "truncated final frame" not in str(excinfo.value)
+
+
+def test_fire_receive_handles_normal_and_split_frames_under_cap(tmp_path: Path) -> None:
+    """Normal traffic, including frames split across reads, is unaffected."""
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=64 * 1024)
+    conn = _FakeConnectedSocket(
+        recv_chunks=[
+            b'{"type":"agent_read',
+            b'y"}\n{"type":"st',
+            b'op"}\n',
+        ]
+    )
+    sandbox._vsock_conn = cast(Any, conn)
+
+    assert sandbox._receive_raw_event(timeout_seconds=30.0) == {"type": "agent_ready"}
+    assert sandbox._receive_raw_event(timeout_seconds=30.0) == {"type": "stop"}
+    assert sandbox._recv_buffer == ""
+
+
+def test_fire_handshake_line_read_is_bounded(tmp_path: Path) -> None:
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=16 * 1024)
+    conn = _EndlessNoNewlineSocket()
+
+    with pytest.raises(VMBootError, match=r"handshake line exceeded max_frame_bytes"):
+        sandbox._recv_line_bytes(cast(Any, conn), timeout_seconds=1.0)
+
+    assert conn.recv_calls <= (16 * 1024 // 4096) + 1
+
+
+def test_fire_handshake_line_read_reports_truncation_on_eof(tmp_path: Path) -> None:
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=16 * 1024)
+    conn = _FakeConnectedSocket(recv_chunks=[b"OK 10"])
+
+    with pytest.raises(VMBootError, match=r"truncated handshake line of 5 bytes"):
+        sandbox._recv_line_bytes(cast(Any, conn), timeout_seconds=1.0)
+
+
+def test_fire_handshake_remainder_respects_frame_cap(tmp_path: Path) -> None:
+    """The handshake remainder is appended through the same bounded path."""
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=1024)
+    conn = _FakeConnectedSocket(recv_chunks=[b"OK 100\n" + b"q" * 2048])
+
+    with pytest.raises(RuntimeError, match=r"exceeded max_frame_bytes"):
+        sandbox._recv_line_bytes(cast(Any, conn), timeout_seconds=1.0)
+    assert sandbox._recv_buffer == ""
+
+
+def test_fire_handshake_remainder_is_kept_under_the_cap(tmp_path: Path) -> None:
+    sandbox = _frame_reader_sandbox(tmp_path, max_frame_bytes=64 * 1024)
+    conn = _FakeConnectedSocket(recv_chunks=[b'OK 100\n{"type":"agent_ready"}\n'])
+
+    assert sandbox._recv_line_bytes(cast(Any, conn), timeout_seconds=1.0) == b"OK 100"
+    assert sandbox._recv_buffer == '{"type":"agent_ready"}\n'
+
+
+def test_fire_max_frame_bytes_defaults_when_unconfigured(tmp_path: Path) -> None:
+    sandbox = FireSandbox(
+        firecracker_config=_build_firecracker_config(tmp_path),
+        agent_config=_agent_config(
+            model="openai/gpt-4.1-mini",
+            api_key="sk-host",
+            max_tokens=1024,
+            temperature=0.2,
+        ),
+        temp_root=tmp_path,
+        install_exit_handlers=False,
+    )
+    assert sandbox._max_frame_bytes == 4 * 1024 * 1024
+    assert sandbox._max_frame_bytes > DEFAULT_LLM_MAX_REQUEST_BYTES

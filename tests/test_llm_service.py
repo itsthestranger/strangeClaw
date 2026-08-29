@@ -8,8 +8,9 @@ import pytest
 
 from agent.broker_client import BrokerClient
 from agent.llm_types import LLMResponse, ToolCall
+from agent.transport import DEFAULT_MAX_FRAME_BYTES
 from sandbox.host_services import HostServiceServer
-from sandbox.llm_service import LLMService
+from sandbox.llm_service import DEFAULT_LLM_MAX_REQUEST_BYTES, LLMService
 
 
 class FakeLLMClient:
@@ -165,3 +166,14 @@ def test_llm_service_registers_with_host_service_server() -> None:
     result = client.call("llm", {"action": "count_tokens", "messages": []})
 
     assert result == {"success": True, "tokens": 42}
+
+
+def test_frame_cap_exceeds_llm_request_cap() -> None:
+    """The transport frame cap is a resource guard that must clear the policy cap.
+
+    ``DEFAULT_LLM_MAX_REQUEST_BYTES`` is checked only after a frame has been
+    buffered and parsed, so it cannot bound buffering. ``DEFAULT_MAX_FRAME_BYTES``
+    does that, and must leave room for the largest payload the policy allows plus
+    its JSON event envelope.
+    """
+    assert DEFAULT_MAX_FRAME_BYTES > DEFAULT_LLM_MAX_REQUEST_BYTES

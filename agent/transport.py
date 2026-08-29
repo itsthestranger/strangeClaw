@@ -9,6 +9,15 @@ from typing import Any, Protocol
 
 from agent.protocol import decode_event, encode_event
 
+# Upper bound on a single newline-delimited frame. A peer that never sends a
+# delimiter would otherwise grow the receive buffer without limit, so this is a
+# resource guard, not a policy check: it is enforced while bytes are being
+# buffered, before any parse happens. It must stay comfortably above the largest
+# legitimate frame; the driver is the host LLM proxy, whose own payload cap is
+# `host_services.llm_max_request_bytes` (2 MiB by default). This value leaves
+# room for that payload plus its JSON event envelope and escaping.
+DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024
+
 
 class InProcessTransport:
     """Queue-based in-process transport."""
@@ -79,6 +88,7 @@ class VsockTransport:
         guest_port: int,
         *,
         recv_buffer_size: int = 65 * 1024,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         connected_socket: SocketLike | None = None,
         socket_family: int | None = None,
         unix_socket_path: str | None = None,
@@ -87,10 +97,14 @@ class VsockTransport:
             raise ValueError("guest_port must be greater than zero.")
         if recv_buffer_size <= 0:
             raise ValueError("recv_buffer_size must be greater than zero.")
+        if max_frame_bytes <= 0:
+            raise ValueError("max_frame_bytes must be greater than zero.")
 
         self._recv_buffer_size = recv_buffer_size
+        self._max_frame_bytes = max_frame_bytes
         self._closed = False
         self._buffer = ""
+        self._failure: str | None = None
         self._listener: socket.socket | None = None
 
         if connected_socket is not None:
@@ -139,6 +153,8 @@ class VsockTransport:
 
     def send(self, event: dict[str, Any]) -> None:
         """Send an event."""
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
         if self._closed:
             raise RuntimeError("Transport is closed.")
         payload = encode_event(event).encode("utf-8")
@@ -149,6 +165,8 @@ class VsockTransport:
 
     def receive(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
         """Receive an event or None on timeout."""
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
         if self._closed:
             raise RuntimeError("Transport is closed.")
         if timeout_seconds is not None and timeout_seconds < 0:
@@ -177,12 +195,41 @@ class VsockTransport:
                 raise RuntimeError(f"Failed to receive event on socket transport: {exc}") from exc
 
             if not chunk:
-                raise RuntimeError("Socket transport peer closed the connection.")
+                pending = len(self._buffer)
+                message = "Socket transport peer closed the connection."
+                if pending:
+                    message += (
+                        f" Discarding a truncated final frame of {pending} bytes"
+                        " with no trailing newline."
+                    )
+                raise self._fail(message)
 
             self._buffer += chunk.decode("utf-8", errors="strict")
             line = self._extract_line()
             if line is not None:
                 return decode_event(line)
+            # The buffer is instance state that survives timeouts, so an
+            # undelimited stream keeps growing across separate receive() calls.
+            # Bound it here, where the bytes land. Encoded frames are ASCII
+            # JSON, so character count equals byte count for legitimate traffic
+            # and under-counts (i.e. trips the cap sooner) for anything else.
+            if len(self._buffer) > self._max_frame_bytes:
+                raise self._fail(
+                    "Socket transport frame exceeded max_frame_bytes "
+                    f"({self._max_frame_bytes}) with no newline delimiter."
+                )
+
+    def _fail(self, message: str) -> RuntimeError:
+        """Reset decoder state, close the stream, and build the fatal error.
+
+        The failed stream is never resumed: every later send/receive raises the
+        same error rather than reading more bytes from a peer that has already
+        violated the framing contract.
+        """
+        self._buffer = ""
+        self._failure = message
+        self.close()
+        return RuntimeError(message)
 
     def close(self) -> None:
         """Close transport resources."""

@@ -134,6 +134,7 @@ def test_load_config_sets_optional_defaults(tmp_path: Path) -> None:
     assert loaded["host_services"] == {
         "llm_timeout_seconds": 120,
         "llm_max_request_bytes": 2 * 1024 * 1024,
+        "max_frame_bytes": 4 * 1024 * 1024,
     }
     assert loaded["firecracker"]["log_export"] == {"enabled": False, "max_bytes": 32 * 1024}
     assert loaded["firecracker"]["lifecycle_status_messages"] is True
@@ -216,6 +217,13 @@ def test_load_config_rejects_invalid_llm_api_base_type(tmp_path: Path) -> None:
         {"llm_timeout_seconds": 30.5, "llm_max_request_bytes": 1024},
         {"llm_timeout_seconds": 30, "llm_max_request_bytes": "1024"},
         {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024.5},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024, "max_frame_bytes": 0},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024, "max_frame_bytes": True},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024, "max_frame_bytes": "4096"},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 1024, "max_frame_bytes": 4096.5},
+        # max_frame_bytes must leave room for the largest legitimate LLM payload.
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 4096, "max_frame_bytes": 4096},
+        {"llm_timeout_seconds": 30, "llm_max_request_bytes": 4096, "max_frame_bytes": 2048},
     ],
 )
 def test_load_config_rejects_invalid_host_services(

@@ -25,6 +25,7 @@ from typing import Any, Protocol, cast
 from agent.broker_client import HostServiceError
 from agent.protocol import decode_event, encode_event
 from agent.tools import CAPABILITY_TOOL_NAMES, default_tool_toggles
+from agent.transport import DEFAULT_MAX_FRAME_BYTES
 from host_secrets import load_secrets
 from sandbox.broker import RequestBroker
 from sandbox.host_services import HostServiceServer
@@ -972,6 +973,8 @@ class FireSandbox:
         self._guest_cid: int | None = None
         self._vsock_conn: ConnectedSocket | None = None
         self._recv_buffer = ""
+        self._recv_failure: str | None = None
+        self._max_frame_bytes = _max_frame_bytes(self._agent_config_template)
         self._stopping = False
         self._host_service_server: HostServiceServer | None = None
 
@@ -1136,6 +1139,7 @@ class FireSandbox:
             self._rootfs_copy_path = None
             self._session_id = None
             self._recv_buffer = ""
+            self._recv_failure = None
             self._credentials = {}
         finally:
             self._process = None
@@ -1144,6 +1148,8 @@ class FireSandbox:
             self._stopping = False
 
     def _receive_raw_event(self, timeout_seconds: float | None = None) -> dict[str, Any] | None:
+        if self._recv_failure is not None:
+            raise RuntimeError(self._recv_failure)
         conn = self._require_vsock_conn()
 
         line = self._extract_line()
@@ -1175,16 +1181,17 @@ class FireSandbox:
                     return None
                 exit_code = self._process.poll() if self._process is not None else None
                 console = self._guest_console_diagnostics()
+                truncated = self._truncated_frame_diagnostic()
                 if exit_code is None:
-                    raise RuntimeError(
-                        f"Guest vsock connection closed unexpectedly.{console}"
+                    raise self._fail_recv(
+                        f"Guest vsock connection closed unexpectedly.{truncated}{console}"
                     )
-                raise RuntimeError(
+                raise self._fail_recv(
                     "Guest vsock connection closed (firecracker exited with code "
-                    f"{exit_code}).{console}"
+                    f"{exit_code}).{truncated}{console}"
                 )
 
-            self._recv_buffer += chunk.decode("utf-8", errors="strict")
+            self._append_recv_buffer(chunk.decode("utf-8", errors="strict"))
             line = self._extract_line()
             if line is not None:
                 return decode_event(line)
@@ -1354,17 +1361,65 @@ class FireSandbox:
         while b"\n" not in data:
             chunk = conn.recv(4096)
             if not chunk:
-                raise VMBootError("EOF while waiting for vsock handshake line.")
+                truncated = ""
+                if data:
+                    truncated = (
+                        f" Discarding a truncated handshake line of {len(data)} bytes"
+                        " with no trailing newline."
+                    )
+                raise VMBootError(f"EOF while waiting for vsock handshake line.{truncated}")
             data += chunk
+            if len(data) > self._max_frame_bytes:
+                raise VMBootError(
+                    "vsock handshake line exceeded max_frame_bytes "
+                    f"({self._max_frame_bytes}) with no newline delimiter."
+                )
         line, remainder = data.split(b"\n", 1)
         if remainder:
-            self._recv_buffer += remainder.decode("utf-8", errors="strict")
+            self._append_recv_buffer(remainder.decode("utf-8", errors="strict"))
         return line
 
     def _require_vsock_conn(self) -> ConnectedSocket:
         if self._vsock_conn is None:
             raise RuntimeError("FireSandbox is not connected to guest vsock.")
         return self._vsock_conn
+
+    def _append_recv_buffer(self, text: str) -> None:
+        """Append decoded bytes to the frame buffer, enforcing the frame cap.
+
+        The buffer is instance state that survives receive timeouts, so a guest
+        that never sends a newline would otherwise grow the host process's
+        buffer without limit across separate reads. The cap is checked here,
+        where the guest-controlled bytes land, before any parse happens.
+        Encoded frames are ASCII JSON, so character count equals byte count for
+        legitimate traffic and under-counts for anything else.
+        """
+        self._recv_buffer += text
+        if len(self._recv_buffer) > self._max_frame_bytes:
+            raise self._fail_recv(
+                "Guest vsock frame exceeded max_frame_bytes "
+                f"({self._max_frame_bytes}) with no newline delimiter."
+            )
+
+    def _truncated_frame_diagnostic(self) -> str:
+        if not self._recv_buffer:
+            return ""
+        return (
+            f" Discarding a truncated final frame of {len(self._recv_buffer)} bytes"
+            " with no trailing newline."
+        )
+
+    def _fail_recv(self, message: str) -> RuntimeError:
+        """Reset frame-decoder state, drop the connection, build the error.
+
+        The failed stream is never resumed: later reads raise the same error
+        instead of trusting more bytes from a peer that has already violated
+        the framing contract.
+        """
+        self._recv_buffer = ""
+        self._recv_failure = message
+        self._close_vsock_conn()
+        return RuntimeError(message)
 
     def _extract_line(self) -> str | None:
         newline_index = self._recv_buffer.find("\n")
@@ -1757,6 +1812,17 @@ def _validate_agent_config_payload(payload: Mapping[str, Any]) -> None:
             raise FirecrackerConfigError("config.max_iterations must be greater than zero.")
 
 
+def _max_frame_bytes(config: Mapping[str, Any]) -> int:
+    """Read the transport frame cap from host_services, falling back to the default."""
+    host_services = config.get("host_services")
+    if not isinstance(host_services, Mapping):
+        return DEFAULT_MAX_FRAME_BYTES
+    raw_value = host_services.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value <= 0:
+        return DEFAULT_MAX_FRAME_BYTES
+    return raw_value
+
+
 def _coerce_agent_config_template(
     *,
     llm_config: Mapping[str, Any] | None,
@@ -1800,6 +1866,7 @@ def _coerce_agent_config_template(
             "host_services": {
                 "llm_timeout_seconds": 120,
                 "llm_max_request_bytes": 2 * 1024 * 1024,
+                "max_frame_bytes": DEFAULT_MAX_FRAME_BYTES,
             },
         }
 

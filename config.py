@@ -11,6 +11,7 @@ from typing import Any, cast
 import yaml
 
 from agent.tools import default_tool_toggles
+from agent.transport import DEFAULT_MAX_FRAME_BYTES
 
 DEFAULT_FALLBACK_CONFIG = Path(__file__).resolve().parent / "config.example.yaml"
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -387,6 +388,7 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
         config["host_services"] = {
             "llm_timeout_seconds": 120,
             "llm_max_request_bytes": 2 * 1024 * 1024,
+            "max_frame_bytes": DEFAULT_MAX_FRAME_BYTES,
         }
         return
     if not isinstance(host_services, dict):
@@ -421,6 +423,25 @@ def _validate_host_services_optional_fields(config: dict[str, Any]) -> None:
             "Config field host_services.llm_max_request_bytes must be greater than zero."
         )
     host_services["llm_max_request_bytes"] = llm_max_request_bytes
+
+    max_frame_bytes_raw = host_services.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
+    if isinstance(max_frame_bytes_raw, bool):
+        raise ConfigError("Config field host_services.max_frame_bytes must be an integer.")
+    if not isinstance(max_frame_bytes_raw, int):
+        raise ConfigError("Config field host_services.max_frame_bytes must be an integer.")
+    max_frame_bytes = max_frame_bytes_raw
+    if max_frame_bytes <= 0:
+        raise ConfigError(
+            "Config field host_services.max_frame_bytes must be greater than zero."
+        )
+    if max_frame_bytes <= llm_max_request_bytes:
+        # The frame cap bounds the whole JSON envelope, so it has to leave room
+        # for the largest legitimate payload the LLM proxy will accept.
+        raise ConfigError(
+            "Config field host_services.max_frame_bytes must be greater than "
+            "host_services.llm_max_request_bytes."
+        )
+    host_services["max_frame_bytes"] = max_frame_bytes
 
 
 def _validate_firecracker_optional_fields(config: dict[str, Any]) -> None:

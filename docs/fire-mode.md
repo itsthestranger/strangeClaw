@@ -54,6 +54,15 @@ The guest receives `host_services.llm_timeout_seconds` so it can wait long
 enough for host-proxied model calls. `host_services.llm_max_request_bytes` is
 host-only and enforced by the LLM service before provider calls.
 
+Both ends of the vsock stream cap a single newline-delimited frame at
+`host_services.max_frame_bytes` (4 MiB by default) while bytes are being
+buffered. A guest that never sends a newline therefore fails the host reader
+fast instead of growing the host process's buffer without limit, and EOF with a
+partial frame buffered is reported as a truncated frame rather than dropped. On
+either failure the reader resets its buffer, closes the vsock connection, and
+never resumes that stream. The cap is host-only in the same sense as
+`llm_max_request_bytes`; the guest transport enforces the built-in default.
+
 ## LLM Proxy
 
 Fire guests use `LLMProxyRuntime`. The guest does not need LiteLLM or provider

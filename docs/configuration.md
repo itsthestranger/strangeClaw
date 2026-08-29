@@ -200,6 +200,37 @@ subset of the parent's tools, and cannot ask the user. In this release
 subagents help with context economy and focus, not speed. See
 [Architecture](architecture.md#subagents) for the runtime model and guidance.
 
+## Host Services
+
+If `host_services` is omitted, strangeClaw defaults to:
+
+```yaml
+host_services:
+  llm_timeout_seconds: 120
+  llm_max_request_bytes: 2097152
+  max_frame_bytes: 4194304
+```
+
+- `llm_timeout_seconds` is how long the guest waits for a host-proxied model
+  call. It is the only `host_services` field that crosses into the guest.
+- `llm_max_request_bytes` is a policy cap on a decoded LLM proxy request. It is
+  checked after the frame has been buffered and parsed, so it limits what the
+  host will act on, not what the host will buffer.
+- `max_frame_bytes` is the resource guard. Both ends of the transport read
+  newline-delimited JSON, and the receive buffer is instance state that survives
+  read timeouts, so a peer that never sends a newline would otherwise grow the
+  buffer without limit. When the buffer passes this cap with no delimiter, the
+  reader resets its decoder state, drops the connection, and raises; the failed
+  stream is never resumed. It must be greater than `llm_max_request_bytes`,
+  since it bounds the whole JSON event envelope around the largest legitimate
+  payload — a config where it is not is rejected at load time.
+
+The host reader is the security-critical direction: it is fed by bytes from the
+guest, across the microVM trust boundary, and the host may be running other
+sandboxes. The guest-side reader is capped symmetrically; it uses the built-in
+default rather than a configured value, since `max_frame_bytes` is not published
+to the guest through MMDS.
+
 ## Telegram
 
 1. Create a bot with `@BotFather` and copy the token.
